@@ -1,0 +1,4 @@
+prebuilt/*.bin
+notes/franzflasch/
+*.o
+*.ko

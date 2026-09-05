@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/dts-v1/;
+
+#include "ar9331.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+/*
+ * Beep "Dial" wireless audio player — 8devices Carambola 2 (AR9331) based.
+ *
+ * Partition table is IDENTICAL to the upstream ar9331_8dev_carambola2.dts
+ * (u-boot @0, u-boot-env @0x40000, firmware @0x50000, art @0xff0000) so the
+ * stock u-boot and radio-calibration (art) survive untouched — see
+ * ~/beep-revival/RESEARCH-SYNTHESIS.md.
+ *
+ * Added vs. stock carambola2 DTS:
+ *  - I2S CPU DAI + MBOX DMA (ath79-i2s driver, this repo) -> WM8524 DAC
+ *  - simple-audio-card gluing them (CPU is bit/frame/MCLK master; WM8524 slave-only)
+ *  - i2c-gpio on GPIO0/GPIO1 for the STM8 control MCU (knob/tap/LED, addr 0x23)
+ *  - gpio-keys "setup" on GPIO11
+ *
+ * Register bases confirmed from franzflasch ath79-stereo-regs.h AND the stock
+ * unstripped ath_i2s.ko (MBOX ctrl @0x180a0024: START=bit1/RESUME=bit2/STOP=bit0).
+ */
+
+/ {
+	model = "Beep Dial (Carambola2 / AR9331)";
+	compatible = "beep,dial", "qca,ar9331";
+
+	aliases {
+		serial0 = &uart;
+	};
+
+	/* WM8524: mainline codec driver, hardware-control mode (no register bus),
+	 * only a mute GPIO. NOTE: the mute-GPIO pin is a PLACEHOLDER — confirm on
+	 * the bench (Saleae during stock power-up, or schematic trace). If the mute
+	 * line is hard-strapped (no GPIO), either patch wm8524.c to make the GPIO
+	 * optional, or switch this node to compatible = "linux,snd-soc-dummy". */
+	wm8524: codec {
+		#sound-dai-cells = <0>;
+		compatible = "wlf,wm8524";
+		wlf,mute-gpios = <&gpio 16 GPIO_ACTIVE_LOW>; /* TODO: verify pin on hardware */
+	};
+
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "Beep-WM8524";
+		simple-audio-card,format = "i2s";
+		/* AR9331 I2S block is the clock master; WM8524 is slave-only */
+		simple-audio-card,bitclock-master = <&sndcpu>;
+		simple-audio-card,frame-master = <&sndcpu>;
+
+		sndcpu: simple-audio-card,cpu {
+			sound-dai = <&i2s>;
+		};
+		simple-audio-card,codec {
+			sound-dai = <&wm8524>;
+		};
+	};
+
+	/* Bit-banged I2C to the STM8L151 control MCU (knob/tap/LED).
+	 * SDA=GPIO0, SCL=GPIO1 (same pins the stock i2c-gpio.0 used).
+	 * NOTE: GPIO0/GPIO1 are also the WLAN/LED0/LED1 bootstrap pins — this file
+	 * deliberately does NOT define a gpio-leds node claiming them. */
+	i2c_stm8: i2c {
+		compatible = "i2c-gpio";
+		sda-gpios = <&gpio 0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&gpio 1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <5>;     /* ~100 kHz; the STM8 slave is slow */
+		i2c-gpio,timeout-ms = <100>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* No child node: beepd talks to the STM8 directly via /dev/i2c-N +
+		 * ioctl(I2C_SLAVE, 0x23). It is a bespoke device, no kernel driver. */
+	};
+
+	keys {
+		compatible = "gpio-keys";
+		setup {
+			label = "setup";
+			linux,code = <KEY_SETUP>;
+			gpios = <&gpio 11 GPIO_ACTIVE_LOW>; /* TODO: confirm polarity */
+			debounce-interval = <60>;
+		};
+	};
+};
+
+/*
+ * I2S CPU DAI + MBOX DMA controller.
+ *   STEREO config block: 0x180b0000, size 0x18
+ *   MBOX/DMA block:      0x180a0000, size 0x6c
+ *   IRQ: ATH79 MISC irq base + 7  (the "audio DMA" line)
+ * Bindings are authored by this project (no upstream ath79 I2S binding exists).
+ */
+&apb {
+	i2s: i2s@180b0000 {
+		compatible = "qca,ar9331-i2s";
+		#sound-dai-cells = <0>;
+		reg = <0x180b0000 0x18>,   /* STEREO config */
+		      <0x180a0000 0x6c>;   /* MBOX DMA      */
+		reg-names = "stereo", "mbox";
+		interrupt-parent = <&miscintc>;
+		interrupts = <7>;
+		status = "okay";
+	};
+};
+
+&uart {
+	status = "okay";
+};
+
+&spi {
+	status = "okay";
+	num-chipselects = <1>;
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x000000 0x040000>;
+				read-only;
+			};
+			partition@40000 {
+				label = "u-boot-env";
+				reg = <0x040000 0x010000>;
+				read-only;
+			};
+			partition@50000 {
+				compatible = "denx,uimage";
+				label = "firmware";
+				reg = <0x050000 0xfa0000>;
+			};
+			art: partition@ff0000 {
+				label = "art";
+				reg = <0xff0000 0x010000>;
+				read-only;
+			};
+		};
+	};
+};
+
+&eth0 {
+	status = "okay";
+	mtd-mac-address = <&art 0x0>;
+};
+
+&eth1 {
+	status = "okay";
+};
+
+&wmac {
+	status = "okay";
+	mtd-cal-data = <&art 0x1000>;
+};

@@ -1,0 +1,9 @@
+#!/bin/sh
+MAC6="$(cat /sys/class/ieee80211/phy0/macaddress 2>/dev/null | tr -d : | tail -c 7 | tr A-Z a-z)"
+uci -q set system.@system[0].hostname="beep-${MAC6:-dial}"
+# per-device self-signed TLS cert for uhttpd (never a shared/baked cert)
+[ -x /usr/sbin/px5g ] && [ ! -f /etc/beep-uhttpd.crt ] && \
+  px5g selfsigned -der -days 3650 -newkey rsa:2048 -keyout /etc/beep-uhttpd.key -out /etc/beep-uhttpd.crt \
+     -subj "/CN=beep-${MAC6}" 2>/dev/null
+uci commit
+exit 0

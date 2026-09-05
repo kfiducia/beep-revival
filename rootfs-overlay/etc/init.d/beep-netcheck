@@ -1,0 +1,10 @@
+#!/bin/sh /etc/rc.common
+START=99
+boot() {
+	# if no client wifi is configured/enabled, or it fails to associate, enter setup
+	local ssid; ssid="$(uci -q get wireless.@wifi-iface[0].ssid)"
+	[ -z "$ssid" ] && { /usr/libexec/beep/wifi-setup-enable; return; }
+	( sleep 25
+	  status="$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.up')"
+	  [ "$status" = "true" ] || /usr/libexec/beep/wifi-setup-enable ) &
+}

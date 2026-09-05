@@ -1,0 +1,22 @@
+#!/bin/sh
+# Bring up "Beep-Setup-XXXX" AP + captive portal (no cloud). Idempotent.
+MAC6="$(cat /sys/class/ieee80211/phy0/macaddress 2>/dev/null | tr -d : | tail -c 7 | tr a-z A-Z)"
+uci -q batch <<UCI
+set wireless.setup=wifi-iface
+set wireless.setup.device=radio0
+set wireless.setup.network=beepap
+set wireless.setup.mode=ap
+set wireless.setup.ssid=Beep-Setup-${MAC6}
+set wireless.setup.encryption=none
+set wireless.setup.disabled=0
+set network.beepap=interface
+set network.beepap.proto=static
+set network.beepap.ipaddr=192.168.60.1
+set network.beepap.netmask=255.255.255.0
+commit
+UCI
+# captive-portal DNS hijack: answer every query with our IP so phones auto-pop setup
+grep -q '^address=/#/192.168.60.1' /etc/dnsmasq.conf 2>/dev/null || \
+	echo 'address=/#/192.168.60.1' >> /etc/dnsmasq.conf
+/etc/init.d/dnsmasq restart; wifi reload; /etc/init.d/uhttpd restart
+logger -t beep "wifi setup mode: SSID Beep-Setup-${MAC6}"
