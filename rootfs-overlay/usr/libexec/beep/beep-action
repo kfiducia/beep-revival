@@ -1,0 +1,88 @@
+#!/bin/sh
+# beep-action <gesture> [arg]   — called by beepd on each decoded gesture.
+# Policy layer: maps physical gestures to Snapcast control (JSON-RPC :1705).
+# Edit freely; beepd does not need recompiling.
+#
+#   turn <delta>   knob rotated <delta> detents  -> volume +/-
+#   tap            single tap                    -> play/pause the active stream
+#   double_tap     double tap                    -> join the active group (sync)
+#   hold           5s long-hold                  -> enter wifi setup mode
+#
+# Requires: nc (busybox), jsonfilter (OpenWrt base). Snapserver reachable at
+# $SNAP_HOST:1705 (localhost when this unit is server, else the helper box —
+# set in /etc/config/beep).
+
+GESTURE="$1"; ARG="$2"
+SNAP_HOST="$(uci -q get beep.main.snapserver || echo 127.0.0.1)"
+SNAP_PORT=1705
+VOL_STEP=4     # % per detent
+LOGT="beep-action"
+
+log() { logger -t "$LOGT" "$*"; }
+
+# rpc <method> <params-json> -> prints result json (one-shot newline-delimited JSON-RPC)
+rpc() {
+	printf '{"id":1,"jsonrpc":"2.0","method":"%s","params":%s}\n' "$1" "$2" \
+		| nc -w2 "$SNAP_HOST" "$SNAP_PORT" 2>/dev/null | head -1
+}
+
+# this snapclient's id == its MAC-derived hostname id; Server.GetStatus lists clients
+my_client_id() {
+	# snapclient identifies by host; match on our hostname
+	local host; host="$(cat /proc/sys/kernel/hostname)"
+	rpc "Server.GetStatus" '{}' \
+		| jsonfilter -e '@.result.server.groups[*].clients[*]' 2>/dev/null \
+		| while read -r c; do :; done
+	# jsonfilter can't easily filter-by-field in one pass here; resolve in the
+	# helper below instead.
+	snap_find_client "$host"
+}
+
+# crude but dependency-light: pull "id" whose "host.name" matches $1
+snap_find_client() {
+	local want="$1" json
+	json="$(rpc "Server.GetStatus" '{}')"
+	echo "$json" | tr ',' '\n' | grep -A1 "\"name\":\"$want\"" >/dev/null 2>&1
+	# fall back to the first client id if we can't disambiguate
+	echo "$json" | grep -oE '"id":"[^"]+"' | head -1 | cut -d'"' -f4
+}
+
+case "$GESTURE" in
+	turn)
+		cid="$(snap_find_client "$(cat /proc/sys/kernel/hostname)")"
+		[ -z "$cid" ] && { log "turn: no client id"; exit 0; }
+		cur="$(rpc "Client.GetStatus" "{\"id\":\"$cid\"}" \
+			| grep -oE '"percent":[0-9]+' | head -1 | cut -d: -f2)"
+		[ -z "$cur" ] && cur=50
+		new=$(( cur + ARG * VOL_STEP ))
+		[ "$new" -lt 0 ] && new=0; [ "$new" -gt 100 ] && new=100
+		rpc "Client.SetVolume" "{\"id\":\"$cid\",\"volume\":{\"muted\":false,\"percent\":$new}}" >/dev/null
+		log "volume -> $new"
+		;;
+	tap)
+		# receiver-side pause: mute/unmute this client (honest limit — can't pause
+		# the phone that owns an AirPlay/Spotify transport)
+		cid="$(snap_find_client "$(cat /proc/sys/kernel/hostname)")"
+		muted="$(rpc "Client.GetStatus" "{\"id\":\"$cid\"}" | grep -oE '"muted":(true|false)' | head -1 | cut -d: -f2)"
+		[ "$muted" = "true" ] && nm=false || nm=true
+		rpc "Client.SetVolume" "{\"id\":\"$cid\",\"volume\":{\"muted\":$nm,\"percent\":50}}" >/dev/null
+		log "tap: muted=$nm"
+		;;
+	double_tap)
+		# join the group that currently has a playing stream
+		json="$(rpc "Server.GetStatus" '{}')"
+		gid="$(echo "$json" | grep -oE '"id":"[^"]+"' | head -1 | cut -d'"' -f4)"
+		cid="$(snap_find_client "$(cat /proc/sys/kernel/hostname)")"
+		[ -n "$gid" ] && [ -n "$cid" ] && \
+			rpc "Group.SetClients" "{\"id\":\"$gid\",\"clients\":[\"$cid\"]}" >/dev/null
+		log "double_tap: join group $gid"
+		;;
+	hold)
+		log "hold: entering wifi setup mode"
+		/usr/libexec/beep/wifi-setup-enable
+		;;
+	*)
+		log "unknown gesture: $GESTURE"
+		;;
+esac
+exit 0

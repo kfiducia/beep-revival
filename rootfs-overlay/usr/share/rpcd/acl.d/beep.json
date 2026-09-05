@@ -1,0 +1,7 @@
+{
+  "beep-admin": {
+    "description": "Beep admin UI",
+    "read":  { "ubus": { "beep": ["status"] } },
+    "write": { "ubus": { "beep": ["set_wifi","set_name"] } }
+  }
+}

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Minimal authenticated ubus/rpcd object for the admin UI. Scoped by acl.d/beep.json.
+case "$1" in
+  list) echo '{ "set_wifi": {"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "status":{} }';;
+  call)
+    read -r input; method="$2"
+    case "$method" in
+      status) echo "{\"name\":\"$(uci -q get system.@system[0].hostname)\",\"role\":\"$(uci -q get beep.main.role)\"}";;
+      set_name) name="$(echo "$input"|jsonfilter -e '@.name')"; uci set system.@system[0].hostname="$name"; uci commit system; echo '{"ok":true}';;
+      set_wifi)
+        s="$(echo "$input"|jsonfilter -e '@.ssid')"; k="$(echo "$input"|jsonfilter -e '@.key')"
+        uci set wireless.@wifi-iface[0].ssid="$s"; uci set wireless.@wifi-iface[0].key="$k"
+        uci set wireless.@wifi-iface[0].encryption='psk2'; uci commit wireless; wifi reload; echo '{"ok":true}';;
+      *) echo '{"error":"unknown"}';;
+    esac;;
+esac

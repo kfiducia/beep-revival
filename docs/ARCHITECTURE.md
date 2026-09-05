@@ -1,0 +1,1 @@
+/Users/kfiducia/beep-revival/ARCHITECTURE.md
