@@ -1,9 +1,37 @@
 #!/bin/sh
-MAC6="$(cat /sys/class/ieee80211/phy0/macaddress 2>/dev/null | tr -d : | tail -c 7 | tr A-Z a-z)"
-uci -q set system.@system[0].hostname="beep-${MAC6:-dial}"
+# First-boot provisioning: per-device identity + credentials. uci-defaults runs
+# this once and DELETES it on exit 0; on a non-zero exit the script is kept and
+# retried next boot — we use that if the MAC isn't readable yet OR if setting the
+# password fails, so we can never leave root blank-forever behind the guard.
+# /etc/beep-code is on the sysupgrade keep-list, so on UPDATES the guard below
+# skips and the owner's password/name/cert are preserved.
+mac() { cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/ieee80211/phy0/macaddress 2>/dev/null; }
+
+set_root_pw() {   # portable: busybox passwd reads stdin, shadow's doesn't
+	if command -v chpasswd >/dev/null 2>&1; then
+		printf 'root:%s\n' "$1" | chpasswd 2>/dev/null && return 0
+	fi
+	printf '%s\n%s\n' "$1" "$1" | passwd root >/dev/null 2>&1
+}
+
+CODE="$(mac | tr -d ': \n' | tr a-z A-Z)"      # full MAC, hex, uppercase
+MAC6="$(printf '%s' "$CODE" | tail -c 6 | tr A-Z a-z)"
+
+# Per-device "setup code" = WPA2 key for the setup AP AND default admin password.
+# Guard runs ONLY on a truly fresh overlay (first boot / after factory reset),
+# never on a keep-config update (beep-code is preserved). Order matters: set the
+# password and confirm it BEFORE writing beep-code, else a failed passwd would
+# leave root blank while the guard treats the unit as provisioned.
+if [ ! -f /etc/beep-code ]; then
+	[ "${#CODE}" -ge 8 ] || { logger -t beep "99-beep: MAC not readable yet — retry next boot"; exit 1; }
+	set_root_pw "$CODE" || { logger -t beep "99-beep: could not set root password — retry next boot"; exit 1; }
+	printf '%s' "$CODE" > /etc/beep-code; chmod 600 /etc/beep-code
+	uci -q set system.@system[0].hostname="beep-${MAC6:-dial}"   # only on first provision
+	uci -q commit system
+fi
+
 # per-device self-signed TLS cert for uhttpd (never a shared/baked cert)
 [ -x /usr/sbin/px5g ] && [ ! -f /etc/beep-uhttpd.crt ] && \
-  px5g selfsigned -der -days 3650 -newkey rsa:2048 -keyout /etc/beep-uhttpd.key -out /etc/beep-uhttpd.crt \
-     -subj "/CN=beep-${MAC6}" 2>/dev/null
-uci commit
+	px5g selfsigned -der -days 3650 -newkey rsa:2048 -keyout /etc/beep-uhttpd.key -out /etc/beep-uhttpd.crt \
+		-subj "/CN=beep-${MAC6}" 2>/dev/null
 exit 0

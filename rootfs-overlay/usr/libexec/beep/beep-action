@@ -3,10 +3,14 @@
 # Policy layer: maps physical gestures to Snapcast control (JSON-RPC :1705).
 # Edit freely; beepd does not need recompiling.
 #
-#   turn <delta>   knob rotated <delta> detents  -> volume +/-
-#   tap            single tap                    -> play/pause the active stream
-#   double_tap     double tap                    -> join the active group (sync)
-#   hold           5s long-hold                  -> enter wifi setup mode
+#   turn <delta>    knob rotated <delta> detents -> volume +/-
+#   tap             single tap                   -> play/pause the active stream
+#   double_tap      double tap                   -> join the active group (sync)
+#   phys_confirm    triple tap                   -> 60s unsigned-upload unlock
+#   hold            release after >=10s hold     -> enter Wi-Fi setup mode
+#   factory_reset   release after >=30s hold     -> wipe config + reboot
+# (beepd fires hold/factory_reset ON RELEASE by duration, with a growing LED
+#  "arming" ring, so neither triggers accidentally.)
 #
 # Requires: nc (busybox), jsonfilter (OpenWrt base). Snapserver reachable at
 # $SNAP_HOST:1705 (localhost when this unit is server, else the helper box —
@@ -49,24 +53,24 @@ snap_find_client() {
 
 case "$GESTURE" in
 	turn)
-		cid="$(snap_find_client "$(cat /proc/sys/kernel/hostname)")"
-		[ -z "$cid" ] && { log "turn: no client id"; exit 0; }
-		cur="$(rpc "Client.GetStatus" "{\"id\":\"$cid\"}" \
-			| grep -oE '"percent":[0-9]+' | head -1 | cut -d: -f2)"
-		[ -z "$cur" ] && cur=50
-		new=$(( cur + ARG * VOL_STEP ))
-		[ "$new" -lt 0 ] && new=0; [ "$new" -gt 100 ] && new=100
-		rpc "Client.SetVolume" "{\"id\":\"$cid\",\"volume\":{\"muted\":false,\"percent\":$new}}" >/dev/null
-		log "volume -> $new"
+		# Drive the ALSA softvol "Master" (see /etc/asound.conf). shairport binds
+		# its AirPlay volume to the same control, so the knob moves local playback
+		# AND AirPlay in lockstep — and the web slider reads the same level. No
+		# Snapcast required. ARG is signed detents; VOL_STEP % per detent.
+		case "$ARG" in ''|*[!0-9-]*) exit 0;; esac   # need a signed integer
+		step=$(( (ARG < 0 ? -ARG : ARG) * VOL_STEP ))
+		dir=$([ "$ARG" -lt 0 ] && echo - || echo +)
+		amixer -M -q set Master "${step}%${dir}" 2>/dev/null
+		# publish the true level so the LED ring arc (beepd) shows the real volume
+		nv="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)"
+		[ -n "$nv" ] && { mkdir -p /var/run/beep; echo "$nv" > /var/run/beep/volume; }
+		log "volume: Master ${dir}${step}% -> ${nv:-?}%"
 		;;
 	tap)
-		# receiver-side pause: mute/unmute this client (honest limit — can't pause
-		# the phone that owns an AirPlay/Spotify transport)
-		cid="$(snap_find_client "$(cat /proc/sys/kernel/hostname)")"
-		muted="$(rpc "Client.GetStatus" "{\"id\":\"$cid\"}" | grep -oE '"muted":(true|false)' | head -1 | cut -d: -f2)"
-		[ "$muted" = "true" ] && nm=false || nm=true
-		rpc "Client.SetVolume" "{\"id\":\"$cid\",\"volume\":{\"muted\":$nm,\"percent\":50}}" >/dev/null
-		log "tap: muted=$nm"
+		# receiver-side pause: toggle mute on Master (honest limit — we can't pause
+		# the phone that owns the AirPlay/Spotify transport)
+		amixer -M -q set Master toggle 2>/dev/null
+		log "tap: toggled mute"
 		;;
 	double_tap)
 		# join the group that currently has a playing stream
@@ -78,8 +82,25 @@ case "$GESTURE" in
 		log "double_tap: join group $gid"
 		;;
 	hold)
-		log "hold: entering wifi setup mode"
+		# released after a >=10s hold (see beepd tiers) -> Wi-Fi reconfig AP
+		log "hold(10s): entering wifi setup mode"
 		/usr/libexec/beep/wifi-setup-enable
+		;;
+	factory_reset)
+		# released after a >=30s hold -> wipe overlay config + reboot. Next boot
+		# re-provisions (per-device code/cert) and comes up in setup mode.
+		log "hold(30s): FACTORY RESET — wiping config and rebooting"
+		jffs2reset -y -r
+		;;
+	phys_confirm)
+		# triple-tap: prove PHYSICAL possession to unlock an UNSIGNED firmware
+		# upload for 60s. This is the anti-remote-hack gate — the OTA CGI accepts
+		# an unsigned image only while this fresh, short-lived flag exists, so a
+		# remote attacker (even with a stolen admin session) cannot flash unsigned.
+		log "triple-tap: opened 60s physical-presence window for unsigned upload"
+		mkdir -p /var/run/beep
+		echo $(( $(date +%s) + 60 )) > /var/run/beep/phys-confirm
+		( sleep 60; rm -f /var/run/beep/phys-confirm ) >/dev/null 2>&1 &
 		;;
 	*)
 		log "unknown gesture: $GESTURE"

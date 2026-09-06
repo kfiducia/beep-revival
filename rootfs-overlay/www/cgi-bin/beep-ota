@@ -1,0 +1,70 @@
+#!/bin/sh
+# Signed OTA endpoint (the ONLY CGI in the image). Two flash paths, by threat model:
+#
+#   SIGNED   image -> requires a valid admin rpcd session AND a usign signature
+#                     against /etc/beep-ota.pub. Safe to allow remotely: a stolen
+#                     session still can't forge the signature.
+#   UNSIGNED image -> requires a FRESH PHYSICAL triple-tap on the device (a 60s
+#                     window in /var/run/beep/phys-confirm, opened by beepd). No
+#                     session can substitute. This is the anti-remote-hack gate:
+#                     a remotely-compromised device cannot be made to flash
+#                     unsigned firmware, because no remote actor can triple-tap.
+#
+# GET returns {"phys":bool} so the web UI reveals the unsigned option only while
+# a physical confirmation is live.
+say() { printf 'Status: %s\r\nContent-Type: application/json\r\n\r\n%s\n' "$1" "$2"; }
+fail() { rm -f /tmp/ota.bin /tmp/ota.sig; say "$1" "$2"; exit 0; }
+
+phys_valid() {
+	[ -f /var/run/beep/phys-confirm ] || return 1
+	local exp now; exp="$(cat /var/run/beep/phys-confirm 2>/dev/null)"
+	now="$(date +%s)"
+	case "$exp" in ''|*[!0-9]*) return 1;; esac
+	[ "$now" -lt "$exp" ]
+}
+
+# --- GET: status for the UI (is a physical override window open?) ---
+if [ "$REQUEST_METHOD" = GET ]; then
+	if phys_valid; then say '200 OK' '{"phys":true}'; else say '200 OK' '{"phys":false}'; fi
+	exit 0
+fi
+[ "$REQUEST_METHOD" = POST ] || { say '405 Method Not Allowed' '{"error":"POST only"}'; exit 0; }
+
+# --- auth signals ---
+admin=0
+sess="$HTTP_X_BEEP_SESSION"
+case "$sess" in ''|*[!0-9a-fA-F]*) ;; *)
+	acc="$(ubus call session access "{\"ubus_rpc_session\":\"$sess\",\"scope\":\"ubus\",\"object\":\"beep\",\"function\":\"reboot\"}" 2>/dev/null | jsonfilter -e '@.access' 2>/dev/null)"
+	[ "$acc" = "true" ] && admin=1 ;;
+esac
+
+# --- receive image ---
+rm -f /tmp/ota.bin /tmp/ota.sig
+cat > /tmp/ota.bin
+[ -s /tmp/ota.bin ] || fail '400 Bad Request' '{"error":"empty image"}'
+
+# --- decide path: unsigned requested (explicit flag or no signature) vs signed ---
+want_unsigned=0
+[ "$HTTP_X_BEEP_ALLOW_UNSIGNED" = "1" ] && want_unsigned=1
+[ -z "$HTTP_X_BEEP_SIG" ] && want_unsigned=1
+
+if [ "$want_unsigned" = 1 ]; then
+	# UNSIGNED: physical presence is mandatory; an admin session is NOT sufficient.
+	phys_valid || fail '403 Forbidden' '{"error":"unsigned upload requires a physical triple-tap on the device (within 60s)"}'
+	logger -t beep "OTA: UNSIGNED flash authorized by physical triple-tap"
+else
+	# SIGNED: admin session + signature verification.
+	[ "$admin" = 1 ] || fail '401 Unauthorized' '{"error":"sign in as admin, or triple-tap the device for an unsigned install"}'
+	printf '%s' "$HTTP_X_BEEP_SIG" | base64 -d > /tmp/ota.sig 2>/dev/null || fail '400 Bad Request' '{"error":"bad signature encoding"}'
+	usign -V -m /tmp/ota.bin -p /etc/beep-ota.pub -x /tmp/ota.sig >/dev/null 2>&1 \
+		|| fail '400 Bad Request' '{"error":"signature verification failed — not a genuine Beep release"}'
+fi
+
+# --- sanity: a real sysupgrade image for this board ---
+sysupgrade -T /tmp/ota.bin >/dev/null 2>&1 \
+	|| fail '400 Bad Request' '{"error":"not a valid firmware image for this device"}'
+
+# --- flash (keep config); device reboots. bootb->recovery backstops a bad boot ---
+say '200 OK' '{"ok":true,"note":"flashing and rebooting"}'
+( sleep 1; sysupgrade /tmp/ota.bin ) >/dev/null 2>&1 &
+exit 0
