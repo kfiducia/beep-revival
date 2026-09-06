@@ -1,4 +1,15 @@
-prebuilt/*.bin
-notes/franzflasch/
-*.o
+# Build artifacts / large binaries — reproducible via scripts/ (see README).
+images/
+prebuilt/
 *.ko
+*.wav
+*.bin
+
+# Personal build-host wrappers (hardcode a private hostname + 1Password socket).
+# The device-side fast-loop helper (scripts/serial-send.sh) IS included; these
+# two are just "how I reach my own Docker build host" — regenerate for yours.
+scripts/local-ssh.sh
+scripts/rebuild-ko.sh
+
+# macOS / editor cruft
+.DS_Store

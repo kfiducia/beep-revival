@@ -55,6 +55,17 @@
 		};
 		simple-audio-card,codec {
 			sound-dai = <&wm8524>;
+			/*
+			 * WM8524 (mainline wm8524.c) refuses to start unless a non-zero
+			 * MCLK is set via set_sysclk() BEFORE stream startup. simple-card's
+			 * `mclk-fs` sets sysclk only at hw_params (too late — the codec's
+			 * startup check zeroes it first), so we must use the FIXED
+			 * `system-clock-frequency`, which simple-card applies at DAI init.
+			 * 11289600 = 256 * 44100 (the AR9331 I2S MCLK for 44.1kHz). This
+			 * also constrains the codec's allowed rates to 44.1k-family; 48k
+			 * needs a re-clock (future: per-rate MCLK / drop the constraint).
+			 */
+			system-clock-frequency = <11289600>;
 		};
 	};
 
@@ -91,8 +102,14 @@
  *   MBOX/DMA block:      0x180a0000, size 0x6c
  *   IRQ: ATH79 MISC irq base + 7  (the "audio DMA" line)
  * Bindings are authored by this project (no upstream ath79 I2S binding exists).
+ *
+ * Placed on the AHB bus (alongside gmac@18070000 / wmac@18100000). In OpenWrt's
+ * ar9330/ath79 dtsi the `ahb`/`apb` bus nodes carry NO label, so we reference the
+ * bus by path (`&{/ahb}`) rather than a label — `&apb` does not resolve and dtc
+ * fails with "Label or path apb not found". reg values are absolute (identity
+ * ranges), so AHB vs APB placement doesn't change the mapping.
  */
-&apb {
+&{/ahb} {
 	i2s: i2s@180b0000 {
 		compatible = "qca,ar9331-i2s";
 		#sound-dai-cells = <0>;
