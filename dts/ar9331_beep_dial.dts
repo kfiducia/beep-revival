@@ -159,6 +159,29 @@
 				label = "art";
 				reg = <0xff0000 0x010000>;
 				read-only;
+
+				/*
+				 * Modern ath79 (k6.6) reads the radio calibration + MACs
+				 * from ART via nvmem, NOT the legacy mtd-cal-data /
+				 * mtd-mac-address bindings (those silently fail -> ath9k
+				 * probe -EINVAL/-5, wifi dead). Layout matches upstream
+				 * ar9331_8dev_carambola2.dts exactly.
+				 */
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr_art_0: macaddr@0 {
+						reg = <0x0 0x6>;
+					};
+					macaddr_art_6: macaddr@6 {
+						reg = <0x6 0x6>;
+					};
+					cal_art_1000: calibration@1000 {
+						reg = <0x1000 0x440>;
+					};
+				};
 			};
 		};
 	};
@@ -166,14 +189,24 @@
 
 &eth0 {
 	status = "okay";
-	mtd-mac-address = <&art 0x0>;
+	nvmem-cells = <&macaddr_art_0>;
+	nvmem-cell-names = "mac-address";
+
+	gmac-config {
+		device = <&gmac>;
+		switch-phy-addr-swap = <1>;
+		switch-phy-swap = <1>;
+	};
 };
 
 &eth1 {
 	status = "okay";
+	nvmem-cells = <&macaddr_art_6>;
+	nvmem-cell-names = "mac-address";
 };
 
 &wmac {
 	status = "okay";
-	mtd-cal-data = <&art 0x1000>;
+	nvmem-cells = <&macaddr_art_6>, <&cal_art_1000>;
+	nvmem-cell-names = "mac-address", "calibration";
 };
