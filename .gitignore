@@ -13,3 +13,11 @@ scripts/rebuild-ko.sh
 
 # macOS / editor cruft
 .DS_Store
+
+# OTA signing — private key never in-repo (staged on build host, then 1Password)
+*.sec
+beep-ota-signing/
+.secrets/
+
+# personal device-access wrapper (hardcodes a private IP + 1Password socket)
+scripts/beep-ssh.sh

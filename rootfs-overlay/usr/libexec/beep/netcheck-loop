@@ -1,0 +1,43 @@
+#!/bin/sh
+# Continuous Wi-Fi watchdog. Keeps the client STA connected and falls back to
+# the Beep-Setup AP (pulsing ring) whenever it can't associate — so a wrong
+# password, a moved router, or a dead AP self-heals into reconfig mode with no
+# UART. Runs under procd (see /etc/init.d/beep-netcheck).
+GRACE=3        # consecutive failed checks before falling back to the AP
+PERIOD=10      # seconds between checks
+
+sta_ok() {
+	local up ip
+	up="$(ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@.up')"
+	[ "$up" = "true" ] || return 1
+	ip="$(ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address')"
+	[ -n "$ip" ]
+}
+ap_up() { [ "$(uci -q get wireless.setup.disabled)" = "0" ]; }
+
+sleep 25       # let wifi + DHCP settle after boot before judging
+fails=0
+while :; do
+	# SSH temporary-mode fail-secure: disable dropbear once the window lapses
+	if [ "$(uci -q get beep.main.ssh_mode)" = temp ]; then
+		exp="$(uci -q get beep.main.ssh_expires)"
+		case "$exp" in [0-9]*) [ "$(date +%s)" -ge "$exp" ] && {
+			/etc/init.d/dropbear disable 2>/dev/null; /etc/init.d/dropbear stop 2>/dev/null
+			uci -q set beep.main.ssh_mode=off; uci -q delete beep.main.ssh_expires; uci -q commit beep
+			logger -t beep "ssh: temporary window expired -> disabled"; };; esac
+	fi
+	ssid="$(uci -q get wireless.@wifi-iface[0].ssid)"
+	if [ -z "$ssid" ]; then
+		ap_up || /usr/libexec/beep/wifi-setup-enable    # never configured -> setup
+		sleep 15; continue
+	fi
+	if sta_ok; then
+		fails=0
+		ap_up && /usr/libexec/beep/wifi-setup-disable   # recovered -> drop the AP
+		sleep 20
+	else
+		fails=$((fails + 1))
+		[ "$fails" -ge "$GRACE" ] && { ap_up || /usr/libexec/beep/wifi-setup-enable; }
+		sleep "$PERIOD"
+	fi
+done

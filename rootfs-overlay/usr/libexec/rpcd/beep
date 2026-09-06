@@ -1,16 +1,210 @@
 #!/bin/sh
-# Minimal authenticated ubus/rpcd object for the admin UI. Scoped by acl.d/beep.json.
+# Authenticated ubus/rpcd object backing the Beep admin/setup web app.
+# Reached from the browser via uhttpd-mod-ubus (/ubus JSON-RPC) after an
+# rpcd session login; every method here is gated by acl.d/beep.json.
+#
+# Design notes:
+#  - Pure /bin/sh + busybox + jsonfilter/iwinfo/amixer (all in the image).
+#  - Every status field is BEST-EFFORT: on any failure it degrades to "" / 0
+#    rather than erroring, so the UI always renders.
+#  - The single radio can't be AP and STA at once, so set_wifi hands the radio
+#    from the setup AP to the client network; the beep-netcheck watchdog brings
+#    the AP back if association fails.
+
+INPUT=""                                   # request body (set in dispatch)
+jf()   { printf '%s' "$INPUT" | jsonfilter -e "$1"; }   # re-feeds stdin each call
+# escape \ and " AND strip control bytes (a neighbor's SSID with a raw newline
+# would otherwise make JSON.parse reject status/scan → UI DoS from radio range)
+jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037'; }
+uget() { uci -q get "$1"; }
+# the 'lan' firewall zone by NAME (not @zone[0] position) — robust to custom configs
+fw_lan_zone() {
+	local z; z="$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='lan'.*/\1/p" | head -1)"
+	[ -n "$z" ] && echo "$z" || echo "@zone[0]"
+}
+
+# Set root's password portably. busybox passwd reads the new password from stdin;
+# shadow-utils passwd ignores the pipe (reads /dev/tty) and would leave root BLANK
+# -> passwordless admin. Prefer chpasswd when present; return 0 only on success.
+set_root_pw() {
+	if command -v chpasswd >/dev/null 2>&1; then
+		printf 'root:%s\n' "$1" | chpasswd 2>/dev/null && return 0
+	fi
+	printf '%s\n%s\n' "$1" "$1" | passwd root >/dev/null 2>&1
+}
+
+# ---- STA connection introspection ------------------------------------------
+sta_ifname() { ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@.l3_device'; }
+sta_up()     { ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@.up'; }
+sta_ip()     { ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address'; }
+sta_ssid() {
+	local dev; dev="$(sta_ifname)"; [ -n "$dev" ] || return
+	iwinfo "$dev" info 2>/dev/null | sed -n 's/.*ESSID: "\(.*\)"$/\1/p'
+}
+sta_signal() {
+	local dev; dev="$(sta_ifname)"; [ -n "$dev" ] || return
+	iwinfo "$dev" info 2>/dev/null | sed -n 's/.*Signal: \(-[0-9]*\) dBm.*/\1/p'
+}
+
+ap_mode() { [ "$(uget wireless.setup.disabled)" = "0" ] && echo true || echo false; }
+ssh_on()  { pidof dropbear >/dev/null 2>&1 && echo 1 || echo 0; }   # actual running state, not a pref
+
+version() {
+	[ -f /etc/beep-version ] && { cat /etc/beep-version; return; }
+	. /etc/openwrt_release 2>/dev/null; printf '%s' "${DISTRIB_DESCRIPTION:-unknown}"
+}
+
+volume() {
+	# ALSA softvol "Master" (see /etc/asound.conf). Empty if the control is absent.
+	amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1
+}
+
+status() {
+	local name role apm up ip ssid sig ver vol utime smode sexp
+	smode="$(uget beep.main.ssh_mode)"; [ -n "$smode" ] || smode=off
+	sexp="$(uget beep.main.ssh_expires)"; case "$sexp" in ''|*[!0-9]*) sexp=null;; esac
+	name="$(jesc "$(uget system.@system[0].hostname)")"
+	role="$(jesc "$(uget beep.main.role)")"
+	apm="$(ap_mode)"
+	up="$(sta_up)";     [ "$up" = "true" ] || up=false
+	ip="$(jesc "$(sta_ip)")"
+	ssid="$(jesc "$(sta_ssid)")"
+	sig="$(sta_signal)"; case "$sig" in -[0-9]*) ;; *) sig="null";; esac
+	ver="$(jesc "$(version)")"
+	vol="$(volume)"; case "$vol" in [0-9]*) ;; *) vol="null";; esac
+	utime="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; case "$utime" in [0-9]*) ;; *) utime=0;; esac
+	printf '{"name":"%s","airplay_name":"%s","role":"%s","ap_mode":%s,' "$name" "$name" "$role" "$apm"
+	printf '"connected":%s,"ssid":"%s","ip":"%s","signal":%s,' "$up" "$ssid" "$ip" "$sig"
+	printf '"volume":%s,"version":"%s","uptime":%s,"ssh":%s,"ssh_mode":"%s","ssh_expires":%s}\n' "$vol" "$ver" "$utime" "$(ssh_on)" "$smode" "$sexp"
+}
+
+scan() {
+	printf '{"networks":['
+	iwinfo radio0 scan 2>/dev/null | tr -d '\000-\011\013-\037' | awk '
+		/ESSID:/      { s=$0; sub(/.*ESSID: "/,"",s); sub(/"$/,"",s); ssid=s; sig="null" }
+		/Signal:/     { g=$0; sub(/.*Signal: /,"",g); sub(/ dBm.*/,"",g); if (g ~ /^-?[0-9]+$/) sig=g }
+		/Encryption:/ { e=$0; sub(/.*Encryption: /,"",e); enc=(e ~ /none/)?"false":"true";
+		                if (ssid!="" && !(ssid in seen)) { seen[ssid]=1;
+		                    gsub(/\\/,"\\\\",ssid); gsub(/"/,"\\\"",ssid);
+		                    printf "%s{\"ssid\":\"%s\",\"signal\":%s,\"enc\":%s}", (n++?",":""), ssid, sig, enc }
+		                ssid="" }'
+	printf ']}\n'
+}
+
+set_wifi() {
+	local s k lz; s="$(jf '@.ssid')"; k="$(jf '@.key')"
+	[ -n "$s" ] || { echo '{"error":"ssid required"}'; return; }
+	# WPA2-PSK needs 8..63 chars; a short key silently fails to associate and the
+	# watchdog just bounces back to setup with no hint why. Reject up front.
+	if [ -n "$k" ] && [ "${#k}" -lt 8 ]; then
+		echo '{"error":"wifi password must be at least 8 characters"}'; return; fi
+	uget network.wwan >/dev/null || {
+		uci set network.wwan=interface; uci set network.wwan.proto=dhcp; uci commit network; }
+	uci set wireless.@wifi-iface[0].device=radio0
+	uci set wireless.@wifi-iface[0].mode=sta
+	uci set wireless.@wifi-iface[0].network=wwan
+	uci set wireless.@wifi-iface[0].ssid="$s"
+	if [ -n "$k" ]; then uci set wireless.@wifi-iface[0].encryption=psk2; uci set wireless.@wifi-iface[0].key="$k"
+	else uci set wireless.@wifi-iface[0].encryption=none; uci -q delete wireless.@wifi-iface[0].key; fi
+	uci set wireless.@wifi-iface[0].disabled=0
+	uci -q set wireless.setup.disabled=1     # hand the single radio AP->STA
+	uci commit wireless
+	# put the client iface in the lan zone (unzoned => REJECT input => AirPlay/web
+	# unreachable), and tear down the setup captive-portal DNS hijack ourselves —
+	# netcheck won't, because the AP is already disabled here, so it would otherwise
+	# leave the device's own resolver answering every name with 192.168.60.1.
+	lz="$(fw_lan_zone)"
+	uci -q get "firewall.${lz}.network" | grep -qw wwan || uci -q add_list "firewall.${lz}.network=wwan"
+	uci -q del_list dhcp.@dnsmasq[0].address='/#/192.168.60.1'
+	uci -q commit firewall; uci -q commit dhcp
+	rm -f /var/run/beep/led-mode 2>/dev/null  # leave the AP-setup ring animation
+	/etc/init.d/firewall reload 2>/dev/null; /etc/init.d/dnsmasq restart 2>/dev/null
+	wifi reload
+	echo '{"ok":true,"note":"joining; the setup network drops. Reconnect on your normal wifi to confirm."}'
+}
+
+set_name() {
+	local name; name="$(jf '@.name')"
+	[ -n "$name" ] || { echo '{"error":"name required"}'; return; }
+	uci set system.@system[0].hostname="$name"; uci commit system
+	echo "$name" > /proc/sys/kernel/hostname 2>/dev/null
+	/etc/init.d/shairport-sync restart >/dev/null 2>&1
+	/etc/init.d/avahi-daemon reload  >/dev/null 2>&1 || /etc/init.d/avahi-daemon restart >/dev/null 2>&1
+	echo '{"ok":true}'
+}
+
+set_volume() {
+	local p; p="$(jf '@.percent')"
+	case "$p" in ''|*[!0-9]*) echo '{"error":"percent 0-100"}'; return;; esac
+	[ "$p" -gt 100 ] && p=100
+	amixer -M set Master "${p}%" >/dev/null 2>&1
+	mkdir -p /var/run/beep; echo "$p" > /var/run/beep/volume   # for the LED arc
+	echo "{\"ok\":true,\"volume\":$p}"
+}
+
+set_audio() {
+	local role srv; role="$(jf '@.role')"; srv="$(jf '@.snapserver')"
+	[ "$role" = client ] || [ "$role" = server ] || { echo '{"error":"role client|server"}'; return; }
+	uci set beep.main.role="$role"
+	[ -n "$srv" ] && uci set beep.main.snapserver="$srv"
+	uci commit beep
+	echo '{"ok":true}'
+}
+
+set_password() {
+	local p; p="$(jf '@.password')"
+	[ "${#p}" -ge 6 ] || { echo '{"error":"min 6 chars"}'; return; }
+	if set_root_pw "$p"; then echo '{"ok":true}'; else echo '{"error":"could not set password"}'; fi
+}
+
+set_ssh() {
+	# Three distinct states (the desired SETTING, separate from the live running
+	# state which status reports via pidof):
+	#   off  -> disabled + stopped
+	#   on   -> enabled + started (persists across reboot)
+	#   temp -> started now but NOT enabled, with an expiry: the netcheck watchdog
+	#           stops it when the window lapses, AND a reboot drops it (no rc.d
+	#           symlink) — fail-secure both ways.
+	# The setting lives in /etc/config/beep (preserved across updates).
+	local mode hours exp; mode="$(jf '@.mode')"; hours="$(jf '@.hours')"
+	case "$mode" in
+		off)
+			uci -q set beep.main.ssh_mode=off; uci -q delete beep.main.ssh_expires; uci -q commit beep
+			/etc/init.d/dropbear disable 2>/dev/null; /etc/init.d/dropbear stop 2>/dev/null
+			echo '{"ok":true,"mode":"off"}';;
+		on)
+			uci -q set beep.main.ssh_mode=on; uci -q delete beep.main.ssh_expires; uci -q commit beep
+			/etc/init.d/dropbear enable 2>/dev/null; /etc/init.d/dropbear start 2>/dev/null
+			echo '{"ok":true,"mode":"on"}';;
+		temp)
+			case "$hours" in ''|*[!0-9]*) hours=12;; esac; [ "$hours" -gt 72 ] && hours=72
+			exp=$(( $(date +%s) + hours * 3600 ))
+			uci -q set beep.main.ssh_mode=temp; uci -q set beep.main.ssh_expires="$exp"; uci -q commit beep
+			/etc/init.d/dropbear disable 2>/dev/null; /etc/init.d/dropbear start 2>/dev/null
+			echo "{\"ok\":true,\"mode\":\"temp\",\"expires\":$exp}";;
+		*) echo '{"error":"mode off|on|temp"}';;
+	esac
+}
+
+reboot_dev() { (sleep 1; reboot) >/dev/null 2>&1 & echo '{"ok":true}'; }
+
 case "$1" in
-  list) echo '{ "set_wifi": {"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "status":{} }';;
+  list)
+    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_audio":{"role":"str","snapserver":"str"}, "set_password":{"password":"str"}, "set_ssh":{"enabled":0}, "reboot":{} }'
+    ;;
   call)
-    read -r input; method="$2"
+    method="$2"; INPUT="$(cat)"
     case "$method" in
-      status) echo "{\"name\":\"$(uci -q get system.@system[0].hostname)\",\"role\":\"$(uci -q get beep.main.role)\"}";;
-      set_name) name="$(echo "$input"|jsonfilter -e '@.name')"; uci set system.@system[0].hostname="$name"; uci commit system; echo '{"ok":true}';;
-      set_wifi)
-        s="$(echo "$input"|jsonfilter -e '@.ssid')"; k="$(echo "$input"|jsonfilter -e '@.key')"
-        uci set wireless.@wifi-iface[0].ssid="$s"; uci set wireless.@wifi-iface[0].key="$k"
-        uci set wireless.@wifi-iface[0].encryption='psk2'; uci commit wireless; wifi reload; echo '{"ok":true}';;
-      *) echo '{"error":"unknown"}';;
-    esac;;
+      status)       status ;;
+      scan)         scan ;;
+      set_wifi)     set_wifi ;;
+      set_name)     set_name ;;
+      set_volume)   set_volume ;;
+      set_audio)    set_audio ;;
+      set_password) set_password ;;
+      set_ssh)      set_ssh ;;
+      reboot)       reboot_dev ;;
+      *)            echo '{"error":"unknown method"}' ;;
+    esac
+    ;;
 esac

@@ -1,4 +1,17 @@
-# beep-i2s — remaining port: the MBOX-DMA "data plane"
+# beep-i2s — the MBOX-DMA "data plane"
+
+> **✅ DONE (2026-09-05) — this port is complete and plays clean audio on hardware.**
+> All of the steps below were carried out in `beep-i2s.c` (kernel-6.6 PCM
+> component). Kept as the record of what was ported + two gotchas that aren't in
+> the reference: (1) the HW descriptor is built with **explicit bit-shifts, not C
+> bitfields** — the vendored struct assumes big-endian, ath79 24.10 is LE; (2) a
+> **hard MBOX reset** (RESET module `0x1806001c` bit1) is needed each `prepare`
+> or the 2nd+ playback fails `-EIO`, and the ALSA buffer must be forced to an
+> integer number of periods (`snd_pcm_hw_constraint_integer`) or a partial buffer
+> tail is skipped each loop → a cyclical pop. Playback runs on the **MBOX0 RX**
+> channel (`BEEP_PLAYBACK_TX` flips to the stock TX path if ever needed).
+
+## Original port task (for reference)
 
 `beep-i2s.c` is the DT-probed **control plane** (clock/format/enable + GPIO mux),
 carried over verbatim from the register map and expected correct. The **data

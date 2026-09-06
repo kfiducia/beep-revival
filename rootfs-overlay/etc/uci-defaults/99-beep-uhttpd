@@ -1,0 +1,25 @@
+#!/bin/sh
+# Expose /ubus for the admin SPA and (if the per-device cert exists) point uhttpd
+# at it. NOTE: we deliberately keep the plain-HTTP listener (no forced https
+# redirect) so the captive-portal browser pops cleanly during setup — that link
+# is already WPA2-encrypted. HTTPS is offered on 443 for LAN use.
+# If px5g will make a cert but 99-beep hasn't yet (its MAC-not-ready retry path),
+# defer so we actually wire HTTPS once the cert exists, instead of skipping 443.
+if [ -x /usr/sbin/px5g ] && [ ! -f /etc/beep-uhttpd.crt ]; then
+	logger -t beep "99-beep-uhttpd: TLS cert not ready yet — retry next boot"
+	exit 1
+fi
+uci -q set uhttpd.main.home=/www
+uci -q set uhttpd.main.ubus_prefix=/ubus
+uci -q set uhttpd.main.cgi_prefix=/cgi-bin      # signed-OTA endpoint lives here
+# allow a large POST body (firmware image ~10MB) and time for the upload
+uci -q set uhttpd.main.max_requests=4
+uci -q set uhttpd.main.script_timeout=120
+# only repoint TLS if 99-beep actually generated the cert (px5g present) — else
+# uhttpd would fail to start its 443 listener trying to load a missing file.
+if [ -f /etc/beep-uhttpd.crt ] && [ -f /etc/beep-uhttpd.key ]; then
+	uci -q set uhttpd.main.cert=/etc/beep-uhttpd.crt
+	uci -q set uhttpd.main.key=/etc/beep-uhttpd.key
+fi
+uci -q commit uhttpd
+exit 0

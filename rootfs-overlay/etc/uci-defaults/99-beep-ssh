@@ -1,0 +1,18 @@
+#!/bin/sh
+# SSH boot policy (fail-secure). Runs on first boot + every sysupgrade. Default
+# OFF; dev builds (/etc/beep-dev) keep it on. The persistent SETTING lives in
+# /etc/config/beep (preserved across updates):
+#   ssh_mode=on   -> leave dropbear enabled (survives reboot)
+#   ssh_mode=temp -> a TIMED enable; deliberately NOT restored on boot (fail-secure)
+#   ssh_mode=off/unset -> disabled
+[ -f /etc/beep-dev ] && exit 0
+mode="$(uci -q get beep.main.ssh_mode)"
+[ "$mode" = "on" ] && exit 0        # keep image-default (dropbear enabled)
+# off / temp / unset -> secure default. A stale 'temp' collapses to off on reboot.
+if [ "$mode" = "temp" ]; then
+	uci -q set beep.main.ssh_mode=off; uci -q delete beep.main.ssh_expires; uci -q commit beep
+fi
+/etc/init.d/dropbear disable 2>/dev/null
+/etc/init.d/dropbear stop    2>/dev/null
+logger -t beep "ssh: off by default (mode=${mode:-unset})"
+exit 0

@@ -1,0 +1,9 @@
+# Files preserved across a config-keeping sysupgrade. Without this, the overlay is
+# wiped on every update and 99-beep re-provisions from scratch — resetting the
+# owner's admin password back to the MAC code and regenerating the TLS cert.
+# Keeping /etc/beep-code makes 99-beep's `[ ! -f /etc/beep-code ]` guard skip on
+# upgrades, so identity + credentials stay put. (Factory reset still wipes the
+# overlay and regenerates these, which is the intended reset behavior.)
+/etc/beep-code
+/etc/beep-uhttpd.crt
+/etc/beep-uhttpd.key

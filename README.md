@@ -7,6 +7,29 @@ Connect / Snapcast / DLNA), a firmware-owned physical UX (knob / tap /
 double-tap-to-join), and a small authenticated on-device admin — nothing
 load-bearing that can be killed by a vanished app or server.
 
+## Status — ✅ working, flashed, on the network (2026-09-05)
+- **🔊 Audio works** — clean tone/playback out the jack from an entirely
+  from-scratch kernel-6.6 driver: the AR9331 I²S CPU DAI **plus** the MBOX-DMA
+  data plane (descriptor-ring DMA + IRQ handler), the WM8524 codec, and
+  simple-audio-card. No mainline AR9331 audio driver exists — this port is the
+  only one for a modern kernel.
+- **📦 Flashed & persistent** on unit #1 — boots from flash via the Beep's own
+  `bootb` failsafe (preserved, not bypassed: `beep_primary` re-pointed at our
+  kernel; bootcount + recovery-slot mechanism intact).
+- **📶 Networked** — wifi (ath9k, nvmem calibration), dropbear, AirPlay
+  (`shairport-sync`); joins the LAN, key-auth SSH, `scp -O` deploys.
+- **🎛️ Admin/setup web app + self-healing wifi** *(implemented, NOT yet verified on hardware)* —
+  a self-contained `/ubus` SPA (wifi scan/join, naming, volume, reboot, admin
+  password), a continuous wifi-fallback watchdog → WPA2 `Beep-Setup` AP with a
+  pulsing LED ring, per-device credentials (no blank-auth), and the stock LED
+  behaviors (idle/volume/party) restored. AirPlay 2 trimmed to a **9.94 MB** image
+  so a recovery slot fits. See `BUILD-STATUS.md`.
+- **Open (Phase 3):** build a recovery-slot initramfs into the freed ~5.6 MB so
+  `bootb` auto-recovers a bad update without a UART; multiroom (Snapcast).
+
+New here? See **[`docs/INSTALL.md`](docs/INSTALL.md)** (rescue/flash your own Beep)
+and **[`docs/COMPARISON.md`](docs/COMPARISON.md)** (stock vs. open, feature by feature).
+
 Background + full research: `docs/` (symlinks to `~/beep-revival/`):
 `RESEARCH-SYNTHESIS.md` (start here), `FIRMWARE-BUILD-PLAN.md`, `ARCHITECTURE.md`,
 and the security post-mortem `ATTACK-SURFACE.md`.
@@ -15,10 +38,13 @@ and the security post-mortem `ATTACK-SURFACE.md`.
 | Path | What |
 |---|---|
 | `dts/ar9331_beep_dial.dts` | device tree: I²S+WM8524, i2c-gpio (STM8), setup key, ART-preserving partitions |
-| `driver-i2s/beep-i2s.c` | AR9331 I²S CPU DAI + pinmux (control plane; **PCM/DMA port pending** — see `driver-i2s/PORTING.md`) |
+| `driver-i2s/beep-i2s.c` | AR9331 I²S CPU DAI + pinmux **+ MBOX-DMA data plane (working)** — descriptor ring, IRQ handler, PCM component; see `driver-i2s/PORTING.md` |
 | `driver-i2s/reference/` | franzflasch DMA source we're porting |
 | `beepd/beepd.c` | STM8 control daemon (knob/tap/LED @ i²c 0x23) |
-| `rootfs-overlay/` | init scripts, provisioning (SoftAP+captive portal), authenticated `rpcd` admin, per-device secrets |
+| `rootfs-overlay/www/index.html` | self-contained admin/setup SPA (talks to `/ubus`) |
+| `rootfs-overlay/usr/libexec/rpcd/beep` | authenticated backend: status/scan/set_wifi/set_name/set_volume/reboot/… |
+| `rootfs-overlay/usr/libexec/beep/` | wifi-setup-enable/disable, netcheck-loop (fallback watchdog), beep-action (gestures) |
+| `rootfs-overlay/etc/` | init scripts, uci-defaults (per-device code+cert, service enable), asound.conf softvol |
 | `feed/` | OpenWrt packages: `kmod-beep-i2s`, `beepd` |
 | `scripts/` | `docker-build-setup.sh` (toolchain), `build.sh` (image) |
 | `prebuilt/` | stock OpenWrt Carambola2 images for the Phase-0 RAM-boot test |
@@ -32,14 +58,26 @@ docker exec -it beep-build bash /src/scripts/build.sh
 # images land in the container at /build/openwrt/bin/targets/ath79/generic/
 ```
 
-## Flash (safe order — RESEARCH-SYNTHESIS.md)
-1. **Phase 0 (zero risk, do first):** `loady` the *prebuilt* initramfs into unit
-   #1's U-Boot RAM, `bootm`; confirm mainline boots + wifi + ART-MAC + SSH — no
-   flash writes. Validates ~90% of the platform.
-2. **Phase 1 (the gate):** RAM-boot our custom initramfs, bring up the audio
-   driver, get a clean `speaker-test` tone (Saleae-verify clocks first).
-3. Commit via SSH `sysupgrade` on unit #1 (rooted); one UART clip for unit #2.
-   Never write u-boot / art.
+## Flash (the safe order we followed — all done on unit #1)
+
+> **Rescuing your own stock Beep?** Follow the step-by-step, never-brick guide in
+> **[`docs/INSTALL.md`](docs/INSTALL.md)** — hardware, serial console, full backup,
+> and the phased flash written for someone new to the board. The summary below is
+> the same procedure in brief.
+
+1. **Phase 0 (zero risk):** `loady` the *prebuilt* mainline initramfs into U-Boot
+   RAM, `bootm`; confirmed board + wifi + ART-MAC on mainline. No flash writes.
+2. **Phase 1 (the gate):** RAM-boot our custom initramfs (`serial-loady.sh`),
+   bring up audio, chase a clean tone. Iterated the driver *without* rebooting via
+   `serial-send.sh` (YMODEM the `.ko` to a running `rz`) + `rmmod`/`insmod`.
+3. **Phase 2 (commit):** `serial-send.sh` the sysupgrade to `/tmp`, md5-verify,
+   `sysupgrade -n`. Then in U-Boot **`setenv beep_primary 0x9f050000; saveenv`** —
+   this keeps the stock `bootb` bootcount/recovery failsafe and just points its
+   *primary* slot at our kernel (OpenWrt lands at `0x50000`; stock U-Boot looks at
+   `0x550000`). **Never write u-boot / art.** U-Boot + the full `flash.bin` dump
+   are the un-brickable backstop.
+4. From here unit #1 is network-flashable (`scp -O` + `sysupgrade`) — no serial.
+   Unit #2 needs one UART clip to reach step 2, then it's networked too.
 
 ## Security (fixes the stock Beep's sins — see ATTACK-SURFACE.md)
 No anonymous control API (admin behind `rpcd` session auth), no default creds

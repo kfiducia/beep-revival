@@ -1,22 +1,55 @@
 #!/bin/sh
-# Bring up "Beep-Setup-XXXX" AP + captive portal (no cloud). Idempotent.
-MAC6="$(cat /sys/class/ieee80211/phy0/macaddress 2>/dev/null | tr -d : | tail -c 7 | tr a-z A-Z)"
+# Bring up "Beep-Setup-XXXX" (WPA2) + captive portal and put the LED ring into
+# AP-setup mode. Idempotent, no cloud. The single radio can't be AP+STA at once,
+# so this disables the client STA while the setup AP is up.
+CODE="$(cat /etc/beep-code 2>/dev/null)"
+[ "${#CODE}" -ge 8 ] || CODE="$(cat /sys/class/net/eth0/address 2>/dev/null | tr -d ': \n' | tr a-z A-Z)"
+if [ "${#CODE}" -lt 8 ]; then CODE="beepsetup00"; logger -t beep "wifi-setup: no device code — using fallback key"; fi
+MAC6="$(printf '%s' "$CODE" | tail -c 6)"     # CODE is uppercase hex
+
+# radio: AP up, client STA down + the AP's static IP
 uci -q batch <<UCI
 set wireless.setup=wifi-iface
 set wireless.setup.device=radio0
 set wireless.setup.network=beepap
 set wireless.setup.mode=ap
-set wireless.setup.ssid=Beep-Setup-${MAC6}
-set wireless.setup.encryption=none
+set wireless.setup.ssid=BeepRevival-Setup-${MAC6}
+set wireless.setup.encryption=psk2
+set wireless.setup.key=${CODE}
 set wireless.setup.disabled=0
+set wireless.@wifi-iface[0].disabled=1
 set network.beepap=interface
 set network.beepap.proto=static
 set network.beepap.ipaddr=192.168.60.1
 set network.beepap.netmask=255.255.255.0
 commit
 UCI
-# captive-portal DNS hijack: answer every query with our IP so phones auto-pop setup
-grep -q '^address=/#/192.168.60.1' /etc/dnsmasq.conf 2>/dev/null || \
-	echo 'address=/#/192.168.60.1' >> /etc/dnsmasq.conf
-/etc/init.d/dnsmasq restart; wifi reload; /etc/init.d/uhttpd restart
-logger -t beep "wifi setup mode: SSID Beep-Setup-${MAC6}"
+
+# DHCP + captive-portal DNS for the AP — via UCI. OpenWrt's dnsmasq is driven by
+# /etc/config/dhcp and does NOT read /etc/dnsmasq.conf, so the hijack must live
+# here. address=/#/ answers every name with us so the phone's portal probe pops.
+uci -q batch <<UCI
+set dhcp.beepap=dhcp
+set dhcp.beepap.interface=beepap
+set dhcp.beepap.start=100
+set dhcp.beepap.limit=100
+set dhcp.beepap.leasetime=1h
+UCI
+uci -q get dhcp.@dnsmasq[0].address | grep -q '/#/192.168.60.1' || \
+	uci -q add_list dhcp.@dnsmasq[0].address='/#/192.168.60.1'
+uci -q commit dhcp
+
+# firewall: an unzoned iface defaults to REJECT input, so clients couldn't reach
+# DHCP/DNS/HTTP. Put beepap in the lan zone (input ACCEPT). Resolve the zone by
+# NAME, not @zone[0] position (robust to non-stock firewall configs).
+LZ="$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='lan'.*/\1/p" | head -1)"
+[ -n "$LZ" ] || LZ="@zone[0]"
+uci -q get "firewall.${LZ}.network" | grep -qw beepap || uci -q add_list "firewall.${LZ}.network=beepap"
+uci -q commit firewall
+
+mkdir -p /var/run/beep; echo ap > /var/run/beep/led-mode   # ring -> AP comet
+wifi reload
+/etc/init.d/dnsmasq restart 2>/dev/null
+/etc/init.d/firewall reload 2>/dev/null
+/etc/init.d/uhttpd restart 2>/dev/null
+logger -t beep "wifi setup mode: SSID Beep-Setup-${MAC6} (WPA2)"

@@ -1,0 +1,20 @@
+#!/bin/sh
+# Enable the audio + discovery services on boot. AirPlay 2 needs all three:
+# shairport-sync (the stream), avahi-daemon (mDNS advertisement — without it the
+# speaker is invisible), and nqptp (the PTP clock).
+for s in nqptp avahi-daemon shairport-sync; do
+	[ -x /etc/init.d/$s ] && /etc/init.d/$s enable 2>/dev/null
+done
+
+# shairport-sync's OpenWrt config has TWO instances; gate on `enabled` (NOT
+# `disabled` — that was the bug that kept AirPlay from ever starting). Run only
+# the instance that uses our native /etc/shairport-sync.conf, and disable the
+# other so we don't double-bind. name/output/device/mixer come from our conf.
+if uci -q get shairport-sync.shairport_sync_file >/dev/null 2>&1; then
+	uci -q set shairport-sync.shairport_sync_file.enabled=1
+	uci -q set shairport-sync.shairport_sync_file.conf_custom=1
+	uci -q set shairport-sync.shairport_sync_file.conf_file=/etc/shairport-sync.conf
+	uci -q set shairport-sync.shairport_sync.enabled=0
+	uci -q commit shairport-sync
+fi
+exit 0
