@@ -1,0 +1,18 @@
+#!/bin/sh
+# First-boot multi-room default: ship as a standalone speaker (solo) with the
+# Snapcast services DISABLED, so a fresh unit doesn't boot with snapclient/
+# snapserver spinning (they auto-enable on package install, and with no group
+# configured snapclient busy-loops on "No chunks available"). beep-group enables
+# them only when the user selects the primary/member role.
+[ -x /etc/init.d/snapclient ] && /etc/init.d/snapclient disable 2>/dev/null
+[ -x /etc/init.d/snapserver ] && /etc/init.d/snapserver disable 2>/dev/null
+/etc/init.d/snapclient stop 2>/dev/null
+/etc/init.d/snapserver stop 2>/dev/null
+if ! uci -q get beep.main >/dev/null 2>&1; then
+	uci -q set beep.main=beep
+fi
+if ! uci -q get beep.main.group_role >/dev/null 2>&1; then
+	uci -q set beep.main.group_role=solo
+	uci -q commit beep
+fi
+exit 0

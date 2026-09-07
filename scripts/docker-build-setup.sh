@@ -7,9 +7,11 @@ if [ ! -d openwrt ]; then
   apt-get update -qq
   # NOTE: no gcc-multilib/g++-multilib — x86-only, absent on arm64 hosts and not
   # needed (OpenWrt builds its own MIPS cross-toolchain from source).
+  # bc: the kernel build needs it to generate include/generated/timeconst.h (else
+  # "bc: not found" -> Error 127). quilt: package patch management.
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang flex bison g++ gawk \
     gettext git libncurses-dev libssl-dev python3 python3-setuptools \
-    rsync swig unzip zlib1g-dev file wget time >/dev/null
+    rsync swig unzip zlib1g-dev file wget time bc quilt >/dev/null
   git clone --depth 1 -b v24.10.0 https://git.openwrt.org/openwrt/openwrt.git
 fi
 cd openwrt

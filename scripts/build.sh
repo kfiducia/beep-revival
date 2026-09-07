@@ -7,8 +7,11 @@
 # (its flash layout already matches the Beep) but swap in our device tree
 # (adds I2S/WM8524 + i2c-gpio STM8 + setup key) and layer our feed + files.
 set -e
-OW=/build/openwrt
-SRC=/src
+# GNU tar (and a few other host tools) refuse to ./configure as root; the build
+# container runs as root, so bypass the check (harmless — it's a throwaway container).
+export FORCE_UNSAFE_CONFIGURE=1
+OW="${OW:-/build/openwrt}"
+SRC="${SRC:-/src}"
 cd "$OW"
 
 echo "== 1. local package feed =="
@@ -16,32 +19,77 @@ grep -q 'src-link beepfeed' feeds.conf.default || echo "src-link beepfeed $SRC/f
 ./scripts/feeds update beepfeed >/dev/null
 ./scripts/feeds install -a -p beepfeed >/dev/null
 
-echo "== 1b. AirPlay 2 on a minimal ffmpeg =="
-# shairport-sync hardcodes +libffmpeg-full (~12MB: all video/filters). AirPlay 2
-# only needs AAC+ALAC *decode*, which libffmpeg-audio-dec provides at ~2-3MB
-# (--enable-small, audio codecs only). Patch the dep so AirPlay 2 keeps working
-# but the image shrinks enough to also fit a recovery slot.
+echo "== 1b. AirPlay build mode (default: classic AirPlay-1 for Snapcast; AIRPLAY2=1: buffered AAC) =="
+# The AR9331 (400MHz, no SIMD) CANNOT decode AirPlay-2 buffered AAC in real time —
+# measured 0% idle + instant PCM XRUN the moment playback starts (see BUILD-STATUS).
+# So the DEFAULT image ships CLASSIC AirPlay-1 (realtime ALAC, ~10x lighter) as the
+# light *ingest* for Snapcast multi-room. AIRPLAY2=1 keeps the full AirPlay-2 build
+# intact for on-device CPU-reduction experiments (kept, not deleted).
 SPS="$OW/feeds/packages/sound/shairport-sync/Makefile"
-[ -f "$SPS" ] && sed -i 's/+libffmpeg-full/+libffmpeg-audio-dec/g' "$SPS"
-# audio-dec --disable-swresamples and doesn't ship libswresample, but shairport
-# links it (the resampler). Force swresample ON + into the audio-dec/mini install.
 FM="$OW/feeds/packages/multimedia/ffmpeg/Makefile"
-if [ -f "$FM" ]; then
-  sed -i 's/--disable-swresample/--enable-swresample/g' "$FM"
-  sed -i 's/{avcodec,avformat,avutil}/{avcodec,avformat,avutil,swresample}/g' "$FM"
-  # audio-dec/install = custom/install, whose unconditional copy is line 740
-  # lib{avcodec,avdevice,avformat,avutil}.so.* (swresample only in a conditional
-  # line audio-dec never triggers) — add swresample there so the .ipk ships it.
-  sed -i 's/lib{avcodec,avdevice,avformat,avutil}\.so\.\*/lib{avcodec,avdevice,avformat,avutil,swresample}.so.*/g' "$FM"
-  # AirPlay 2 HARD-requires a FLOAT (FLTP) AAC decoder (shairport's
-  # has_fltp_capable_aac_decoder(); else it dies "can not run on this system").
-  # The audio-dec preset's decoder list OMITS aac entirely (only alac/flac/...),
-  # and the block ends with a --disable-decoder line — append the float aac
-  # decoder + parser there so AirPlay 2 works while ffmpeg stays small (~+200KB).
-  sed -i 's/--disable-decoder=pcm_bluray,pcm_dvd/--disable-decoder=pcm_bluray,pcm_dvd --enable-decoder=aac --enable-parser=aac/' "$FM"
+SPP="$OW/feeds/packages/sound/shairport-sync/patches"
+# CRITICAL: the mode-specific seds below are PERSISTENT, non-idempotent edits to the
+# shared packages-feed Makefiles. Restore them to pristine (from the feed's git)
+# before EACH build — otherwise a prior build's edits leak in. (This bit us: a
+# default build strips --with-airplay-2, then an AIRPLAY2 build on the same tree
+# silently produced a classic binary because the strip was still in the Makefile.)
+git config --global --add safe.directory "$OW/feeds/packages" 2>/dev/null || true
+git -C "$OW/feeds/packages" checkout -- sound/shairport-sync/Makefile multimedia/ffmpeg/Makefile 2>/dev/null || true
+# Universal (both modes): make the pipe backend emit little-endian S16 so Snapcast
+# (which assumes LE) gets clean audio on this big-endian target instead of static.
+# The patch compiles out on little-endian hosts, so it's harmless everywhere else.
+mkdir -p "$SPP"
+cp "$SRC/scripts/patches/030-pipe-output-little-endian.patch" "$SPP/" 2>/dev/null || true
+if [ -n "${AIRPLAY2:-}" ]; then
+  echo "   [AIRPLAY2] AirPlay-2 build — experimental on this silicon; ffmpeg full->audio-dec + BE crypto patch"
+  # shairport-sync hardcodes +libffmpeg-full (~12MB). AirPlay 2 only needs AAC+ALAC
+  # *decode* → libffmpeg-audio-dec (~2-3MB, --enable-small). Patch the dep down.
+  [ -f "$SPS" ] && sed -i 's/+libffmpeg-full/+libffmpeg-audio-dec/g' "$SPS"
+  # audio-dec doesn't ship libswresample, but shairport links it. Force it ON + into install.
+  if [ -f "$FM" ]; then
+    sed -i 's/--disable-swresample/--enable-swresample/g' "$FM"
+    sed -i 's/{avcodec,avformat,avutil}/{avcodec,avformat,avutil,swresample}/g' "$FM"
+    # CRITICAL: the Build/InstallDev block (headers+lib+.pc → staging, what shairport
+    # BUILDS against) uses the avdevice-inclusive brace {avcodec,avdevice,avformat,avutil}.
+    # Without swresample there, libavcodec's link test fails and shairport's configure
+    # reports "AirPlay 2 support requires libavcodec". Add swresample to that pattern too.
+    sed -i 's/lib{avcodec,avdevice,avformat,avutil}/lib{avcodec,avdevice,avformat,avutil,swresample}/g' "$FM"
+    # Enable BOTH aac (float) and aac_fixed (fixed-point). aac_fixed is integer-only
+    # and ~10x cheaper on the FPU-less AR9331 (measured); our decode patch selects it.
+    sed -i 's/--disable-decoder=pcm_bluray,pcm_dvd/--disable-decoder=pcm_bluray,pcm_dvd --enable-decoder=aac,aac_fixed --enable-parser=aac/' "$FM"
+  fi
+  # AirPlay 2 on BIG-ENDIAN MIPS: our LE-framing pair_ap patch (shairport-sync #1683).
+  mkdir -p "$SPP"
+  cp "$SRC/scripts/patches/010-airplay2-bigendian-pairing.patch" "$SPP/" 2>/dev/null || true
+  # Fixed-point AAC decode: select ffmpeg's aac_fixed (integer S32P) instead of the
+  # float decoder so AAC-LC decode fits the 400MHz no-FPU core. See docs/DEV-NOTES.md §1.
+  cp "$SRC/scripts/patches/020-aac-fixed-decode.patch" "$SPP/" 2>/dev/null || true
+  # Force a clean ffmpeg restage so the swresample InstallDev fix actually takes —
+  # stale staged libav* from a prior variant can otherwise leave libswresample missing.
+  make package/feeds/packages/ffmpeg/dirclean >/dev/null 2>&1 || true
+  # ONLY ffmpeg's libs — NOT libav* wildcard (that also nukes libavahi-client/common/core,
+  # which shairport needs, and made configure fail on Avahi instead).
+  rm -f "$OW"/staging_dir/target-*/usr/lib/libav{codec,device,filter,format,util}.so* \
+        "$OW"/staging_dir/target-*/usr/lib/lib{swresample,swscale,postproc}.so* 2>/dev/null || true
+  # Build + STAGE ffmpeg NOW (before the world build). shairport's runtime DEPENDS on
+  # libffmpeg doesn't force ffmpeg's InstallDev to finish before shairport configures
+  # under -j, so shairport could otherwise configure before libswresample is staged and
+  # fail "requires libavcodec". Staging it here first makes the ordering deterministic.
+  echo "   [AIRPLAY2] pre-building ffmpeg (audio-dec + swresample) so shairport finds it"
+  make package/feeds/packages/ffmpeg/compile -j4 >/dev/null 2>&1 || { echo "!! ffmpeg pre-build failed"; exit 4; }
+else
+  echo "   [default] classic AirPlay-1 — strip --with-airplay-2 + AP2-only deps (no ffmpeg/nqptp/sodium/gcrypt)"
+  if [ -f "$SPS" ]; then
+    # drop the AirPlay-2 configure flag (and MQTT, unused) → classic RAOP. KEEP --with-pipe
+    # (shairport writes raw PCM to a fifo that snapserver reads — the multi-room ingest).
+    sed -i '/--with-airplay-2/d; /--with-mqtt-client/d' "$SPS"
+    # trim AP2-only deps from the default DEPENDS line so nothing heavy is pulled in
+    sed -i '/DEPENDS:=@AUDIO_SUPPORT/ { s/+libplist //g; s/+libsodium //g; s/+libgcrypt //g; s/+libffmpeg-full //g; s/+libffmpeg-audio-dec //g; s/+nqptp //g; s/+libmosquitto //g }' "$SPS"
+  fi
+  # the AP2 crypto patch targets pair_ap (not compiled in a classic build) — keep it out
+  rm -f "$SPP/010-airplay2-bigendian-pairing.patch" 2>/dev/null || true
 fi
-# we patched both Makefiles → force a clean rebuild so the changes take
-make package/feeds/packages/ffmpeg/clean >/dev/null 2>&1 || true
+# Makefile/source changed → force a clean shairport rebuild so the mode switch takes
 make package/feeds/packages/shairport-sync/clean >/dev/null 2>&1 || true
 
 echo "== 2. swap in our device tree (keep carambola2 board-name for sysupgrade) =="
@@ -89,18 +137,13 @@ CFG
 # a ~14MB image decompresses past its load address and clobbers its own
 # compressed source (LZMA ERROR 1). The full image still boots fine from FLASH;
 # the lean image is purely for zero-risk RAM-boot driver testing.
-# NOTE: snapcast is NOT in the 24.10 feeds — deferred either way.
 if [ -z "${LEAN:-}" ]; then
 cat >> .config <<CFG
-#CONFIG_PACKAGE_snapcast-client=y  (not in 24.10 feeds; deferred)
-# AirPlay 2: use the mbedtls variant (it links avahi, so it actually ADVERTISES;
-# the mini variant uses tinysvcmdns which CANNOT advertise AirPlay 2 → invisible).
-# ffmpeg is swapped full→audio-dec below (AAC+ALAC only, ~2-3MB vs ~12MB) so
-# AirPlay 2 stays functional AND a ~5MB recovery slot still fits in 16MB flash.
+# shairport-sync mbedtls variant links avahi so it ADVERTISES over mDNS (the mini
+# variant's tinysvcmdns cannot). In DEFAULT mode 1b strips --with-airplay-2 from
+# this same package → it becomes a light classic AirPlay-1 receiver.
 CONFIG_PACKAGE_shairport-sync-mbedtls=y
 CONFIG_PACKAGE_avahi-daemon=y
-CONFIG_PACKAGE_libffmpeg-audio-dec=y
-# CONFIG_PACKAGE_libffmpeg-full is not set
 CONFIG_PACKAGE_uhttpd=y
 CONFIG_PACKAGE_uhttpd-mod-ubus=y
 CONFIG_PACKAGE_rpcd=y
@@ -111,6 +154,28 @@ CONFIG_PACKAGE_iwinfo=y
 # signed OTA: usign verifies the uploaded image against the baked-in pubkey
 CONFIG_PACKAGE_usign=y
 CFG
+if [ -n "${AIRPLAY2:-}" ]; then
+cat >> .config <<CFG
+# AIRPLAY2 image: buffered AAC needs a float-capable ffmpeg decoder (trimmed to
+# audio-dec in 1b). No Snapcast here — this image is for AP2 CPU-reduction work.
+CONFIG_PACKAGE_libffmpeg-audio-dec=y
+# CONFIG_PACKAGE_libffmpeg-full is not set
+# CONFIG_PACKAGE_snapserver is not set
+# CONFIG_PACKAGE_snapclient is not set
+CFG
+else
+cat >> .config <<CFG
+# DEFAULT image: Snapcast multi-room. The AirPlay-receiving Beep runs snapserver
+# (fed by the classic AirPlay-1 shairport pipe); every Beep runs snapclient and
+# plays to the shared server timeline → sample-accurate sync. Classic AirPlay-1
+# pulls no ffmpeg. libatomic: snapcast's 64-bit std::atomic needs it on mips32.
+CONFIG_PACKAGE_snapserver=y
+CONFIG_PACKAGE_snapclient=y
+CONFIG_PACKAGE_libatomic=y
+# CONFIG_PACKAGE_libffmpeg-full is not set
+# CONFIG_PACKAGE_libffmpeg-audio-dec is not set
+CFG
+fi
 else
 # Explicitly DISABLE (not just omit) — build.sh appends to .config, so a prior
 # full build's =y lines are still present; last-wins in kconfig must turn them off.
@@ -153,9 +218,28 @@ rm -rf "$OW"/build_dir/target-*/linux-*/beep-i2s \
        "$OW"/build_dir/target-*/linux-*/beepd \
        "$OW"/build_dir/target-*/linux-*/sound-soc-extra 2>/dev/null || true
 set -o pipefail   # else the pipe's exit = tee/tail, masking a make failure
-make -j"$(nproc)" 2>&1 | tee /build/image-build.log | tail -1
+# Cap parallelism. On many-core hosts OpenWrt's recursive sub-makes (notably gcc's
+# bootstrap, and several base packages: zlib/usign/libjson-c) RACE at very high -j
+# and fail non-deterministically with a bare "world Error 1". Capping at 6 (override
+# with JOBS=) builds reliably; the toolchain itself must be built at low -j too.
+JOBS="${JOBS:-$(n=$(nproc); [ "$n" -gt 6 ] && echo 6 || echo "$n")}"
+echo "   building with -j$JOBS (cap avoids high-parallelism gcc/base-package races)"
+make -j"$JOBS" 2>&1 | tee /build/image-build.log | tail -1
 MAKE_RC=$?
 [ "$MAKE_RC" -eq 0 ] || { echo "!! make FAILED (rc=$MAKE_RC) — see /build/image-build.log"; exit "$MAKE_RC"; }
+
+# GUARD: an AIRPLAY2 build MUST actually contain AirPlay 2. This silently regressed
+# once when a prior default build's --with-airplay-2 strip leaked into the Makefile,
+# producing a classic binary that no one caught until it was flashed. Fail loudly.
+if [ -n "${AIRPLAY2:-}" ]; then
+  SPB="$(ls "$OW"/staging_dir/target-*/root-*/usr/bin/shairport-sync 2>/dev/null | head -1)"
+  if [ -n "$SPB" ] && strings "$SPB" 2>/dev/null | grep -qi airplay2; then
+    echo "   [AIRPLAY2] verified: shairport binary contains AirPlay 2"
+  else
+    echo "!! AIRPLAY2=1 but the built shairport-sync is NOT an AirPlay-2 binary — aborting"
+    exit 3
+  fi
+fi
 
 # LEAN: surgically drop rootfs fat that's a hard dependency (can't deselect) but
 # useless for a tone test — the ALSA UCM profiles (~2MB, alsa-ucm-conf is pulled

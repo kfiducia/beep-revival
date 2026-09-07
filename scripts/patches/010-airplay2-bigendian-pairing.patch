@@ -1,0 +1,42 @@
+--- a/pair_ap/pair_homekit.c
++++ b/pair_ap/pair_homekit.c
+@@ -2971,11 +2971,13 @@
+       // If it is the last block we will encrypt only the remaining data
+       block_len = (i + 1 == nblocks) ? (plaintext + plaintext_len - plain_block) : ENCRYPTED_LEN_MAX;
+ 
+-      memcpy(nonce + 4, &(cctx->encryption_counter), sizeof(cctx->encryption_counter));// TODO BE or LE?
++      { uint64_t _ec = cctx->encryption_counter; int _k; /* beep-revival: LE nonce */
++        for (_k = 0; _k < 8; _k++) nonce[4 + _k] = (uint8_t)(_ec >> (8 * _k)); }
+ 
+       // Write the ciphered block
+-      memcpy(cipher_block, &block_len, sizeof(block_len)); // TODO BE or LE?
+-      ret = encrypt_chacha(cipher_block + sizeof(block_len), plain_block, block_len, cctx->encryption_key, sizeof(cctx->encryption_key), &block_len, sizeof(block_len), tag, sizeof(tag), nonce);
++      { uint8_t _bl[2] = { (uint8_t)(block_len & 0xff), (uint8_t)((block_len >> 8) & 0xff) }; /* beep-revival: LE len+AAD */
++      memcpy(cipher_block, _bl, sizeof(_bl));
++      ret = encrypt_chacha(cipher_block + sizeof(block_len), plain_block, block_len, cctx->encryption_key, sizeof(cctx->encryption_key), _bl, sizeof(_bl), tag, sizeof(tag), nonce); }
+       if (ret < 0)
+ 	{
+ 	  cctx->errmsg = "Encryption with chacha poly1305 failed";
+@@ -3018,7 +3020,7 @@
+ 
+   for (plain_block = *plaintext, cipher_block = ciphertext; cipher_block < ciphertext + ciphertext_len; )
+     {
+-      memcpy(&block_len, cipher_block, sizeof(block_len)); // TODO BE or LE?
++      block_len = (uint16_t)(cipher_block[0] | (cipher_block[1] << 8)); /* beep-revival: LE len */
+       if (cipher_block + block_len + sizeof(block_len) + AUTHTAG_LENGTH > ciphertext + ciphertext_len)
+ 	{
+ 	  // The remaining ciphertext doesn't contain an entire block, so stop
+@@ -3026,9 +3028,11 @@
+ 	}
+ 
+       memcpy(tag, cipher_block + sizeof(block_len) + block_len, sizeof(tag));
+-      memcpy(nonce + 4, &(cctx->decryption_counter), sizeof(cctx->decryption_counter));// TODO BE or LE?
++      { uint64_t _dc = cctx->decryption_counter; int _k; /* beep-revival: LE nonce */
++        for (_k = 0; _k < 8; _k++) nonce[4 + _k] = (uint8_t)(_dc >> (8 * _k)); }
+ 
+-      ret = decrypt_chacha(plain_block, cipher_block + sizeof(block_len), block_len, cctx->decryption_key, sizeof(cctx->decryption_key), &block_len, sizeof(block_len), tag, sizeof(tag), nonce);
++      { uint8_t _bl[2] = { (uint8_t)(block_len & 0xff), (uint8_t)((block_len >> 8) & 0xff) }; /* beep-revival: LE AAD */
++      ret = decrypt_chacha(plain_block, cipher_block + sizeof(block_len), block_len, cctx->decryption_key, sizeof(cctx->decryption_key), _bl, sizeof(_bl), tag, sizeof(tag), nonce); }
+       if (ret < 0)
+ 	{
+ 	  cctx->errmsg = "Decryption with chacha poly1305 failed";

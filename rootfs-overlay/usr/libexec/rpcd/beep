@@ -60,8 +60,9 @@ volume() {
 }
 
 status() {
-	local name role apm up ip ssid sig ver vol utime smode sexp
+	local name role apm up ip ssid sig ver vol utime smode sexp grole
 	smode="$(uget beep.main.ssh_mode)"; [ -n "$smode" ] || smode=off
+	grole="$(uget beep.main.group_role)"; [ -n "$grole" ] || grole=solo
 	sexp="$(uget beep.main.ssh_expires)"; case "$sexp" in ''|*[!0-9]*) sexp=null;; esac
 	name="$(jesc "$(uget system.@system[0].hostname)")"
 	role="$(jesc "$(uget beep.main.role)")"
@@ -75,7 +76,10 @@ status() {
 	utime="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; case "$utime" in [0-9]*) ;; *) utime=0;; esac
 	printf '{"name":"%s","airplay_name":"%s","role":"%s","ap_mode":%s,' "$name" "$name" "$role" "$apm"
 	printf '"connected":%s,"ssid":"%s","ip":"%s","signal":%s,' "$up" "$ssid" "$ip" "$sig"
-	printf '"volume":%s,"version":"%s","uptime":%s,"ssh":%s,"ssh_mode":"%s","ssh_expires":%s}\n' "$vol" "$ver" "$utime" "$(ssh_on)" "$smode" "$sexp"
+	printf '"volume":%s,"version":"%s","uptime":%s,"ssh":%s,"ssh_mode":"%s","ssh_expires":%s,' "$vol" "$ver" "$utime" "$(ssh_on)" "$smode" "$sexp"
+	printf '"group_role":"%s","snapserver":%s,"snapclient":%s}\n' "$grole" \
+		"$(pidof snapserver >/dev/null 2>&1 && echo true || echo false)" \
+		"$(pidof snapclient >/dev/null 2>&1 && echo true || echo false)"
 }
 
 scan() {
@@ -142,13 +146,17 @@ set_volume() {
 	echo "{\"ok\":true,\"volume\":$p}"
 }
 
-set_audio() {
-	local role srv; role="$(jf '@.role')"; srv="$(jf '@.snapserver')"
-	[ "$role" = client ] || [ "$role" = server ] || { echo '{"error":"role client|server"}'; return; }
-	uci set beep.main.role="$role"
-	[ -n "$srv" ] && uci set beep.main.snapserver="$srv"
-	uci commit beep
-	echo '{"ok":true}'
+set_group() {
+	# Multi-room role. solo = standalone (shairport -> ALSA). primary = this Beep
+	# receives AirPlay and runs the Snapcast server the group syncs to. member =
+	# plays the group's stream (snapclient), discovering the primary over mDNS (or
+	# an explicit server host). beep-group applies the services + shairport backend.
+	local role srv; role="$(jf '@.role')"; srv="$(jf '@.server')"
+	case "$role" in solo|primary|member) ;; *) echo '{"error":"role solo|primary|member"}'; return;; esac
+	if [ -n "$srv" ]; then uci -q set beep.main.group_server="$srv"; else uci -q delete beep.main.group_server 2>/dev/null; fi
+	uci -q set beep.main.group_role="$role"; uci -q commit beep
+	/usr/libexec/beep/beep-group "$role" >/dev/null 2>&1
+	echo "{\"ok\":true,\"role\":\"$role\"}"
 }
 
 set_password() {
@@ -190,7 +198,7 @@ reboot_dev() { (sleep 1; reboot) >/dev/null 2>&1 & echo '{"ok":true}'; }
 
 case "$1" in
   list)
-    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_audio":{"role":"str","snapserver":"str"}, "set_password":{"password":"str"}, "set_ssh":{"enabled":0}, "reboot":{} }'
+    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_group":{"role":"str","server":"str"}, "set_password":{"password":"str"}, "set_ssh":{"mode":"str","hours":0}, "reboot":{} }'
     ;;
   call)
     method="$2"; INPUT="$(cat)"
@@ -200,7 +208,7 @@ case "$1" in
       set_wifi)     set_wifi ;;
       set_name)     set_name ;;
       set_volume)   set_volume ;;
-      set_audio)    set_audio ;;
+      set_group)    set_group ;;
       set_password) set_password ;;
       set_ssh)      set_ssh ;;
       reboot)       reboot_dev ;;
