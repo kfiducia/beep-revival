@@ -14,6 +14,16 @@ the dead Beep servers. It's written for someone who has never touched this board
 > §§11–12). If you brick your device, you are responsible for it — there is no
 > support guarantee. Proceed only if you accept that.
 
+> 📖 **For the detailed, validated, "run this → looks like this" version of this
+> process, see [`FLASHING-WALKTHROUGH.md`](FLASHING-WALKTHROUGH.md)** — it has the
+> developer-unlock step, the verified-backup tooling, and per-step expected output.
+>
+> ⚠️ **Partitions vary by unit — always match by NAME, never by mtd number.** Some
+> units have an extra `rootfs_data` partition that shifts the numbering, so `art`
+> (your irreplaceable MAC + calibration) may be `mtd6` on one Beep and `mtd7` on
+> another. Everywhere below that names an mtd number, **verify it against
+> `cat /proc/mtd` on *your* device first.**
+
 ---
 
 ## 0. Is this your device?
