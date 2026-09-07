@@ -1,0 +1,78 @@
+#!/bin/sh
+# beep-group — apply this Beep's multi-room role. Model A (self-contained): the
+# AirPlay-receiving Beep is the group PRIMARY (classic AirPlay-1 -> /tmp/snapfifo ->
+# snapserver -> snapclients); every Beep runs snapclient and plays to the shared
+# server timeline, so a group stays sample-accurately in sync. AirPlay-2 grouping
+# can't run on this 400MHz silicon (AAC decode saturates the core) — Snapcast is
+# the sync engine instead.
+#
+# Roles (uci: beep.main.group_role):
+#   solo    - shairport -> ALSA directly (low latency, no snapcast). Default.
+#   primary - shairport(AirPlay-1) -> pipe -> snapserver + local snapclient. Advertises.
+#   member  - snapclient only; mDNS-discovers the primary (or beep.main.group_server).
+#
+# Usage: beep-group apply | primary | member | solo | toggle | status
+
+SPCONF=/etc/shairport-sync.conf
+FIFO=/tmp/snapfifo
+RUNDIR=/var/run/beep
+
+log() { logger -t beep-group "$*"; }
+
+sp_backend() {  # $1 = alsa|pipe
+	[ -f "$SPCONF" ] || return 0
+	sed -i 's/output_backend = "[a-z]*";/output_backend = "'"$1"'";/' "$SPCONF"
+	if [ "$1" = pipe ]; then
+		grep -q '^pipe = {' "$SPCONF" || \
+			printf '\npipe = {\n\tname = "%s";\n};\n' "$FIFO" >> "$SPCONF"
+	fi
+}
+
+svc() { /etc/init.d/"$1" "$2" >/dev/null 2>&1; }
+
+apply_solo() {
+	log "role=solo"
+	sp_backend alsa
+	svc snapclient disable; svc snapclient stop
+	svc snapserver disable; svc snapserver stop
+	svc shairport-sync enable; svc shairport-sync restart
+	rm -f "$RUNDIR/group" 2>/dev/null
+}
+
+apply_primary() {
+	log "role=primary"
+	mkdir -p "$RUNDIR"
+	[ -p "$FIFO" ] || { rm -f "$FIFO"; mkfifo -m 666 "$FIFO"; }
+	sp_backend pipe
+	svc snapserver enable;  svc snapserver restart
+	svc snapclient enable;  svc snapclient restart
+	svc shairport-sync enable; svc shairport-sync restart
+	echo primary > "$RUNDIR/group"
+}
+
+apply_member() {
+	log "role=member server=$(uci -q get beep.main.group_server || echo mDNS)"
+	mkdir -p "$RUNDIR"
+	sp_backend alsa
+	svc shairport-sync disable; svc shairport-sync stop   # members don't receive AirPlay; the primary does
+	svc snapserver disable; svc snapserver stop
+	svc snapclient enable;  svc snapclient restart
+	echo member > "$RUNDIR/group"
+}
+
+role="${1:-apply}"
+[ "$role" = apply ] && role="$(uci -q get beep.main.group_role || echo solo)"
+
+case "$role" in
+	primary) uci -q set beep.main.group_role=primary; uci -q commit beep; apply_primary ;;
+	member)  uci -q set beep.main.group_role=member;  uci -q commit beep; apply_member ;;
+	solo)    uci -q set beep.main.group_role=solo;    uci -q commit beep; apply_solo ;;
+	toggle)  # double-tap: leave the group if in it, else (re)join as member
+		if [ -f "$RUNDIR/group" ]; then apply_solo; else apply_member; fi ;;
+	status)
+		printf 'role=%s snapserver=%s snapclient=%s\n' \
+			"$(uci -q get beep.main.group_role || echo solo)" \
+			"$(pidof snapserver >/dev/null && echo up || echo down)" \
+			"$(pidof snapclient >/dev/null && echo up || echo down)" ;;
+	*) echo "usage: beep-group apply|primary|member|solo|toggle|status" >&2; exit 1 ;;
+esac

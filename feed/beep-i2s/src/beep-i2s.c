@@ -116,6 +116,7 @@ struct beep_hwdesc {
 #define AR9331_GPIO_OE		0x00
 #define AR9331_GPIO_FUNC	0x28
 #define AR9331_GPIO_FUNC2	0x30
+#define FUNC_I2S_SPDIF_EN	BIT(30)   /* S/PDIF (optical) output enable — see beep_pinmux */
 #define FUNC_I2S_GPIO_18_22_EN	BIT(29)
 #define FUNC_I2S_REFCLKEN	BIT(28)
 #define FUNC_I2S_MCKEN		BIT(27)
@@ -125,6 +126,7 @@ struct beep_hwdesc {
 #define I2S_PIN_SD    20
 #define I2S_PIN_MCLK  21
 #define I2S_PIN_MIC   22
+/* GPIO23 is the S/PDIF (optical) pin — enabled via FUNC_I2S_SPDIF_EN, not GPIO_OE */
 
 struct beep_i2s {
 	struct device *dev;
@@ -181,9 +183,15 @@ static int beep_pinmux(struct device *dev)
 	if (!g)
 		return -ENOMEM;
 	v = readl(g + AR9331_GPIO_FUNC);
-	v |= FUNC_I2S_GPIO_18_22_EN | FUNC_I2S_MCKEN | FUNC_I2S0_EN;
+	/* FUNC_I2S_SPDIF_EN (bit30) is what actually routes S/PDIF out to GPIO23 and
+	 * drives the pad — verified LIVE on the device (poking bit30 lit the optical
+	 * TOSLINK; the GPIO_OE bit23 that stock also writes is a no-op here — it won't
+	 * even latch, the S/PDIF function owns the pad). Stock's ath_i2s_init_reg sets
+	 * FUNC |= 0x6c000000, i.e. these four bits including bit30. Without bit30 the
+	 * optical stays dark even with SPDIF_ENABLE set. */
+	v |= FUNC_I2S_SPDIF_EN | FUNC_I2S_GPIO_18_22_EN | FUNC_I2S_MCKEN | FUNC_I2S0_EN;
 	writel(v, g + AR9331_GPIO_FUNC); readl(g + AR9331_GPIO_FUNC);
-	writel(readl(g + AR9331_GPIO_FUNC2) | BIT(2), g + AR9331_GPIO_FUNC2); /* SPDIF/GPIO23 */
+	writel(readl(g + AR9331_GPIO_FUNC2) | BIT(2), g + AR9331_GPIO_FUNC2); /* SPDIF/GPIO23 mux */
 	v = readl(g + AR9331_GPIO_OE);
 	v |= BIT(I2S_PIN_SCK) | BIT(I2S_PIN_WS) | BIT(I2S_PIN_SD) | BIT(I2S_PIN_MCLK);
 	v &= ~BIT(I2S_PIN_MIC);

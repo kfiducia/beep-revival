@@ -1,0 +1,24 @@
+#!/bin/sh /etc/rc.common
+# Snapcast server — runs only on the Beep that is the group PRIMARY (the one
+# receiving AirPlay). Reads /etc/snapserver.conf, whose pipe source is /tmp/snapfifo,
+# fed by the local classic AirPlay-1 shairport. Enabled/disabled by beep-group.
+USE_PROCD=1
+START=96
+STOP=9
+
+FIFO=/tmp/snapfifo
+
+start_service() {
+	# The pipe source must exist before snapserver opens it for reading.
+	[ -p "$FIFO" ] || { rm -f "$FIFO"; mkfifo -m 666 "$FIFO"; }
+	procd_open_instance
+	procd_set_param command /usr/bin/snapserver --server.datadir=/tmp -c /etc/snapserver.conf
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger beep
+}

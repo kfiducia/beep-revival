@@ -1,0 +1,40 @@
+--- a/rtp.c
++++ b/rtp.c
+@@ -2269,7 +2269,12 @@
+   // ideas and some code from https://rodic.fr/blog/libavcodec-tutorial-decode-audio-file/
+   // with thanks
+ 
+-  const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
++  const AVCodec *codec = avcodec_find_decoder_by_name("aac_fixed");
++  // Beep: prefer the FIXED-POINT AAC decoder (integer S32P). On the FPU-less
++  // AR9331 it is ~10x cheaper than the float decoder (soft-float emulation).
++  // Fall back to the default (float, fltp) decoder if aac_fixed is absent.
++  if (codec == NULL)
++    codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
+   if (codec == NULL) {
+     debug(1, "Can't find an AAC decoder!");
+   }
+@@ -2318,7 +2323,8 @@
+   av_opt_set_int(swr, "in_sample_rate", conn->input_rate, 0);
+   av_opt_set_int(swr, "out_sample_rate", conn->input_rate,
+                  0); // must match or the timing will be wrong`
+-  av_opt_set_sample_fmt(swr, "in_sample_fmt", AV_SAMPLE_FMT_FLTP, 0);
++  av_opt_set_sample_fmt(swr, "in_sample_fmt", codec->sample_fmts[0],
++                        0); // Beep: match chosen decoder (S32P for aac_fixed, fltp for float aac)
+ 
+   enum AVSampleFormat av_format;
+   switch (config.output_format) {
+--- a/shairport.c
++++ b/shairport.c
+@@ -157,6 +157,11 @@
+ 
+   // return 1 if the AAC decoder advertises fltp decoding capability, which
+   // is needed for decoding Buffered Audio streams
++  // Beep: the fixed-point AAC decoder (aac_fixed) emits integer S32P, not
++  // fltp, but rtp.c selects it and configures swr to its native format, so
++  // treat its presence as sufficient to run.
++  if (avcodec_find_decoder_by_name("aac_fixed") != NULL)
++    return 1;
+   int has_capability = 0;
+   const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
+   if (codec != NULL) {

@@ -53,6 +53,21 @@
 #define MULTI_TAP_MS       380    /* window between taps for double/triple detection */
 #define VOL_HOLD_MS       1500    /* keep the volume arc up this long after a turn */
 
+/* --- LED UX state machine: boot-sequence timings + ring geometry ------------
+ * Beepd owns the ring, so it renders the whole boot story itself the moment it
+ * starts (a few seconds into userspace): smiley -> sweep -> live states. There's
+ * no pre-Linux stage here by design (no bootloader/STM8 changes). */
+#define SMILEY_MS         1200    /* boot-OK smiley shown this long at startup */
+#define SWEEP_MS          2000    /* symmetric two-LED boot sweep after the smiley */
+#define SLEEP_AFTER_MS  120000    /* connected + idle this long -> dim to sleep pulse */
+/* Ring positions, logical index 0..23: 0 = 12 o'clock, increasing clockwise.
+ * These are the on-device calibration knobs — light one LED, see where it lands,
+ * nudge until the smiley/sweep/sleep sit right. */
+#define LED_TOP            0      /* 12 o'clock */
+#define LED_BOT           12      /* 6 o'clock */
+#define EYE_L             20      /* ~10 o'clock */
+#define EYE_R              4      /* ~2 o'clock  */
+
 #define ACTION_BIN        "/usr/libexec/beep/beep-action"
 
 static volatile sig_atomic_t running = 1;
@@ -125,6 +140,24 @@ static void refresh_led_mode(void)
 	led_mode = (n >= 2 && b[0] == 'a' && b[1] == 'p') ? 1 : 0;
 }
 
+/* --- net state --------------------------------------------------------------
+ * The Wi-Fi watchdog writes "connecting" or "connected" here so the ring can
+ * show a working spinner while associating vs. a calm idle once we have an IP.
+ * AP-setup uses led-mode (above), which outranks this. A missing file reads as
+ * "connecting" — which is exactly true during the boot window before DHCP. */
+#define NET_STATE_FILE "/var/run/beep/net-state"
+static int net_connected = 0;
+
+static void refresh_net_state(void)
+{
+	int fd = open(NET_STATE_FILE, O_RDONLY);
+	if (fd < 0) { net_connected = 0; return; }
+	char b[16] = {0};
+	int n = read(fd, b, sizeof b - 1);
+	close(fd);
+	net_connected = (n >= 9 && strncmp(b, "connected", 9) == 0);
+}
+
 /* Rotating comet (bright head + fading tail) — the "come reconfigure me" signal.
  * ~1 rev/sec at the 24 Hz poll. Ring is single-brightness per LED, so this reads
  * as a distinct chasing pattern vs. any steady volume/gesture feedback. */
@@ -135,6 +168,67 @@ static void led_render_ap(int64_t frame)
 	memset(led_target, 0, sizeof led_target);
 	for (int d = 0; d < (int)(sizeof tail); d++)
 		led_target[(head - d + NLED) % NLED] = tail[d];
+}
+
+/* Boot-OK "smiley": two eyes + a bottom smile arc. 24 mono LEDs can't draw a
+ * real face, but eyes-over-a-smile reads unmistakably as a happy power-on glyph. */
+static void led_render_smiley(void)
+{
+	memset(led_target, 0, sizeof led_target);
+	led_target[EYE_L] = 255;
+	led_target[EYE_R] = 255;
+	for (int i = LED_BOT - 2; i <= LED_BOT + 2; i++)   /* smile arc across 6 o'clock */
+		led_target[(i + NLED) % NLED] = 200;
+}
+
+/* Boot progress: two LEDs sweep down both sides in mirror (12->6, then back), the
+ * stock "I'm booting" look. Triangle-wave position with a short trailing tail. */
+static void led_render_sweep(int64_t frame)
+{
+	static const uint8_t tail[] = { 255, 90, 25 };
+	int half = LED_BOT;                              /* 12 -> 6 is 12 steps */
+	int ph   = (int)(frame % (2 * half));            /* 0..2*half */
+	int pos  = (ph <= half) ? ph : (2 * half - ph);  /* 0..half..0 */
+	memset(led_target, 0, sizeof led_target);
+	for (int d = 0; d < (int)sizeof tail; d++) {
+		int p = pos - d; if (p < 0) p = 0;
+		int r = (LED_TOP + p) % NLED;                /* right side, clockwise */
+		int l = (LED_TOP - p + NLED) % NLED;         /* left side, mirror image */
+		if (tail[d] > led_target[r]) led_target[r] = tail[d];
+		if (tail[d] > led_target[l]) led_target[l] = tail[d];
+	}
+}
+
+/* "Ready": the whole ring breathing gently (integer triangle wave, no libm). */
+static void led_render_breathe(int64_t frame)
+{
+	int period = 84;                                 /* ~3.5s at 24 Hz */
+	int ph  = (int)(frame % period);
+	int tri = (ph < period / 2) ? ph : (period - ph);/* 0..42 */
+	uint8_t level = (uint8_t)(24 + tri * 3);         /* ~24..150 */
+	memset(led_target, level, sizeof led_target);
+}
+
+/* Wi-Fi connecting: a single dot orbiting on a dim track. Deliberately unlike the
+ * AP-setup comet (long tail, black background) so the two are never confused. */
+static void led_render_connecting(int64_t frame)
+{
+	int head = (int)(frame % NLED);
+	memset(led_target, 10, sizeof led_target);       /* dim "working" track */
+	led_target[head] = 255;
+	led_target[(head - 1 + NLED) % NLED] = 70;
+}
+
+/* "Sleep": the bottom two LEDs pulsing slowly and softly — on, idle, at rest. */
+static void led_render_sleep(int64_t frame)
+{
+	int period = 120;                                /* ~5s */
+	int ph  = (int)(frame % period);
+	int tri = (ph < period / 2) ? ph : (period - ph);/* 0..60 */
+	uint8_t lvl = (uint8_t)(3 + tri / 2);            /* ~3..33, soft */
+	memset(led_target, 0, sizeof led_target);
+	led_target[LED_BOT]              = lvl;
+	led_target[(LED_BOT + 1) % NLED] = lvl;
 }
 
 /* Is the PCM actually pushing samples? (drives "playing" party mode.) */
@@ -245,11 +339,13 @@ int main(int argc, char **argv)
 	int64_t last_tap_at = -1;   /* ms of the last tap in a tap burst */
 	int  tap_count = 0;         /* taps in the current burst (1/2/3+) */
 	int  read_pending = 0;
-	int64_t loops = 0, anim = 0;/* LED-mode poll counter + AP animation frame */
+	int64_t loops = 0, anim = 0;/* LED-mode poll counter + animation frame */
 	int  vol = 40, playing = 0; /* vol 0..100 (display), PCM-running latch */
 	int64_t last_vol_ms = -100000;       /* last knob turn — gates the volume arc */
 	int64_t last_turn_exec = -100000;    /* coalesce knob execs (perf) */
 	int  pending_turn = 0;               /* net detents awaiting a single exec */
+	int64_t t0 = now_ms();               /* beepd start — anchors the boot sequence */
+	int64_t last_active_ms = t0;         /* last activity — gates ready-breathe -> sleep */
 	srand((unsigned)now_ms());
 
 	memset(led_target, 0, sizeof led_target);
@@ -316,14 +412,28 @@ int main(int argc, char **argv)
 		 * moves, a random party pulse during playback — plus our AP-setup comet.
 		 * refresh the control file ~2x/sec and the PCM state ~4x/sec. */
 		if ((loops   % 12) == 0) refresh_led_mode();
+		if ((loops   % 12) == 3) refresh_net_state();
 		if ((loops++ %  6) == 0) playing = pcm_running();
 		int64_t held = (btn_down_at >= 0) ? (t - btn_down_at) : -1;
-		if (led_mode)                            led_render_ap(anim++);
-		else if (held >= ARM_SHOW_MS)            led_render_arming(held);
-		else if (t - last_vol_ms < VOL_HOLD_MS) { int sv = read_vol_file();
-		                                          led_render_volume(sv < 0 ? vol : sv); }
-		else if (playing)                        led_render_party();
-		else                                     memset(led_target, 0, sizeof led_target);
+		int64_t f = anim++;                 /* free-running animation frame */
+		/* any activity (knob, button, playback) refeeds the sleep timer */
+		if (playing || (t - last_vol_ms) < VOL_HOLD_MS || btn_down_at >= 0)
+			last_active_ms = t;
+
+		/* Priority, high -> low: boot story first, then AP-setup, then live
+		 * feedback (arming/volume/playing), then the idle continuum
+		 * (connecting spinner -> ready breathe -> sleep pulse). */
+		int64_t boot_ms = t - t0;
+		if      (boot_ms < SMILEY_MS)                 led_render_smiley();
+		else if (boot_ms < SMILEY_MS + SWEEP_MS)      led_render_sweep(f);
+		else if (led_mode)                            led_render_ap(f);
+		else if (held >= ARM_SHOW_MS)                 led_render_arming(held);
+		else if (t - last_vol_ms < VOL_HOLD_MS)     { int sv = read_vol_file();
+		                                              led_render_volume(sv < 0 ? vol : sv); }
+		else if (playing)                             led_render_party();
+		else if (!net_connected)                      led_render_connecting(f);
+		else if (t - last_active_ms < SLEEP_AFTER_MS) led_render_breathe(f);
+		else                                          led_render_sleep(f);
 
 		led_flush(read_pending);
 		read_pending = 0;

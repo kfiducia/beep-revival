@@ -1,0 +1,32 @@
+Make the pipe backend emit little-endian S16.
+
+shairport-sync's pipe backend writes the decoded audio buffer verbatim, in the
+host's native byte order. On a big-endian target (ath79 / mips_24kc BE) that is
+big-endian S16, but Snapcast's pipe source — and virtually every other pipe
+consumer — expects little-endian S16LE. The mismatch turns music into full-scale
+white-noise static (every sample's two bytes swapped).
+
+Byte-swap each 16-bit sample before the write. The block compiles out on
+little-endian hosts via __BYTE_ORDER__, so it is a no-op everywhere except the
+big-endian build and is safe to carry as a downstream patch.
+
+--- a/audio_pipe.c
++++ b/audio_pipe.c
+@@ -76,6 +76,17 @@
+   }
+   // if it's got a reader, write to it.
+   if (fd > 0) {
++    // The buffer is native-endian S16 stereo. Snapcast (and most pipe consumers)
++    // expect little-endian S16LE; on a big-endian host that mismatch renders as
++    // white-noise static. Byte-swap each 16-bit sample. Compiles out on LE hosts.
++#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++    {
++      uint16_t *sp = (uint16_t *)buf;
++      int i, n = samples * 2; /* two int16 samples per stereo frame */
++      for (i = 0; i < n; i++)
++        sp[i] = (uint16_t)((sp[i] << 8) | (sp[i] >> 8));
++    }
++#endif
+     // int rc = non_blocking_write(fd, buf, samples * 4);
+     int rc = write(fd, buf, samples * 4);
+     if ((rc < 0) && (errno != EPIPE)) {

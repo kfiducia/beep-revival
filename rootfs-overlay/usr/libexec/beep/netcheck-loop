@@ -15,6 +15,11 @@ sta_ok() {
 }
 ap_up() { [ "$(uci -q get wireless.setup.disabled)" = "0" ]; }
 
+# net-state drives the ring (beepd reads it): "connecting" -> orbiting spinner,
+# "connected" -> calm idle. AP-setup is signalled separately via led-mode.
+set_net() { mkdir -p /var/run/beep 2>/dev/null; printf '%s' "$1" > /var/run/beep/net-state; }
+
+set_net connecting   # we come up trying to associate
 sleep 25       # let wifi + DHCP settle after boot before judging
 fails=0
 while :; do
@@ -33,10 +38,12 @@ while :; do
 	fi
 	if sta_ok; then
 		fails=0
+		set_net connected
 		ap_up && /usr/libexec/beep/wifi-setup-disable   # recovered -> drop the AP
 		sleep 20
 	else
 		fails=$((fails + 1))
+		set_net connecting
 		[ "$fails" -ge "$GRACE" ] && { ap_up || /usr/libexec/beep/wifi-setup-enable; }
 		sleep "$PERIOD"
 	fi

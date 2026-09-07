@@ -157,19 +157,24 @@ summary::-webkit-details-marker{display:none}
 
     <!-- system -->
     <div class="card">
+      <h2>🔊 Multi-room</h2>
+      <p class="mut">Play the same audio in sync across your Beeps. Make one the
+        <b>Group primary</b> (AirPlay to that one) and the others <b>Members</b>.
+        <b>Solo</b> is a standalone speaker.</p>
+      <div class="seg" role="group" aria-label="Multi-room role" style="margin-top:10px">
+        <button id="grp-solo"    aria-pressed="true"  onclick="setGroup('solo')">Solo</button>
+        <button id="grp-primary" aria-pressed="false" onclick="setGroup('primary')">Group primary</button>
+        <button id="grp-member"  aria-pressed="false" onclick="setGroup('member')">Member</button>
+      </div>
+      <div id="grp-srvwrap" class="hide" style="margin-top:12px">
+        <label for="grp-srv">Primary address <span class="mut">(blank = auto-discover on your network)</span></label>
+        <input id="grp-srv" type="text" placeholder="auto (mDNS)">
+      </div>
+      <p class="mut" id="grp-status" style="margin-top:10px"></p>
+    </div>
+
+    <div class="card">
       <h2>System</h2>
-      <details class="mb">
-        <summary>Multi-room audio (advanced)</summary>
-        <div style="margin-top:12px">
-          <div class="seg" role="group" aria-label="Role">
-            <button id="role-client" aria-pressed="true"  onclick="setRole('client')">Player</button>
-            <button id="role-server" aria-pressed="false" onclick="setRole('server')">Group host</button>
-          </div>
-          <label for="snap">Group host address</label>
-          <input id="snap" type="text" placeholder="127.0.0.1">
-          <button class="btn sec" style="margin-top:12px" onclick="saveAudio()">Save audio</button>
-        </div>
-      </details>
       <details class="mb">
         <summary>Set admin password</summary>
         <div style="margin-top:12px">
@@ -217,7 +222,7 @@ summary::-webkit-details-marker{display:none}
 <script>
 "use strict";
 var UBUS="/ubus", NULLSESS="00000000000000000000000000000000", sess=NULLSESS;
-var role="client", selEnc=false;
+var selEnc=false;
 
 function el(id){return document.getElementById(id);}
 function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast show"+(bad?" bad":"");
@@ -260,7 +265,7 @@ function refresh(){return call("status").then(function(s){
   el("s-up").textContent=fmtUp(s.uptime);
   if(!el("nm").matches(":focus"))el("nm").value=s.name||"";
   if(s.volume!=null && !el("vol")._live){el("vol").value=s.volume;el("volpct").textContent=s.volume+"%";}
-  role=s.role||"client"; setRoleUI(role);
+  setGroupUI(s);
   setSshUI(s);
   el("foot").textContent="Beep Revival — open firmware · "+(s.name||"");
 }).catch(function(e){ // status failed -> needs login
@@ -315,12 +320,24 @@ function volInput(v){el("volpct").textContent=v+"%";var r=el("vol");r._live=true
     call("set_volume",{percent:+v}).catch(function(e){toast(e.message,true);})
       .then(function(){clearTimeout(r._clearT);r._clearT=setTimeout(function(){r._live=false;},1500);});},180);}
 
-function setRoleUI(r){el("role-client").setAttribute("aria-pressed",r==="client");
-  el("role-server").setAttribute("aria-pressed",r==="server");}
-function setRole(r){role=r;setRoleUI(r);}
-function saveAudio(){call("set_audio",{role:role,snapserver:el("snap").value.trim()})
-  .then(function(){toast("Audio settings saved");}).catch(function(e){toast(e.message,true);});}
-
+function setGroupUI(s){
+  var r=(s&&s.group_role)||"solo";
+  ["solo","primary","member"].forEach(function(x){
+    var b=el("grp-"+x); if(b)b.setAttribute("aria-pressed",x===r);
+  });
+  el("grp-srvwrap").classList.toggle("hide",r!=="member");
+  var msg="";
+  if(r==="primary") msg=s&&s.snapserver?"Hosting the group — AirPlay here and members will sync.":"Starting the group host…";
+  else if(r==="member") msg=s&&s.snapclient?"In the group — playing in sync with the primary.":"Joining… make sure a primary is active.";
+  else msg="Standalone speaker. AirPlay directly to this Beep.";
+  el("grp-status").textContent=msg;
+}
+function setGroup(r){
+  var body={role:r}; if(r==="member"){var v=el("grp-srv").value.trim(); if(v)body.server=v;}
+  el("grp-status").textContent="Applying…";
+  call("set_group",body).then(function(){setTimeout(refresh,1200);})
+    .catch(function(e){el("grp-status").textContent="Failed: "+(e&&e.message||e);});
+}
 function savePw(){var p=el("np").value;if(p.length<6){toast("Min 6 characters",true);return;}
   call("set_password",{password:p}).then(function(){el("np").value="";toast("Password set");})
     .catch(function(e){toast(e.message,true);});}
