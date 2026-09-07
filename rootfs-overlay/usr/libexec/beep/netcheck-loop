@@ -15,11 +15,31 @@ sta_ok() {
 }
 ap_up() { [ "$(uci -q get wireless.setup.disabled)" = "0" ]; }
 
+# set_wifi (and boot, below) drop this marker — a deadline in *uptime* seconds —
+# when we are DELIBERATELY switching the single radio AP->STA. While it's live we
+# must NOT fall back to the setup AP: the radio can't be AP+STA at once, so a
+# premature fallback rips the radio out mid-handshake and the join never lands
+# (proven live: with this fallback suppressed, the STA associates in ~3s). It
+# self-expires, so a genuinely wrong password still returns to setup after the
+# window. Monotonic uptime avoids a pre-NTP wall clock mis-expiring it.
+joining() {
+	local d now; d="$(cat /var/run/beep/joining 2>/dev/null)" || return 1
+	case "$d" in ''|*[!0-9]*) return 1;; esac
+	now="$(cut -d. -f1 /proc/uptime)"
+	[ "$now" -lt "$d" ]
+}
+
 # net-state drives the ring (beepd reads it): "connecting" -> orbiting spinner,
 # "connected" -> calm idle. AP-setup is signalled separately via led-mode.
 set_net() { mkdir -p /var/run/beep 2>/dev/null; printf '%s' "$1" > /var/run/beep/net-state; }
 
 set_net connecting   # we come up trying to associate
+# On boot with a configured STA, give the first (cold) association the same
+# protected window the portal switch gets — a cold associate + DHCP on this SoC
+# can outlast the base grace, and there's no set_wifi involved to drop the marker.
+[ -n "$(uci -q get wireless.@wifi-iface[0].ssid)" ] && {
+	mkdir -p /var/run/beep 2>/dev/null
+	echo "$(( $(cut -d. -f1 /proc/uptime) + 90 ))" > /var/run/beep/joining; }
 sleep 25       # let wifi + DHCP settle after boot before judging
 fails=0
 while :; do
@@ -38,9 +58,16 @@ while :; do
 	fi
 	if sta_ok; then
 		fails=0
+		rm -f /var/run/beep/joining 2>/dev/null         # landed -> normal watchdog resumes
 		set_net connected
 		ap_up && /usr/libexec/beep/wifi-setup-disable   # recovered -> drop the AP
 		sleep 20
+	elif joining; then
+		# a deliberate AP->STA switch is in flight — give it the full window,
+		# never fall back to the AP mid-association (that's what broke the join)
+		fails=0
+		set_net connecting
+		sleep "$PERIOD"
 	else
 		fails=$((fails + 1))
 		set_net connecting

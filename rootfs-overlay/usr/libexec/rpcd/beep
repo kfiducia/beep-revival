@@ -124,8 +124,16 @@ set_wifi() {
 	uci -q commit firewall; uci -q commit dhcp
 	rm -f /var/run/beep/led-mode 2>/dev/null  # leave the AP-setup ring animation
 	/etc/init.d/firewall reload 2>/dev/null; /etc/init.d/dnsmasq restart 2>/dev/null
+	# Tell the watchdog this AP->STA switch is DELIBERATE: hold its setup-AP fallback
+	# for a full association+DHCP window. The single radio can't be AP+STA at once, so
+	# without this netcheck's short fuse rips the radio back to AP mid-handshake and the
+	# join never lands (proven: with netcheck stopped, the STA associates in ~3s). The
+	# deadline is monotonic uptime-seconds so a pre-NTP clock can't mis-expire it; a
+	# genuinely wrong password still self-heals to setup once the window lapses.
+	mkdir -p /var/run/beep 2>/dev/null
+	echo "$(( $(cut -d. -f1 /proc/uptime) + 90 ))" > /var/run/beep/joining
 	wifi reload
-	echo '{"ok":true,"note":"joining; the setup network drops. Reconnect on your normal wifi to confirm."}'
+	echo '{"ok":true,"note":"Attempting to join. This setup network will disappear; if the join succeeds the speaker appears on your normal Wi-Fi within ~30s. If it fails (e.g. wrong password) this setup network comes back on its own."}'
 }
 
 set_name() {
