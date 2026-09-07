@@ -1,0 +1,177 @@
+name: Release
+
+# Cut a signed Beep Revival firmware release. Push a tag like `v1.0.0` (or run
+# manually), and this builds the shippable image on a GitHub-hosted runner,
+# signs the sysupgrade with the usign OTA key (repo secret BEEP_OTA_SEC), and
+# publishes a GitHub Release with the signed .bin + raw images + checksums + pubkey.
+#
+# One-time setup: add the private OTA key as a repo secret named BEEP_OTA_SEC
+#   gh secret set BEEP_OTA_SEC < ~/beep-ota-signing/beep-ota.sec
+# (Its public half lives in rootfs-overlay/etc/beep-ota.pub and is baked into
+# every image, so devices verify the signature before flashing.)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string to stamp (e.g. v1.0.0-test); defaults to the run id'
+        required: false
+
+permissions:
+  contents: write        # create the GitHub Release + upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-sign-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180   # first run builds the toolchain from source (~45-90 min)
+    steps:
+      - name: Reclaim runner disk (OpenWrt build needs ~25 GB)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then V="${{ github.ref_name }}";
+          elif [ -n "${{ github.event.inputs.version }}" ]; then V="${{ github.event.inputs.version }}";
+          else V="0.0.0+ci.${{ github.run_number }}"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version $V"
+
+      - name: Install build dependencies
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget time bc quilt cmake
+
+      - name: Prepare build root (/build) — matches the scripts' default paths
+        run: sudo mkdir -p /build && sudo chown "$(id -u):$(id -g)" /build
+
+      - name: Cache OpenWrt toolchain + downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            /build/openwrt/dl
+            /build/openwrt/staging_dir
+            /build/openwrt/build_dir/toolchain-*
+          key: openwrt-v24.10.0-ath79-${{ hashFiles('scripts/docker-build-setup.sh') }}
+          restore-keys: |
+            openwrt-v24.10.0-ath79-
+
+      - name: Set up OpenWrt + build cross-toolchain
+        run: |
+          set -e
+          export FORCE_UNSAFE_CONFIGURE=1
+          cd /build
+          [ -d openwrt ] || git clone --depth 1 -b v24.10.0 https://git.openwrt.org/openwrt/openwrt.git
+          cd openwrt
+          ./scripts/feeds update -a >/dev/null
+          ./scripts/feeds install -a >/dev/null
+          cat > .config <<'CFG'
+          CONFIG_TARGET_ath79=y
+          CONFIG_TARGET_ath79_generic=y
+          CONFIG_TARGET_ath79_generic_DEVICE_8dev_carambola2=y
+          CFG
+          make defconfig >/dev/null
+          # low -j for the toolchain (gcc bootstrap races at high parallelism)
+          make -j"$(nproc)" tools/install toolchain/install
+
+      - name: Stamp firmware version
+        run: echo "Beep Revival ${{ steps.ver.outputs.version }}" > rootfs-overlay/etc/beep-version
+
+      - name: Build shippable image (AirPlay-1 + Snapcast, SSH OFF — no BEEP_DEV)
+        run: |
+          export OW=/build/openwrt SRC="$GITHUB_WORKSPACE"
+          bash "$SRC/scripts/build.sh"
+
+      - name: Collect images
+        id: img
+        run: |
+          OUT=/build/openwrt/bin/targets/ath79/generic
+          SYS=$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)
+          INI=$(ls "$OUT"/*8dev_carambola2-initramfs-kernel.bin)
+          echo "sysupgrade=$SYS" >> "$GITHUB_OUTPUT"
+          echo "initramfs=$INI"  >> "$GITHUB_OUTPUT"
+          ls -la "$OUT"/*8dev_carambola2*.bin
+
+      - name: Build usign (matches the baked-in key format)
+        run: |
+          git clone --depth 1 https://github.com/openwrt/usign /tmp/usign
+          cmake -S /tmp/usign -B /tmp/usign/build >/dev/null
+          make -C /tmp/usign/build >/dev/null
+          /tmp/usign/build/usign -h 2>&1 | head -1 || true
+
+      - name: Sign the sysupgrade image
+        env:
+          BEEP_OTA_SEC: ${{ secrets.BEEP_OTA_SEC }}
+        run: |
+          [ -n "$BEEP_OTA_SEC" ] || { echo "::error::secret BEEP_OTA_SEC is not set"; exit 1; }
+          umask 077; printf '%s\n' "$BEEP_OTA_SEC" > /tmp/beep-ota.sec
+          V="${{ steps.ver.outputs.version }}"
+          USIGN=/tmp/usign/build/usign bash scripts/sign-release.sh \
+            "${{ steps.img.outputs.sysupgrade }}" /tmp/beep-ota.sec \
+            "/tmp/beep-revival-${V}-sysupgrade.signed.bin"
+          # verify our own signature against the public key that's baked into the image
+          /tmp/usign/build/usign -V -m "${{ steps.img.outputs.sysupgrade }}" \
+            -p rootfs-overlay/etc/beep-ota.pub \
+            -x <(head -2 "/tmp/beep-revival-${V}-sysupgrade.signed.bin") \
+            && echo "signature verifies against baked-in pubkey"
+          shred -u /tmp/beep-ota.sec
+
+      - name: Assemble release assets + checksums
+        id: assets
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          mkdir -p release
+          cp "${{ steps.img.outputs.sysupgrade }}" "release/beep-revival-${V}-sysupgrade.bin"
+          cp "${{ steps.img.outputs.initramfs }}"  "release/beep-revival-${V}-initramfs-kernel.bin"
+          cp "/tmp/beep-revival-${V}-sysupgrade.signed.bin" release/
+          cp rootfs-overlay/etc/beep-ota.pub release/beep-ota.pub
+          ( cd release && sha256sum * > SHA256SUMS )
+          ls -la release/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Beep Revival ${{ steps.ver.outputs.version }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          draft: ${{ github.ref_type != 'tag' }}   # manual runs land as a draft to review
+          generate_release_notes: true
+          files: release/*
+          body: |
+            **Beep Revival firmware — ${{ steps.ver.outputs.version }}**
+
+            Open OpenWrt-based firmware for the orphaned Beep "Dial" speaker (AR9331 / Carambola 2).
+
+            ### Install (already on Beep Revival)
+            In the device's web admin → **Update firmware**, upload the single
+            **`*-sysupgrade.signed.bin`**. The device verifies the usign signature
+            against its baked-in key before flashing. No unsigned bypass without the
+            physical triple-tap.
+
+            ### First-time flash (still on stock/cloud firmware)
+            You need a 3.3 V USB-UART adapter. Follow **[docs/FLASHING-WALKTHROUGH.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/FLASHING-WALKTHROUGH.md)**.
+            Use the raw `*-sysupgrade.bin`.
+
+            ### Verify a download
+            `usign -V -m <image> -p beep-ota.pub -x <(head -2 *.signed.bin)` — or check `SHA256SUMS`.
+
+            > ⚠️ **No warranty.** 3.3 V UART only. Never write `u-boot` or `art`. See the walkthrough's safety section.
