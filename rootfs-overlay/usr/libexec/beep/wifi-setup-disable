@@ -6,9 +6,15 @@ set wireless.setup.disabled=1
 set wireless.@wifi-iface[0].disabled=0
 commit wireless
 UCI
-uci -q del_list dhcp.@dnsmasq[0].address='/#/192.168.60.1'   # drop the DNS hijack
+# Fully FLUSH the captive-portal DNS state so real name resolution (and NTP) work
+# again. Nuke the whole dnsmasq address list (only the /#/192.168.60.1 hijack lives
+# there) plus the setup-AP DHCP pool, then do a FULL dnsmasq stop+start so the config
+# is regenerated AND the cache flushed. A plain `restart`/reload left stale hijack
+# answers on a client we tested — every name still resolved to 192.168.60.1.
+uci -q delete dhcp.@dnsmasq[0].address 2>/dev/null   # the captive-portal DNS hijack
+uci -q delete dhcp.beepap 2>/dev/null                # the setup-AP DHCP pool
 uci -q commit dhcp
 rm -f /var/run/beep/led-mode                                 # leave AP-setup ring
 wifi reload
-/etc/init.d/dnsmasq restart 2>/dev/null
+/etc/init.d/dnsmasq stop 2>/dev/null; sleep 1; /etc/init.d/dnsmasq start 2>/dev/null
 logger -t beep "wifi setup mode OFF; client STA re-enabled"
