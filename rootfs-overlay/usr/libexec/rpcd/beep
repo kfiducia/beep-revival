@@ -120,10 +120,15 @@ set_wifi() {
 	# leave the device's own resolver answering every name with 192.168.60.1.
 	lz="$(fw_lan_zone)"
 	uci -q get "firewall.${lz}.network" | grep -qw wwan || uci -q add_list "firewall.${lz}.network=wwan"
-	uci -q del_list dhcp.@dnsmasq[0].address='/#/192.168.60.1'
+	uci -q delete dhcp.@dnsmasq[0].address 2>/dev/null   # nuke the captive-portal DNS hijack list
+	uci -q delete dhcp.beepap 2>/dev/null                # + the setup-AP DHCP pool
 	uci -q commit firewall; uci -q commit dhcp
 	rm -f /var/run/beep/led-mode 2>/dev/null  # leave the AP-setup ring animation
-	/etc/init.d/firewall reload 2>/dev/null; /etc/init.d/dnsmasq restart 2>/dev/null
+	# FULL dnsmasq restart (stop+start, not reload) so the config regenerates AND the
+	# DNS cache is flushed — a reload left stale hijack answers (every name resolved to
+	# 192.168.60.1) on a tested client, which also broke NTP name resolution.
+	/etc/init.d/firewall reload 2>/dev/null
+	/etc/init.d/dnsmasq stop 2>/dev/null; sleep 1; /etc/init.d/dnsmasq start 2>/dev/null
 	# Tell the watchdog this AP->STA switch is DELIBERATE: hold its setup-AP fallback
 	# for a full association+DHCP window. The single radio can't be AP+STA at once, so
 	# without this netcheck's short fuse rips the radio back to AP mid-handshake and the
