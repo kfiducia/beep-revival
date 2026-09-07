@@ -69,9 +69,15 @@ while :; do
 		set_net connecting
 		sleep "$PERIOD"
 	else
+		# ANTI-DEAUTH — do NOT auto-raise the setup AP for a *configured* STA that
+		# can't associate. The old fallback (wifi-setup-enable after GRACE failures)
+		# let an attacker deauth a configured device into setup mode, then read the
+		# MAC-derived code off the broadcast SSID and reconfigure it. Now we just keep
+		# retrying the client; the owner deliberately enters setup by HOLDING THE KNOB
+		# ~10s (beepd hold gesture -> beep-action hold -> wifi-setup-enable). First
+		# boot (no ssid, above) still auto-starts setup — there's no STA to deauth then.
 		fails=$((fails + 1))
 		set_net connecting
-		[ "$fails" -ge "$GRACE" ] && { ap_up || /usr/libexec/beep/wifi-setup-enable; }
 		sleep "$PERIOD"
 	fi
 done
