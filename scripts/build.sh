@@ -130,6 +130,9 @@ CONFIG_PACKAGE_libgpiod=y
 # devmem2 for live MBOX/stereo register peeking (busybox devmem also present)
 CONFIG_PACKAGE_lrzsz=y
 CONFIG_PACKAGE_devmem2=y
+# busybox base64 applet — the signed-OTA cgi base64-decodes the release signature
+# passed in the query string (uhttpd drops custom headers, so it can't ride in one).
+CONFIG_BUSYBOX_CONFIG_BASE64=y
 CFG
 
 # Extra userspace (AirPlay + web admin + dnsmasq) — FULL build only.

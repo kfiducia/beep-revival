@@ -30,34 +30,42 @@ if [ "$REQUEST_METHOD" = GET ]; then
 fi
 [ "$REQUEST_METHOD" = POST ] || { say '405 Method Not Allowed' '{"error":"POST only"}'; exit 0; }
 
-# --- auth signals (headers only — evaluated BEFORE we read the request body) ---
+# --- Auth + signature travel in the QUERY STRING, not custom headers. uhttpd only
+# exports standard request headers (Host/User-Agent/...) to CGI — it silently drops
+# custom X-* headers — but it DOES pass QUERY_STRING and the request body. So the
+# session token and the detached signature come via ?session=&sig=&unsigned=, and the
+# image is the raw body. The signature is base64url (-_ for +/, padding stripped) so
+# it rides in a URL untouched. The browser splits the single signed .bin (sig lines +
+# image) and sends only the image here — no on-device split, so RAM stays ~one image. ---
+qs_get() { printf '%s' "$QUERY_STRING" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
+
+sess="$(qs_get session)"
+sig_b64u="$(qs_get sig)"
+want_unsigned=0
+[ "$(qs_get unsigned)" = "1" ] && want_unsigned=1
+
 admin=0
-sess="$HTTP_X_BEEP_SESSION"
 case "$sess" in ''|*[!0-9a-fA-F]*) ;; *)
 	acc="$(ubus call session access "{\"ubus_rpc_session\":\"$sess\",\"scope\":\"ubus\",\"object\":\"beep\",\"function\":\"reboot\"}" 2>/dev/null | jsonfilter -e '@.access' 2>/dev/null)"
 	[ "$acc" = "true" ] && admin=1 ;;
 esac
 
-# --- decide path from headers (no body needed): unsigned (explicit flag or no sig) vs signed ---
-want_unsigned=0
-[ "$HTTP_X_BEEP_ALLOW_UNSIGNED" = "1" ] && want_unsigned=1
-[ -z "$HTTP_X_BEEP_SIG" ] && want_unsigned=1
-
-# --- AUTHORIZE BEFORE RECEIVING THE IMAGE. Reading the body first let an
+# --- AUTHORIZE BEFORE RECEIVING THE IMAGE. Reading the body first would let an
 # unauthenticated caller stream an arbitrarily large POST into /tmp (tmpfs = RAM)
-# and exhaust memory before any credential was checked — a pre-auth DoS. Decide
-# entirely from headers/flags here, so an unauthorized request is rejected without
-# buffering a single byte of payload. ---
+# and exhaust memory before any credential was checked — a pre-auth DoS. Both the
+# unsigned flag and the session are in the query, so we decide without a body. ---
 if [ "$want_unsigned" = 1 ]; then
 	# UNSIGNED: physical presence is mandatory; an admin session is NOT sufficient.
 	phys_valid || fail '403 Forbidden' '{"error":"unsigned upload requires a physical triple-tap on the device (within 60s)"}'
 else
-	# SIGNED: admin session required (signature itself is verified after receive).
+	# SIGNED: a signature must be supplied AND an admin session held (the signature
+	# itself is verified after the body arrives). A stolen session still can't forge it.
+	[ -n "$sig_b64u" ] || fail '400 Bad Request' '{"error":"no signature — upload a signed .bin (or triple-tap for an unsigned install)"}'
 	[ "$admin" = 1 ] || fail '401 Unauthorized' '{"error":"sign in as admin, or triple-tap the device for an unsigned install"}'
 fi
 
-# --- receive image, hard-capped. Refuse an over-large Content-Length up front,
-# and cap the actual read too so a chunked/omitted length still can't exhaust RAM. ---
+# --- receive image (raw body), hard-capped. Refuse an over-large Content-Length up
+# front, and cap the actual read too so a chunked/omitted length can't exhaust RAM. ---
 MAX_BYTES=16777216   # 16 MiB — real sysupgrade images for this board are ~10 MB
 case "$CONTENT_LENGTH" in
 	''|*[!0-9]*) ;;   # absent/non-numeric (e.g. chunked) — the read cap below still bounds us
@@ -67,11 +75,15 @@ rm -f /tmp/ota.bin /tmp/ota.sig
 head -c "$MAX_BYTES" > /tmp/ota.bin
 [ -s /tmp/ota.bin ] || fail '400 Bad Request' '{"error":"empty image"}'
 
-# --- signature verification for the signed path (needs the received body) ---
+# --- signature verification for the signed path ---
 if [ "$want_unsigned" = 1 ]; then
 	logger -t beep "OTA: UNSIGNED flash authorized by physical triple-tap"
 else
-	printf '%s' "$HTTP_X_BEEP_SIG" | base64 -d > /tmp/ota.sig 2>/dev/null || fail '400 Bad Request' '{"error":"bad signature encoding"}'
+	# base64url -> base64 (restore +/), re-add stripped '=' padding, then decode to
+	# the detached usign signature.
+	b64="$(printf '%s' "$sig_b64u" | tr '_-' '/+')"
+	while [ $(( ${#b64} % 4 )) -ne 0 ]; do b64="${b64}="; done
+	printf '%s' "$b64" | base64 -d > /tmp/ota.sig 2>/dev/null || fail '400 Bad Request' '{"error":"bad signature encoding"}'
 	usign -V -m /tmp/ota.bin -p /etc/beep-ota.pub -x /tmp/ota.sig >/dev/null 2>&1 \
 		|| fail '400 Bad Request' '{"error":"signature verification failed — not a genuine Beep release"}'
 fi

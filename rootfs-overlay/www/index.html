@@ -185,12 +185,11 @@ summary::-webkit-details-marker{display:none}
       <details class="mb">
         <summary>Update firmware</summary>
         <div style="margin-top:12px">
-          <label for="otaimg">Firmware image (.bin)</label>
+          <label for="otaimg">Signed firmware (.bin)</label>
           <input id="otaimg" type="file" accept=".bin,.img" class="mb">
-          <label for="otasig">Signature (.sig)</label>
-          <input id="otasig" type="file" accept=".sig,.ucert" class="mb">
           <button class="btn sec" id="otabtn" onclick="otaUpload()">Verify &amp; install</button>
-          <p class="mut">Signed images from the Beep release key are verified before
+          <p class="mut">Pick the single signed <code>.bin</code> from a Beep release —
+            its signature is bundled in and verified against the device key before
             flashing. If an update won't boot, the device auto-recovers — no cable.
             To install an <b>unsigned</b> build, <b>triple-tap the knob</b> on the
             device (physical presence required — a remote attacker can't).</p>
@@ -345,27 +344,30 @@ function savePw(){var p=el("np").value;if(p.length<6){toast("Min 6 characters",t
 function reboot(){if(!confirm("Restart the Beep now?"))return;
   call("reboot").then(function(){toast("Restarting…");}).catch(function(e){toast(e.message,true);});}
 
-function otaUpload(){   /* signed install — admin session + signature */
-  var img=el("otaimg").files[0], sigf=el("otasig").files[0];
-  if(!img||!sigf){toast("Pick the firmware and its .sig (or triple-tap for unsigned)",true);return;}
+function otaUpload(){   /* signed install — ONE signed .bin (sig lines prepended to the image) */
+  var f=el("otaimg").files[0];
+  if(!f){toast("Pick the signed .bin (or triple-tap the knob for an unsigned install)",true);return;}
   var b=el("otabtn");b.disabled=true;b.innerHTML='<span class="spin"></span> Verifying…';
-  var sr=new FileReader();
-  sr.onload=function(){
-    var sigb64=btoa(new Uint8Array(sr.result).reduce(function(a,c){return a+String.fromCharCode(c);},""));
-    var ir=new FileReader();
-    ir.onload=function(){
-      fetch("/cgi-bin/beep-ota",{method:"POST",
-        headers:{"X-Beep-Session":sess,"X-Beep-Sig":sigb64,"Content-Type":"application/octet-stream"},
-        body:ir.result})
-        .then(function(r){return r.json().catch(function(){return {error:"upload failed"};});})
-        .then(function(j){ if(j.ok)toast("Verified — flashing, device will reboot");
-                           else toast(j.error||"update rejected",true); })
-        .catch(function(){toast("upload failed",true);})
-        .then(function(){b.disabled=false;b.textContent="Verify & install";});
-    };
-    ir.readAsArrayBuffer(img);
+  var done=function(){b.disabled=false;b.textContent="Verify & install";};
+  var r=new FileReader();
+  r.onload=function(){
+    /* uhttpd drops custom X-* headers, so the signature travels in the query and the
+     * image in the body. Split the signed .bin here (browser has the memory): the
+     * usign signature is the first two lines; everything after is the image. */
+    var bytes=new Uint8Array(r.result), nl=0, pos=-1, i;
+    for(i=0;i<bytes.length;i++){ if(bytes[i]===10 && ++nl===2){ pos=i+1; break; } }
+    if(pos<0){ toast("That doesn't look like a signed Beep image",true); done(); return; }
+    var sig="", j; for(j=0;j<pos;j++) sig+=String.fromCharCode(bytes[j]);
+    var sigb64=btoa(sig).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");   /* base64url */
+    fetch("/cgi-bin/beep-ota?session="+encodeURIComponent(sess)+"&sig="+sigb64,
+      {method:"POST",headers:{"Content-Type":"application/octet-stream"},body:bytes.subarray(pos)})
+      .then(function(x){return x.json().catch(function(){return {error:"upload failed"};});})
+      .then(function(jj){ if(jj.ok)toast("Verified — flashing, device will reboot");
+                          else toast(jj.error||"update rejected",true); })
+      .catch(function(){toast("upload failed",true);})
+      .then(done);
   };
-  sr.readAsArrayBuffer(sigf);
+  r.readAsArrayBuffer(f);
 }
 
 function physUpload(){   /* unsigned install — authorized by the physical triple-tap */
@@ -375,9 +377,8 @@ function physUpload(){   /* unsigned install — authorized by the physical trip
   var b=el("physbtn");b.disabled=true;b.innerHTML='<span class="spin"></span> Installing…';
   var ir=new FileReader();
   ir.onload=function(){
-    fetch("/cgi-bin/beep-ota",{method:"POST",
-      headers:{"X-Beep-Allow-Unsigned":"1","Content-Type":"application/octet-stream"},
-      body:ir.result})
+    fetch("/cgi-bin/beep-ota?unsigned=1",
+      {method:"POST",headers:{"Content-Type":"application/octet-stream"},body:ir.result})
       .then(function(r){return r.json().catch(function(){return {error:"upload failed"};});})
       .then(function(j){ if(j.ok)toast("Flashing unsigned — device will reboot");
                          else toast(j.error||"rejected — triple-tap again?",true); })
