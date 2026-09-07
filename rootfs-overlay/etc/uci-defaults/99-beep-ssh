@@ -5,7 +5,9 @@
 #   ssh_mode=on   -> leave dropbear enabled (survives reboot)
 #   ssh_mode=temp -> a TIMED enable; deliberately NOT restored on boot (fail-secure)
 #   ssh_mode=off/unset -> disabled
-[ -f /etc/beep-dev ] && exit 0
+# Dev builds keep SSH on — but make the saved preference MATCH that reality so the
+# admin panel's toggle can't show "Off" while dropbear is actually listening.
+[ -f /etc/beep-dev ] && { uci -q set beep.main.ssh_mode=on; uci -q commit beep; exit 0; }
 mode="$(uci -q get beep.main.ssh_mode)"
 [ "$mode" = "on" ] && exit 0        # keep image-default (dropbear enabled)
 # off / temp / unset -> secure default. A stale 'temp' collapses to off on reboot.

@@ -111,6 +111,7 @@ set_wifi() {
 	if [ -n "$k" ]; then uci set wireless.@wifi-iface[0].encryption=psk2; uci set wireless.@wifi-iface[0].key="$k"
 	else uci set wireless.@wifi-iface[0].encryption=none; uci -q delete wireless.@wifi-iface[0].key; fi
 	uci set wireless.@wifi-iface[0].disabled=0
+	uci set wireless.radio0.disabled=0       # OpenWrt ships the radio disabled; enable it
 	uci -q set wireless.setup.disabled=1     # hand the single radio AP->STA
 	uci commit wireless
 	# put the client iface in the lan zone (unzoned => REJECT input => AirPlay/web

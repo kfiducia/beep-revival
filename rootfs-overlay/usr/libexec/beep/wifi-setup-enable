@@ -9,6 +9,7 @@ MAC6="$(printf '%s' "$CODE" | tail -c 6)"     # CODE is uppercase hex
 
 # radio: AP up, client STA down + the AP's static IP
 uci -q batch <<UCI
+set wireless.radio0.disabled=0
 set wireless.setup=wifi-iface
 set wireless.setup.device=radio0
 set wireless.setup.network=beepap
@@ -52,4 +53,4 @@ wifi reload
 /etc/init.d/dnsmasq restart 2>/dev/null
 /etc/init.d/firewall reload 2>/dev/null
 /etc/init.d/uhttpd restart 2>/dev/null
-logger -t beep "wifi setup mode: SSID Beep-Setup-${MAC6} (WPA2)"
+logger -t beep "wifi setup mode: SSID BeepRevival-Setup-${MAC6} (WPA2)"
