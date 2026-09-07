@@ -50,10 +50,18 @@
 #define NLED              24
 #define POLL_MS           42       /* ~24 Hz */
 #define ARM_SHOW_MS        400    /* show the "arming" ring after this much hold */
+#define BTN_PULSE_MS       350    /* one-shot whole-ring pulse on a button press */
 #define HOLD_WIFI_MS     10000    /* release after >=10s hold -> Wi-Fi setup AP */
 #define HOLD_RESET_MS    30000    /* release after >=30s hold -> factory reset */
 #define MULTI_TAP_MS       380    /* window between taps for double/triple detection */
 #define VOL_HOLD_MS       1500    /* keep the volume arc up this long after a turn */
+#define PLAY_GRACE_MS     3000    /* latch "playing" this long after PCM stops (anti-flicker) */
+/* Party = a faithful port of the stock 'twinkle' view (etc/config/io: audio_playing
+ * -> twinkle). Each sparkle lives PARTY_LIFE_MIN..+RAND frames, ramps up over its
+ * first 1/4 then fades over the last 3/4; a new one seeds every other 24Hz tick. */
+#define PARTY_LIFE_MIN       6    /* min twinkle length in frames (~250ms @ 24Hz) */
+#define PARTY_LIFE_RAND     19    /* + up to this many extra frames (~1000ms max total) */
+#define PARTY_CAP          250    /* stock note: brightness >250 flickers the whole ring */
 
 /* --- LED UX state machine: boot-sequence timings + ring geometry ------------
  * Beepd owns the ring, so it renders the whole boot story itself the moment it
@@ -124,8 +132,11 @@ static void led_flush(int ack_pending)
 	uint8_t out[NLED + 1];
 	for (int i = 0; i < NLED; i++) {
 		int src = (i + LED_ROT) % NLED;         /* logical->wire (bench-calibrated) */
-		uint32_t x = led_target[src];
-		out[i] = (uint8_t)((x * x * x) / 65025); /* cubic perceptual gamma */
+		/* NO gamma. Bench-proven: a raw linear PWM ramp reads perfectly smooth on
+		 * this LED/diffuser, so the driver is already perceptually linear. A cubic
+		 * gamma would crawl at the bottom and rush at the top — which is exactly why
+		 * a full-range party fade "flashed" bright. Output led_target straight. */
+		out[i] = (uint8_t)led_target[src];
 	}
 	out[NLED] = ack_pending ? LED_ACK : 0x00;
 	stm8_write(REG_LED, out, NLED + 1);
@@ -149,6 +160,12 @@ static void refresh_led_mode(void)
 	close(fd);
 	led_mode = (n >= 2 && b[0] == 'a' && b[1] == 'p') ? 1 : 0;
 }
+
+/* muted: beep-action (tap) creates this flag when it soft-mutes Master; the ring
+ * shows a distinct calm breath so "muted" is unmistakable vs the playing sparkle. */
+#define MUTED_FILE "/var/run/beep/muted"
+static int muted = 0;
+static void refresh_muted(void) { muted = (access(MUTED_FILE, F_OK) == 0); }
 
 /* --- net state --------------------------------------------------------------
  * The Wi-Fi watchdog writes "connecting" or "connected" here so the ring can
@@ -210,12 +227,23 @@ static void led_render_sweep(int64_t frame)
 }
 
 /* "Ready": the whole ring breathing gently (integer triangle wave, no libm). */
+/* Muted indicator: a slow, calm whole-ring breath at low brightness — deliberately
+ * unlike the lively playing sparkle, so "we're muted" reads at a glance. */
+static void led_render_muted(int64_t frame)
+{
+	int period = 84;                                  /* ~3.5s at 24Hz — slow */
+	int ph = (int)(frame % period);
+	int tri = (ph < period / 2) ? ph : (period - ph); /* 0..42 */
+	uint8_t level = (uint8_t)(8 + tri);               /* ~8..50, dim */
+	memset(led_target, level, sizeof led_target);
+}
+
 static void led_render_breathe(int64_t frame)
 {
 	int period = 84;                                 /* ~3.5s at 24 Hz */
 	int ph  = (int)(frame % period);
 	int tri = (ph < period / 2) ? ph : (period - ph);/* 0..42 */
-	uint8_t level = (uint8_t)(24 + tri * 3);         /* ~24..150 */
+	uint8_t level = (uint8_t)(4 + tri);              /* ~4..46, gentle (linear — no gamma now) */
 	/* connected + idle: JUST the bottom two LEDs breathing (the pair that
 	 * straddles 6 o'clock, wire 11+12 ~5:45 & 6:15), rest dark — a calm "I'm
 	 * here, resting" indicator rather than the whole ring pulsing. */
@@ -287,18 +315,42 @@ static void led_render_volume(int vol)
 		led_target[(LED_BOT + j) % NLED] = 255;
 }
 
-/* "Party mode" while playing — each LED drifts toward a random target and
- * repicks on arrival, giving an organic random pulse. Integer only (no libm). */
-static uint8_t party_b[NLED], party_t[NLED];
+/* One-shot whole-ring pulse as button-press feedback: a quick symmetric flash
+ * (rise then fall over BTN_PULSE_MS) across all LEDs so a tap is unmistakably
+ * acknowledged, regardless of what state the ring was showing. */
+static void led_render_button_pulse(int64_t elapsed)
+{
+	int half = BTN_PULSE_MS / 2;
+	int64_t tri = (elapsed < half) ? (elapsed * 255 / half)
+	                               : ((BTN_PULSE_MS - elapsed) * 255 / half);
+	if (tri < 0) tri = 0; else if (tri > 255) tri = 255;
+	memset(led_target, (uint8_t)tri, sizeof led_target);
+}
+
+/* "Party mode" while playing — faithful port of the stock Beep 'twinkle' view.
+ * Sparse random sparkles: a new random LED lights every other 24Hz tick and lives
+ * PARTY_LIFE_MIN..+RAND frames, ramping UP over its first 1/4 then fading DOWN over
+ * the remaining 3/4 (a spark then a gentle fall). ~30% lit at once, rest dark.
+ * Capped at PARTY_CAP — the stock notes brightness >250 flickers the whole ring. */
+static int16_t party_life[NLED];   /* twinkle length in frames (0 = idle/dark) */
+static int16_t party_age[NLED];    /* frames elapsed in the current twinkle */
 static void led_render_party(void)
 {
+	static int64_t tw_tick = 0;
+	tw_tick++;
 	for (int i = 0; i < NLED; i++) {
-		int b = party_b[i], tg = party_t[i];
-		if (b < tg)      b += (tg - b > 14) ? 14 : (tg - b);
-		else if (b > tg) b -= (b - tg > 14) ? 14 : (b - tg);
-		else             party_t[i] = rand() & 0xff;
-		party_b[i] = (uint8_t)b;
-		led_target[i] = party_b[i];
+		if (party_life[i] <= 0) { led_target[i] = 0; continue; }
+		int life = party_life[i], age = party_age[i]++;
+		if (age >= life) { party_life[i] = 0; led_target[i] = 0; continue; }
+		int on = life / 4; if (on < 1) on = 1;
+		int b = (age < on) ? (PARTY_CAP * age / on)                 /* ramp up (first 1/4) */
+		                   : (PARTY_CAP * (life - age) / (life - on)); /* fade (last 3/4) */
+		if (b < 0) b = 0; else if (b > PARTY_CAP) b = PARTY_CAP;
+		led_target[i] = (uint8_t)b;
+	}
+	if ((tw_tick & 1) == 0) {                    /* every other tick, seed a new sparkle */
+		int led = rand() % NLED;
+		if (party_life[led] <= 0) { party_life[led] = PARTY_LIFE_MIN + rand() % PARTY_LIFE_RAND; party_age[led] = 0; }
 	}
 }
 
@@ -361,11 +413,12 @@ int main(int argc, char **argv)
 	int64_t loops = 0, anim = 0;/* LED-mode poll counter + animation frame */
 	int  vol = 40, playing = 0; /* vol 0..100 (display), PCM-running latch */
 	int64_t last_vol_ms = -100000;       /* last knob turn — gates the volume arc */
+	int64_t btn_pulse_ms = -100000;      /* last button-down — one-shot press pulse */
 	int64_t last_turn_exec = -100000;    /* coalesce knob execs (perf) */
 	int  pending_turn = 0;               /* net detents awaiting a single exec */
 	int64_t t0 = now_ms();               /* beepd start — anchors the boot sequence */
 	int64_t last_active_ms = t0;         /* last activity — gates ready-breathe -> sleep */
-	srand((unsigned)now_ms());
+	srand((unsigned)now_ms());   /* party twinkles self-seed; party_life/age 0-init */
 
 	memset(led_target, 0, sizeof led_target);
 
@@ -393,8 +446,10 @@ int main(int argc, char **argv)
 			}
 
 			/* fold press/release counts into edges */
-			for (int i = 0; i < downs; i++)
+			for (int i = 0; i < downs; i++) {
 				btn_down_at = t;
+				btn_pulse_ms = t;        /* one-shot whole-ring press feedback */
+			}
 			for (int i = 0; i < ups; i++) {
 				if (btn_down_at >= 0) {
 					int64_t held = t - btn_down_at; /* decide the action by hold time */
@@ -432,6 +487,7 @@ int main(int argc, char **argv)
 		 * refresh the control file ~2x/sec and the PCM state ~4x/sec. */
 		if ((loops   % 12) == 0) refresh_led_mode();
 		if ((loops   % 12) == 3) refresh_net_state();
+		if ((loops   % 12) == 6) refresh_muted();
 		if ((loops++ %  6) == 0) playing = pcm_running();
 		int64_t held = (btn_down_at >= 0) ? (t - btn_down_at) : -1;
 		int64_t f = anim++;                 /* free-running animation frame */
@@ -447,8 +503,10 @@ int main(int argc, char **argv)
 		else if (boot_ms < SMILEY_MS + SWEEP_MS)      led_render_sweep(f);
 		else if (led_mode)                            led_render_ap(f);
 		else if (held >= ARM_SHOW_MS)                 led_render_arming(held);
+		else if (t - btn_pulse_ms < BTN_PULSE_MS)     led_render_button_pulse(t - btn_pulse_ms);
 		else if (t - last_vol_ms < VOL_HOLD_MS)     { int sv = read_vol_file();
 		                                              led_render_volume(sv < 0 ? vol : sv); }
+		else if (muted)                               led_render_muted(f);
 		else if (playing)                             led_render_party();
 		else if (!net_connected)                      led_render_connecting(f);
 		else if (t - last_active_ms < SLEEP_AFTER_MS) led_render_breathe(f);

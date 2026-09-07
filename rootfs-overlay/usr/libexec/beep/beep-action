@@ -66,20 +66,41 @@ case "$GESTURE" in
 		case "$ARG" in ''|*[!0-9-]*) exit 0;; esac
 		[ "$ARG" -eq 0 ] && exit 0
 		step=1; [ "$ARG" -lt 0 ] && step=-1
-		cur="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)"
+		# Read our last-known level from the state file — NOT `amixer get`. Per-detent
+		# turns fire up to ~12x/s; forking amixer-get + logger each time spiked the CPU
+		# and made audio choppy on the AR9331. One `amixer set` is the only fork here.
+		cur="$(cat /var/run/beep/volume 2>/dev/null)"
+		case "$cur" in ''|*[!0-9]*) cur="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)";; esac
 		case "$cur" in ''|*[!0-9]*) cur=0;; esac
 		lvl=$(( (cur * NLEDS + 50) / 100 + step ))   # current LED level +/- one step
 		[ "$lvl" -lt 0 ] && lvl=0; [ "$lvl" -gt "$NLEDS" ] && lvl="$NLEDS"
 		pct=$(( (lvl * 100 + NLEDS / 2) / NLEDS ))   # snap back to % for the DAC
 		amixer -M -q set Master "${pct}%" 2>/dev/null
-		echo "$pct" > /var/run/beep/volume           # beepd arc reads this
-		log "volume: ${step} LED -> level ${lvl}/${NLEDS} (${pct}%)"
+		echo "$pct" > /var/run/beep/volume           # beepd arc reads this (no per-detent logger)
 		;;
 	tap)
-		# receiver-side pause: toggle mute on Master (honest limit — we can't pause
-		# the phone that owns the AirPlay/Spotify transport)
-		amixer -M -q set Master toggle 2>/dev/null
-		log "tap: toggled mute"
+		# Soft mute/unmute. The softvol "Master" has a volume capability but NO mute
+		# switch, so `set Master toggle` is a silent no-op — that's why tap did nothing.
+		# We also can't pause the phone that owns the AirPlay transport (would need a
+		# DACP remote), so the honest local equivalent is: save the level and drop to
+		# 0; the next tap restores it.
+		cur="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)"
+		case "$cur" in ''|*[!0-9]*) cur=0;; esac
+		mkdir -p /var/run/beep
+		if [ "$cur" -gt 0 ]; then
+			echo "$cur" > /var/run/beep/premute-vol
+			amixer -M -q set Master 0% 2>/dev/null
+			echo 0 > /var/run/beep/volume
+			: > /var/run/beep/muted            # flag: beepd shows the muted indicator
+			log "tap: muted (was ${cur}%)"
+		else
+			prev="$(cat /var/run/beep/premute-vol 2>/dev/null)"
+			case "$prev" in ''|*[!0-9]*|0) prev=30;; esac
+			amixer -M -q set Master "${prev}%" 2>/dev/null
+			echo "$prev" > /var/run/beep/volume
+			rm -f /var/run/beep/muted
+			log "tap: unmuted -> ${prev}%"
+		fi
 		;;
 	double_tap)
 		# join the group that currently has a playing stream
