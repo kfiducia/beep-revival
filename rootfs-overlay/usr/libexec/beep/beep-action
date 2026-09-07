@@ -19,7 +19,7 @@
 GESTURE="$1"; ARG="$2"
 SNAP_HOST="$(uci -q get beep.main.snapserver || echo 127.0.0.1)"
 SNAP_PORT=1705
-VOL_STEP=4     # % per detent
+NLEDS=24              # LED ring resolution == number of volume levels (1 LED per detent)
 LOGT="beep-action"
 
 log() { logger -t "$LOGT" "$*"; }
@@ -55,16 +55,25 @@ case "$GESTURE" in
 	turn)
 		# Drive the ALSA softvol "Master" (see /etc/asound.conf). shairport binds
 		# its AirPlay volume to the same control, so the knob moves local playback
-		# AND AirPlay in lockstep — and the web slider reads the same level. No
-		# Snapcast required. ARG is signed detents; VOL_STEP % per detent.
-		case "$ARG" in ''|*[!0-9-]*) exit 0;; esac   # need a signed integer
-		step=$(( (ARG < 0 ? -ARG : ARG) * VOL_STEP ))
-		dir=$([ "$ARG" -lt 0 ] && echo - || echo +)
-		amixer -M -q set Master "${step}%${dir}" 2>/dev/null
-		# publish the true level so the LED ring arc (beepd) shows the real volume
-		nv="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)"
-		[ -n "$nv" ] && { mkdir -p /var/run/beep; echo "$nv" > /var/run/beep/volume; }
-		log "volume: Master ${dir}${step}% -> ${nv:-?}%"
+		# AND AirPlay in lockstep — and the web slider reads the same level.
+		# beepd calls us at most ~12x/s with the NET encoder motion in that window.
+		# The optical encoder emits an UNRELIABLE count-per-detent (measured: 1 when
+		# slow, more when bunched at speed), so we do NOT trust the magnitude — each
+		# call = exactly ONE LED step in the direction turned. At normal speed detents
+		# land in separate calls (1 detent = 1 LED); very fast spins are gently
+		# rate-limited to the call cadence. Master is snapped to exact 1/NLEDS levels
+		# so beepd's arc (round(pct*NLEDS/100)) advances exactly one LED per step.
+		case "$ARG" in ''|*[!0-9-]*) exit 0;; esac
+		[ "$ARG" -eq 0 ] && exit 0
+		step=1; [ "$ARG" -lt 0 ] && step=-1
+		cur="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)"
+		case "$cur" in ''|*[!0-9]*) cur=0;; esac
+		lvl=$(( (cur * NLEDS + 50) / 100 + step ))   # current LED level +/- one step
+		[ "$lvl" -lt 0 ] && lvl=0; [ "$lvl" -gt "$NLEDS" ] && lvl="$NLEDS"
+		pct=$(( (lvl * 100 + NLEDS / 2) / NLEDS ))   # snap back to % for the DAC
+		amixer -M -q set Master "${pct}%" 2>/dev/null
+		echo "$pct" > /var/run/beep/volume           # beepd arc reads this
+		log "volume: ${step} LED -> level ${lvl}/${NLEDS} (${pct}%)"
 		;;
 	tap)
 		# receiver-side pause: toggle mute on Master (honest limit — we can't pause

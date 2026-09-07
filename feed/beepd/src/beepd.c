@@ -69,6 +69,14 @@
 #define LED_BOT           12      /* 6 o'clock */
 #define EYE_L             20      /* ~10 o'clock */
 #define EYE_R              4      /* ~2 o'clock  */
+/* logical->wire rotation. BENCH-CALIBRATED on hardware: lighting wire index 0
+ * lands at ~12:15 and the index runs clockwise (wire 6 ~3:15, wire 12 ~6:15),
+ * i.e. the wire order already matches our logical clock convention — so logical
+ * index == wire index. (The prior value 11 rotated the whole ring ~180 deg:
+ * "top" rendered at the bottom, and the volume arc started at 12 instead of 6.)
+ * No LED sits exactly on a cardinal point; 12 o'clock straddles wire 23+0 and
+ * 6 o'clock straddles wire 11+12. */
+#define LED_ROT            0
 
 #define ACTION_BIN        "/usr/libexec/beep/beep-action"
 
@@ -115,7 +123,7 @@ static void led_flush(int ack_pending)
 {
 	uint8_t out[NLED + 1];
 	for (int i = 0; i < NLED; i++) {
-		int src = (i + 11) % NLED;              /* physical->wire rotation */
+		int src = (i + LED_ROT) % NLED;         /* logical->wire (bench-calibrated) */
 		uint32_t x = led_target[src];
 		out[i] = (uint8_t)((x * x * x) / 65025); /* cubic perceptual gamma */
 	}
@@ -208,7 +216,12 @@ static void led_render_breathe(int64_t frame)
 	int ph  = (int)(frame % period);
 	int tri = (ph < period / 2) ? ph : (period - ph);/* 0..42 */
 	uint8_t level = (uint8_t)(24 + tri * 3);         /* ~24..150 */
-	memset(led_target, level, sizeof led_target);
+	/* connected + idle: JUST the bottom two LEDs breathing (the pair that
+	 * straddles 6 o'clock, wire 11+12 ~5:45 & 6:15), rest dark — a calm "I'm
+	 * here, resting" indicator rather than the whole ring pulsing. */
+	memset(led_target, 0, sizeof led_target);
+	led_target[LED_BOT]                     = level;
+	led_target[(LED_BOT - 1 + NLED) % NLED] = level;
 }
 
 /* Wi-Fi connecting: a single dot orbiting on a dim track. Deliberately unlike the
@@ -265,9 +278,13 @@ static int read_vol_file(void)
  * faint track so the full scale is visible. Matches the stock knob feedback. */
 static void led_render_volume(int vol)
 {
-	int lit = (vol * NLED + 50) / 100;
-	for (int i = 0; i < NLED; i++)
-		led_target[i] = (i < lit) ? 255 : 10;
+	int lit = (vol * NLED + 50) / 100;          /* 0..NLED LEDs of arc */
+	for (int i = 0; i < NLED; i++) led_target[i] = 10;   /* dim full-scale track */
+	/* single arc ANCHORED AT THE BOTTOM (LED_BOT ~6 o'clock) that grows CLOCKWISE
+	 * as volume rises — 50% lights the whole left side (6->12), 100% the full ring
+	 * — and retreats counter-clockwise as it falls. Matches the knob: CW = up. */
+	for (int j = 0; j < lit; j++)
+		led_target[(LED_BOT + j) % NLED] = 255;
 }
 
 /* "Party mode" while playing — each LED drifts toward a random target and
