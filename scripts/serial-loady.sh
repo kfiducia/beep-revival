@@ -11,7 +11,7 @@
 
 set -u
 PORT="${1:-/dev/cu.usbserial-A602SG50}"
-IMG="${2:-$HOME/github/beep-firmware/images/openwrt-ath79-generic-8dev_carambola2-initramfs-kernel.bin}"
+IMG="${2:-$HOME/github/beep-revival/images/openwrt-ath79-generic-8dev_carambola2-initramfs-kernel.bin}"
 ADDR="${3:-0x82000000}"
 
 [ -e "$PORT" ] || { echo "!! port $PORT not found"; exit 1; }
@@ -45,7 +45,7 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 echo "[✓] transfer complete."
-LOG="${LOG:-$HOME/beep-revival/dump/phase0-ramboot.log}"
+LOG="${LOG:-$HOME/beep-ramboot.log}"
 echo "[*] booting: bootm $ADDR"
 echo "[*] streaming + logging the boot to: $LOG"
 echo "[*] --> watch for the login prompt, then Ctrl-C and reconnect: tio -b 115200 $PORT"

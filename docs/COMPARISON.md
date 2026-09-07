@@ -54,7 +54,7 @@ Status key for the open firmware: ✅ working · 🔧 building/plumbed · 🔭 p
 |---|---|---|
 | Account required | Yes (Beep) | **No** |
 | Data to third-party servers | Yes | **None** |
-| Default credentials | App/cloud-managed | **Per-device** code from the MAC — never a shared/blank password ✅ |
+| Default credentials | App/cloud-managed | **Per-device** code (not shared/blank) — but ⚠️ derived from the MAC, so guessable on-LAN/in-range until you change it; **change the admin password after setup** |
 | Remote attack surface | Cloud API + app | Minimal: local web UI behind session auth; **SSH off by default** ✅; no anonymous control API |
 | Firmware trust | Vendor cloud push | **Signature-verified** uploads only (usign) 🔧 |
 

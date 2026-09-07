@@ -1,1 +1,0 @@
-/Users/kfiducia/beep-revival/RESEARCH-SYNTHESIS.md

@@ -10,6 +10,10 @@ prebuilt/
 # two are just "how I reach my own Docker build host" — regenerate for yours.
 scripts/imac-ssh.sh
 scripts/rebuild-ko.sh
+# beep-ssh.sh hardcodes a personal LAN IP + 1Password agent socket path — keep local.
+scripts/beep-ssh.sh
+# build-status.sh polls the personal iMac build container — useless off that host.
+scripts/build-status.sh
 
 # macOS / editor cruft
 .DS_Store
