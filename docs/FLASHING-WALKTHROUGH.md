@@ -184,12 +184,22 @@ and (c) `art` is byte-for-byte intact (its md5 still matches your backup).
 ```
 scripts/serial-send.sh /dev/cu.usbserial-XXXX images/beep-sysupgrade.bin
 ```
-> **⏱ This step is SILENT — no console output — and takes ~25 minutes. Do NOT
-> interrupt it.** Watch the **TX LED on your USB-UART adapter**: **solid red for
-> ~20 min** while the 10 MB image streams over, then **dark for ~5 min** while it's
-> flushed. Both are normal. The console only returns when it's fully done.
+> **⏱ The transfer is SILENT on the console and takes ~15–20 minutes. Do NOT
+> interrupt it.** `tio` is detached while `serial-send.sh` owns the port, so the
+> **TX LED on your USB-UART adapter is your progress indicator**: it stays **solid
+> red** while your Mac streams the ~10 MB image over, then goes **quiet** as the
+> YMODEM handshake finalizes. **This all goes into the device's RAM** — the image
+> lands in `/tmp`, which is a `tmpfs`. **Nothing is written to flash yet.**
+>
+> **Your "done" signal is `serial-send.sh` printing its completion** (the `sz`
+> summary / `[✓] transfer complete`) and returning you to your shell prompt — not
+> the TX LED alone. When you see that, the image is fully in RAM. *Then* quit the
+> send script if needed and reconnect `tio -b 115200 /dev/cu.usbserial-XXXX`.
 
 **What (b) — verify, then flash** (reconnect tio):
+The image is now in **RAM** (`/tmp`). We check it there, then commit — the
+`sysupgrade` below is the **only** step that writes flash (it's quick and *does*
+print progress to the console before it reboots):
 ```
 sha256sum /tmp/beep-sysupgrade.bin        # compare to the sha printed by your build
 sysupgrade -T /tmp/beep-sysupgrade.bin    # image sanity ("will be flashed")
