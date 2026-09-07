@@ -8,6 +8,11 @@ the dead Beep servers. It's written for someone who has never touched this board
 > them. The one truly unrecoverable mistake is destroying the bootloader or the
 > radio calibration — this guide is built around *never* doing that, and around
 > making a full backup first so you always have a way home.
+>
+> **No warranty, use at your own risk.** This firmware is provided "AS IS" with no
+> warranty and no liability of any kind (see [`LICENSE`](../LICENSE), GPL-2.0
+> §§11–12). If you brick your device, you are responsible for it — there is no
+> support guarantee. Proceed only if you accept that.
 
 ---
 

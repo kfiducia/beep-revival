@@ -30,7 +30,7 @@ if [ "$REQUEST_METHOD" = GET ]; then
 fi
 [ "$REQUEST_METHOD" = POST ] || { say '405 Method Not Allowed' '{"error":"POST only"}'; exit 0; }
 
-# --- auth signals ---
+# --- auth signals (headers only — evaluated BEFORE we read the request body) ---
 admin=0
 sess="$HTTP_X_BEEP_SESSION"
 case "$sess" in ''|*[!0-9a-fA-F]*) ;; *)
@@ -38,23 +38,39 @@ case "$sess" in ''|*[!0-9a-fA-F]*) ;; *)
 	[ "$acc" = "true" ] && admin=1 ;;
 esac
 
-# --- receive image ---
-rm -f /tmp/ota.bin /tmp/ota.sig
-cat > /tmp/ota.bin
-[ -s /tmp/ota.bin ] || fail '400 Bad Request' '{"error":"empty image"}'
-
-# --- decide path: unsigned requested (explicit flag or no signature) vs signed ---
+# --- decide path from headers (no body needed): unsigned (explicit flag or no sig) vs signed ---
 want_unsigned=0
 [ "$HTTP_X_BEEP_ALLOW_UNSIGNED" = "1" ] && want_unsigned=1
 [ -z "$HTTP_X_BEEP_SIG" ] && want_unsigned=1
 
+# --- AUTHORIZE BEFORE RECEIVING THE IMAGE. Reading the body first let an
+# unauthenticated caller stream an arbitrarily large POST into /tmp (tmpfs = RAM)
+# and exhaust memory before any credential was checked — a pre-auth DoS. Decide
+# entirely from headers/flags here, so an unauthorized request is rejected without
+# buffering a single byte of payload. ---
 if [ "$want_unsigned" = 1 ]; then
 	# UNSIGNED: physical presence is mandatory; an admin session is NOT sufficient.
 	phys_valid || fail '403 Forbidden' '{"error":"unsigned upload requires a physical triple-tap on the device (within 60s)"}'
+else
+	# SIGNED: admin session required (signature itself is verified after receive).
+	[ "$admin" = 1 ] || fail '401 Unauthorized' '{"error":"sign in as admin, or triple-tap the device for an unsigned install"}'
+fi
+
+# --- receive image, hard-capped. Refuse an over-large Content-Length up front,
+# and cap the actual read too so a chunked/omitted length still can't exhaust RAM. ---
+MAX_BYTES=16777216   # 16 MiB — real sysupgrade images for this board are ~10 MB
+case "$CONTENT_LENGTH" in
+	''|*[!0-9]*) ;;   # absent/non-numeric (e.g. chunked) — the read cap below still bounds us
+	*) [ "$CONTENT_LENGTH" -le "$MAX_BYTES" ] || fail '413 Payload Too Large' '{"error":"image too large"}';;
+esac
+rm -f /tmp/ota.bin /tmp/ota.sig
+head -c "$MAX_BYTES" > /tmp/ota.bin
+[ -s /tmp/ota.bin ] || fail '400 Bad Request' '{"error":"empty image"}'
+
+# --- signature verification for the signed path (needs the received body) ---
+if [ "$want_unsigned" = 1 ]; then
 	logger -t beep "OTA: UNSIGNED flash authorized by physical triple-tap"
 else
-	# SIGNED: admin session + signature verification.
-	[ "$admin" = 1 ] || fail '401 Unauthorized' '{"error":"sign in as admin, or triple-tap the device for an unsigned install"}'
 	printf '%s' "$HTTP_X_BEEP_SIG" | base64 -d > /tmp/ota.sig 2>/dev/null || fail '400 Bad Request' '{"error":"bad signature encoding"}'
 	usign -V -m /tmp/ota.bin -p /etc/beep-ota.pub -x /tmp/ota.sig >/dev/null 2>&1 \
 		|| fail '400 Bad Request' '{"error":"signature verification failed — not a genuine Beep release"}'

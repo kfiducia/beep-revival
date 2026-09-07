@@ -8,7 +8,7 @@
 # Then reconnect tio and reload the module.
 set -u
 PORT="${1:-/dev/cu.usbserial-A602SG50}"
-FILE="${2:-$HOME/github/beep-firmware/images/beep-i2s.ko}"
+FILE="${2:-$HOME/github/beep-revival/images/beep-i2s.ko}"
 DEST="${3:-/tmp}"
 
 [ -e "$PORT" ] || { echo "!! port $PORT not found"; exit 1; }

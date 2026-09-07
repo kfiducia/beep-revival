@@ -41,7 +41,7 @@ old kernels) is vendored in `reference/` (`ath79-mbox.c`, `ath79-pcm.c`).
 5. **FIFO reset** (mbox+0x58 = 0xff) on open; **DMA policy** (mbox+0x10) TX FIFO
    threshold per the reference.
 
-## Bench checkpoints (do in this order — RESEARCH-SYNTHESIS.md)
+## Bench checkpoints (do in this order)
 - soundcard node appears (`cat /proc/asound/cards`) — franzflasch users stalled here.
 - Saleae on CK/WS/MCK: confirm the clocks match hw_params (48k×256) BEFORE analog.
 - `speaker-test -Dhw:0,0 -c2 -r48000 -FS16_LE -tsine` → clean tone.

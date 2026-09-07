@@ -18,7 +18,7 @@
  *   driver registers the CPU DAI so `aplay -D hw` fails cleanly with "no PCM"
  *   rather than silently — which is the correct Phase-1 checkpoint.
  *
- * Bench verification order (RESEARCH-SYNTHESIS.md): RAM-boot -> confirm the
+ * Bench verification order (see driver-i2s/PORTING.md): RAM-boot -> confirm the
  * soundcard node appears -> Saleae on CK/WS/MCK to prove the clocks match
  * hw_params BEFORE trusting analog -> then speaker-test.
  */

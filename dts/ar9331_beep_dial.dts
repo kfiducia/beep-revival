@@ -10,8 +10,7 @@
  *
  * Partition table is IDENTICAL to the upstream ar9331_8dev_carambola2.dts
  * (u-boot @0, u-boot-env @0x40000, firmware @0x50000, art @0xff0000) so the
- * stock u-boot and radio-calibration (art) survive untouched — see
- * ~/beep-revival/RESEARCH-SYNTHESIS.md.
+ * stock u-boot and radio-calibration (art) survive untouched.
  *
  * Added vs. stock carambola2 DTS:
  *  - I2S CPU DAI + MBOX DMA (ath79-i2s driver, this repo) -> WM8524 DAC

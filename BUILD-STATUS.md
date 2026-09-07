@@ -7,7 +7,7 @@ hardware** — the "needs the bench" unknowns were resolved. See the ✅ section
 - **🔊 Audio out the jack** — clean 440Hz tone, `aplay` EXIT=0, DMA period IRQ
   climbing (0→254 over 3s). The **make-or-break MBOX-DMA data plane is ported and
   working** (see PORTING.md): descriptor-ring DMA + IRQ handler in
-  `driver-i2s/beep-i2s.c`, on the MBOX0 RX channel. Two fixes closed it: a hard
+  `feed/beep-i2s/src/beep-i2s.c`, on the MBOX0 RX channel. Two fixes closed it: a hard
   MBOX reset (RESET module `0x1806001c` bit1) each `prepare` (else 2nd playback
   `-EIO`), and `snd_pcm_hw_constraint_integer(PERIODS)` (else a cyclical pop from
   the ring not covering a partial buffer).
@@ -38,16 +38,21 @@ writing (build host was mid-rebuild). Treat as "should work, verify on device."
   signal/uptime/version/ap_mode/volume), `scan` (iwinfo→JSON), `set_wifi`,
   `set_name`, `set_volume`, `set_audio`, `set_password`, `reboot`; ACL in
   `acl.d/beep.json`.
-- **Closed the empty-root-password hole.** Fresh OpenWrt has a blank root password
-  = passwordless admin once on the LAN. `99-beep` now derives a per-device code
-  from the MAC and sets it as BOTH the root/admin password and the WPA2 setup-AP
-  key (`/etc/beep-code`). Never blank-auth on any network. uhttpd keeps plain HTTP
-  for the captive portal (WPA2-encrypted link) and offers per-device HTTPS on 443.
+- **Closed the empty-root-password hole (with a known caveat).** Fresh OpenWrt has
+  a blank root password = passwordless admin once on the LAN. `99-beep` now derives
+  a per-device code from the MAC and sets it as BOTH the root/admin password and the
+  WPA2 setup-AP key (`/etc/beep-code`), so there is never blank-auth on any network.
+  ⚠️ **Caveat, disclosed openly:** a MAC is not secret — it is readable via ARP on
+  the LAN and the setup SSID publishes part of it — so this code is *guessable*, not
+  a strong secret. It raises the bar over blank-auth but does not replace changing
+  the admin password after setup. See the README ⚠️ note. uhttpd keeps plain HTTP
+  for the captive portal (WPA2-encrypted link) and offers per-device HTTPS on 443
+  (the plain-HTTP admin plane sends credentials in the clear on the LAN).
 - **Wi-Fi fallback watchdog** (`etc/init.d/beep-netcheck` → `netcheck-loop`) —
   continuous procd service on the **correct STA iface (wwan)**, not the old one-shot
   `wan` check. STA can't associate → `Beep-Setup-XXXX` **WPA2** AP + captive portal;
   STA recovers → tears the AP down. Single-radio AP↔STA handoff handled.
-- **LED ring behavior restored** (`beepd/beepd.c`) — dark when idle, **volume arc**
+- **LED ring behavior restored** (`feed/beepd/src/beepd.c`) — dark when idle, **volume arc**
   while the knob turns, **random "party" pulse** while playing (PCM RUNNING), plus
   a rotating **AP-setup comet** driven by `/var/run/beep/led-mode`.
 - **Unified system volume** — WM8524 has no hardware volume register, so
@@ -57,8 +62,8 @@ writing (build host was mid-rebuild). Treat as "should work, verify on device."
 
 ## Done & high-confidence (authored from the register map / decoded protocol)
 - ✅ **Device tree** (`dts/ar9331_beep_dial.dts`) — real I²S register addresses (STEREO 0x180b0000, MBOX 0x180a0000, confirmed vs the unstripped `ath_i2s.ko`), WM8524 mainline codec node, simple-audio-card, i2c-gpio for the STM8, setup key, and the **exact upstream partition table** (u-boot/art preserved).
-- ✅ **I²S control plane** (`driver-i2s/beep-i2s.c`) — DT-probed ASoC CPU DAI: clock table (44100→0x11/0xB726, 48000→0x10/0x46AB), CONFIG register (I2S+SPDIF+MASTER, 16-bit, posedge), and the GPIO function-mux pokes (no mainline pinctrl for these). Modern kernel-6.x APIs (ioremap, of_match, devm_snd_soc_register_component).
-- ✅ **`beepd`** (`beepd/beepd.c`) — STM8 daemon at i²c **0x23** (the *live* protocol): input decode (signed knob delta + press/release counts, v0/v1), LED ring with the cubic gamma + rotation, tap/double-tap(340ms)/hold(5s) state machine, gesture→`beep-action`. Plain C, compiles against musl.
+- ✅ **I²S control plane** (`feed/beep-i2s/src/beep-i2s.c`) — DT-probed ASoC CPU DAI: clock table (44100→0x11/0xB726, 48000→0x10/0x46AB), CONFIG register (I2S+SPDIF+MASTER, 16-bit, posedge), and the GPIO function-mux pokes (no mainline pinctrl for these). Modern kernel-6.x APIs (ioremap, of_match, devm_snd_soc_register_component).
+- ✅ **`beepd`** (`feed/beepd/src/beepd.c`) — STM8 daemon at i²c **0x23** (the *live* protocol): input decode (signed knob delta + press/release counts, v0/v1), LED ring with the cubic gamma + rotation, tap/double-tap(340ms)/hold(5s) state machine, gesture→`beep-action`. Plain C, compiles against musl.
 - ✅ **Provisioning + admin + robustness** — every-boot wifi-fallback → SoftAP + `dnsmasq` captive portal; **authenticated** `rpcd` admin object + ACL (closes the stock anonymous-ubus hole); per-device hostname + self-signed TLS at first boot (no default creds/shared certs).
 - ✅ **OpenWrt packaging** — `feed/` (kmod-beep-i2s, beepd), `scripts/build.sh` (rides the carambola2 profile, swaps our DTS, layers feed+files+packages), `docker-build-setup.sh` (toolchain).
 - ✅ **Phase-0 prebuilt images** downloaded (`prebuilt/`) for the zero-risk RAM-boot validation.

@@ -121,7 +121,7 @@ Method: dumped `mtd0`+`mtd1`, rebooted once, re-dumped, diffed. `mtd0` unchanged
 
 ### Confirmed from the stock 16 MB dump (2026-09-06)
 
-The stock flash dump (`~/beep-revival/dump/`) settled the remaining unknowns:
+The stock 16 MB flash dump settled the remaining unknowns:
 
 - **`bootb` loads a legacy U-Boot uImage** (`0x27051956`), LZMA MIPS kernel, load/entry
   `0x80060000`. Stock primary = "OpenWrt Linux-3.8.13", stock recovery = "OpenWrt
