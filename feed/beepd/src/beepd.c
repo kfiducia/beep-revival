@@ -13,7 +13,9 @@
  *   0x00  read 3B   -> [?, ?, version]      version byte selects reply shape
  *   0x01  read 3B (v0) / 4B (v1, checksummed):
  *            [knob_delta(int8), btn_down_cnt, btn_up_cnt, (v1: dropped_frames)]
- *   0x80  write 25B -> [led_1..led_24, ack_byte]   ack=0xAA iff a read is pending
+ *   0x80  write 25B -> [led_1..led_24, ack_byte]   ack=0xAA REQUESTS the next
+ *            input frame. On v1 the STM8 serves reg 0x01 ONLY after an ack=0xAA
+ *            write, so the host must request every cycle (see led_flush call).
  *
  * LED: physical->wire rotation  flipped[i] = leds[((i+11)%24)]
  *      cubic gamma              out = (x*x*x) / 65025           (x in 0..255)
@@ -435,7 +437,13 @@ int main(int argc, char **argv)
 		else if (t - last_active_ms < SLEEP_AFTER_MS) led_render_breathe(f);
 		else                                          led_render_sleep(f);
 
-		led_flush(read_pending);
+		/* v1 STM8 serves the input frame (reg 0x01) only when the host REQUESTS
+		 * it via ack=0xAA in the *preceding* LED write. We read every cycle, so on
+		 * v1 always request — otherwise the ack is set only after a non-zero read,
+		 * which can never bootstrap, and the knob is dead (proven on the bench:
+		 * forcing ack=0xAA made byte0 stream detents). v0 acks only to acknowledge
+		 * received input (verified in production), so keep that behavior there. */
+		led_flush(proto_ver ? 1 : read_pending);
 		read_pending = 0;
 
 		struct timespec ts = { .tv_sec = 0, .tv_nsec = POLL_MS * 1000000L };
