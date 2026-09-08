@@ -185,6 +185,15 @@ private key, i.e. `openssl rsautl -sign`) produces a response that verifies back
 challenge — the iOS-acceptable form. (Not big-endian, not IPv6, not discovery — the IPv6
 address is embedded perfectly; purely public-vs-private key.)
 
+### 2.3.1 On-hardware confirmation (2026-09-08)
+Built the fix (classic mbedTLS image, iMac `beep-build`) and hot-ran the patched binary
+on unit `beep-silver`. A controlled `OPTIONS`+`Apple-Challenge` probe returns an
+`Apple-Response` that RSA-**verifies** (public op) straight back to `challenge ‖ IP ‖
+deviceID` — the iOS-acceptable form (the unpatched binary returned random bytes here). A
+live iPhone (`AirPlay/960.x`) then completed the full handshake — `ANNOUNCE → SETUP →
+RECORD → first frame` — and **played audio**, no XRUN/crash. Fix confirmed end-to-end.
+(Deployed from `/tmp` for the test; ships permanently via the full signed image.)
+
 ### 2.4 Fix — `scripts/patches/110-ap1-apple-response-mbedtls3-sign.patch`
 In the mbedTLS-3 branch of `rsa_apply(RSA_MODE_AUTH)`, do a real private-key op on a
 hand-built PKCS#1 v1.5 **type-1** block (`00 01 FF..FF 00 M`) via `mbedtls_rsa_private()`
