@@ -6,6 +6,11 @@ Audio sources in this image:
   * Lyrion / LMS player (NEW)     — squeezelite
 
 Squeezelite (LMS) details:
+  Enabled         : OFF by default (opt-in). Every source is baked into this one
+                    image but dormant until enabled, so an unused source costs 0
+                    RAM/CPU (only ~190 KB flash). To turn LMS on:
+                      uci set squeezelite.options.enabled=1; uci commit squeezelite
+                      /etc/init.d/squeezelite restart
   Codecs built in : FLAC, MP3 (libmpg123), Opus            [all integer / fixed-point paths]
   Codecs NOT built: AAC/HE-AAC, WMA, ALAC, DSD, soxr resample
                     -> the LMS server transcodes anything else to FLAC.
@@ -20,6 +25,7 @@ Squeezelite (LMS) details:
   Config / init   : /etc/config/squeezelite , /etc/init.d/squeezelite
 
 How to test:
+  0. Enable it (see above) -- it's OFF by default.
   1. Run a Lyrion Music Server on the LAN.
   2. The Beep should appear as a player (named after its hostname) in the LMS web UI / app.
   3. Play a FLAC or MP3 track -> audio out the speaker; the LED arc shows "playing".

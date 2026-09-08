@@ -9,6 +9,7 @@ players did.
 
 | | |
 |---|---|
+| **Enabled** | **OFF by default (opt-in)** — baked in but dormant; 0 RAM/CPU until enabled |
 | **Sources** | AirPlay-1 (classic) + Snapcast (multi-room) + **squeezelite (LMS)** |
 | **LMS codecs built in** | FLAC, MP3 (libmpg123), Opus |
 | **LMS codecs left out** | AAC/HE-AAC, WMA, ALAC, DSD, soxr resampling — LMS transcodes to FLAC |
@@ -48,6 +49,7 @@ docker exec -d beep-build bash -lc 'cd /build/openwrt && env BEEP_DEV=1 SRC=/src
 
 ## Test on a Beep
 
+0. Enable it (OFF by default): `uci set squeezelite.options.enabled=1; uci commit squeezelite; /etc/init.d/squeezelite restart`
 1. Run a Lyrion Music Server on the LAN.
 2. The Beep appears as a player (its hostname) in the LMS web UI / app.
 3. Play FLAC/MP3 → audio out; LED arc shows "playing".

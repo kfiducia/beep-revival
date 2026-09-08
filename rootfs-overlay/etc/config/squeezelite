@@ -15,4 +15,9 @@ config options 'options'
 	option priority '0'
 	# Empty server_addr -> auto-discover the LMS instance on the LAN.
 	option server_addr ''
-	option enabled '1'
+	# Opt-in: OFF by default so a device that isn't using LMS spends ZERO resources
+	# on it (the daemon otherwise holds ~5-6 MiB of ring buffers resident). One image
+	# ships every source; each is dormant until enabled. To turn LMS on:
+	#   uci set squeezelite.options.enabled=1; uci commit squeezelite
+	#   /etc/init.d/squeezelite restart
+	option enabled '0'
