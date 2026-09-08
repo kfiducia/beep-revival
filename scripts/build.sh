@@ -40,6 +40,18 @@ git -C "$OW/feeds/packages" checkout -- sound/shairport-sync/Makefile multimedia
 # The patch compiles out on little-endian hosts, so it's harmless everywhere else.
 mkdir -p "$SPP"
 cp "$SRC/scripts/patches/030-pipe-output-little-endian.patch" "$SPP/" 2>/dev/null || true
+# Give shairport a scheduling edge on the single-core AR9331 so the LED bit-banged-i2c
+# churn / SSH / knob->amixer forks can't starve the audio thread and XRUN playback
+# (measured: AP2 AAC decode leaves only ~45% idle, and concurrent load glitches it).
+# A safe NEGATIVE NICE via procd — deliberately NOT SCHED_FIFO: blanket real-time on a
+# single core risks the decode preempting the network read that feeds it and
+# self-deadlocking into an underrun. Idempotent (the feed's init isn't git-restored).
+SPI="$OW/feeds/packages/sound/shairport-sync/files/shairport-sync.init"
+if [ -f "$SPI" ] && ! grep -q 'procd_set_param nice' "$SPI"; then
+  # '#' delimiter avoids escaping the command path; \n\t inserts a tab-indented line
+  # right after the command set (order among procd params is irrelevant at instance close).
+  sed -i 's#\(procd_set_param command /usr/bin/shairport-sync\)#\1\n\tprocd_set_param nice -12#' "$SPI"
+fi
 if [ -n "${AIRPLAY2:-}" ]; then
   echo "   [AIRPLAY2] AirPlay-2 build — experimental on this silicon; ffmpeg full->audio-dec + BE crypto patch"
   # shairport-sync hardcodes +libffmpeg-full (~12MB). AirPlay 2 only needs AAC+ALAC
@@ -64,6 +76,15 @@ if [ -n "${AIRPLAY2:-}" ]; then
   # Fixed-point AAC decode: select ffmpeg's aac_fixed (integer S32P) instead of the
   # float decoder so AAC-LC decode fits the 400MHz no-FPU core. See docs/DEV-NOTES.md §1.
   cp "$SRC/scripts/patches/020-aac-fixed-decode.patch" "$SPP/" 2>/dev/null || true
+  # nqptp PTP timing (BIG-ENDIAN): fix ntoh64() transposing the 64-bit PTP
+  # correctionField on BE (nqptp's hand-rolled swap is LE-only). Latent on a flat
+  # single-switch subnet (correctionField is 0 there) but a real BE correctness bug
+  # in the AP2 timing path. See docs/BE-AP2-AUDIT.md Finding 1 / docs/DEV-NOTES.md §1.
+  NQP="$OW/feeds/packages/net/nqptp/patches"
+  mkdir -p "$NQP"
+  cp "$SRC/scripts/patches/040-nqptp-bigendian-ntoh64.patch" "$NQP/" 2>/dev/null || true
+  # new patch → force nqptp re-prepare so the patch is actually applied
+  make package/feeds/packages/nqptp/clean >/dev/null 2>&1 || true
   # Force a clean ffmpeg restage so the swresample InstallDev fix actually takes —
   # stale staged libav* from a prior variant can otherwise leave libswresample missing.
   make package/feeds/packages/ffmpeg/dirclean >/dev/null 2>&1 || true
@@ -88,6 +109,8 @@ else
   fi
   # the AP2 crypto patch targets pair_ap (not compiled in a classic build) — keep it out
   rm -f "$SPP/010-airplay2-bigendian-pairing.patch" 2>/dev/null || true
+  # nqptp isn't built in the classic image (dep stripped above) — keep its patch out too
+  rm -f "$OW/feeds/packages/net/nqptp/patches/040-nqptp-bigendian-ntoh64.patch" 2>/dev/null || true
 fi
 # Makefile/source changed → force a clean shairport rebuild so the mode switch takes
 make package/feeds/packages/shairport-sync/clean >/dev/null 2>&1 || true

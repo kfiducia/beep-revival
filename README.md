@@ -7,6 +7,8 @@ Connect / Snapcast / DLNA), a firmware-owned physical UX (knob / tap /
 double-tap-to-join), and a small authenticated on-device admin — nothing
 load-bearing that can be killed by a vanished app or server.
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K7E85Z2)
+
 > ### ⚠️ Security — known limitation, read before you flash
 > **The default admin password is derived from the device's MAC address, and a MAC
 > is not a secret.** On first boot the firmware sets one per-device "setup code"
@@ -40,6 +42,17 @@ load-bearing that can be killed by a vanished app or server.
   pulsing LED ring, per-device credentials (no blank-auth), and the stock LED
   behaviors (idle/volume/party) restored. AirPlay 2 trimmed to a **9.94 MB** image
   so a recovery slot fits. See `BUILD-STATUS.md`.
+- **🎧 AirPlay 2 — experimental, under test (2026-09-08):** an `AIRPLAY2=1` build now
+  decodes AirPlay-2 **buffered AAC in real time on the FPU-less AR9331** by switching
+  ffmpeg to its fixed-point `aac_fixed` decoder (the default float decoder pegs this
+  soft-float core and underruns) — the first known `aac_fixed` + shairport-sync port on
+  this class of chip. On unit #2 it **sustains playback with headroom** (≈45% idle,
+  ≈36% CPU, no XRUN over a full track) — **good performance so far**. The margin is thin,
+  so concurrent-load hardening is in progress (knob-volume fork coalescing, audio-thread
+  priority). Big-endian pairing/timing fixes (`pair_ap`, nqptp `ntoh64`) are included.
+  It is **not the default image** — the lean AirPlay-1 + Snapcast build ships by default;
+  build AirPlay 2 with `AIRPLAY2=1 ./scripts/build.sh`. See `docs/DEV-NOTES.md` §1 and
+  `docs/BE-AP2-AUDIT.md`.
 - **Open (Phase 3):** build a recovery-slot initramfs into the freed ~5.6 MB so
   `bootb` auto-recovers a bad update without a UART; multiroom (Snapcast).
 

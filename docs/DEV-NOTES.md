@@ -78,6 +78,60 @@ Planned 3-edit patch (adapt line numbers to 4.3.2):
    to S32 for free — no extra shim needed.
 Plus: ensure ffmpeg is built `--enable-decoder=aac_fixed` (audio-dec preset omits it).
 
+### 1.5.1 ON-HARDWARE RESULT (2026-09-08) — fixed-point AP2 WORKS on the AR9331
+First-ever confirmed AirPlay-2 buffered-AAC playback on the FPU-less 24Kc. Built
+`BEEP_DEV=1 AIRPLAY2=1` (patches 010 pairing + 020 aac_fixed + 040 nqptp-ntoh64),
+flashed unit #2 (`beep-copper`). Live Apple Music session, `scripts/ap2-bench.sh`:
+```
+44 s steady state: PCM RUNNING, 0 XRUN, idle ~42–52%, shairport ~35–38% CPU,
+                   MemAvailable stable ~6.2 MB (no leak).
+```
+`aac_fixed` carries the AAC decode in ~36% of one core instead of pegging it — the
+decisive proof the fixed-point lever works (float pegged the core + XRUN'd in
+seconds, §1.1). **AP2 is viable on this silicon.**
+
+⚠️ **But the margin is thin.** ~45% idle is eaten instantly by *any* concurrent
+load — the bench's own per-second sampling + SSH induced the single XRUN at t=45
+(sampler also mis-reported that tick's per-proc CPU as 277%, an interval artifact).
+Transient spikes alone hit 16% idle (t=6). Real-world corroboration: on-device
+diagnostics during playback audibly glitch the audio. So AP2 needs the core mostly
+to itself.
+
+### 1.5.2 Hardening the margin (2026-09-08)
+- **[done, deployed live] Volume knob fork-storm.** A knob turn fired
+  `beep-action`→`amixer set` up to ~12×/s; on AP2's thin margin that concurrent
+  fork load XRUN'd the decode (Kyle's earlier b082d90 killed the `amixer get`+logger
+  forks on AP1, but the remaining `set` fork now bites on the heavier AP2 path).
+  Fix: `beepd` coalesces knob execs to ~5×/s **only while the PCM is decoding**
+  (`VOL_COALESCE_MS_PLAY`), staying snappy (80 ms) when idle/AP1. Deployed to #2's
+  running beepd (no audio cut); in the source so it survives reflash.
+- **[done, baked — effective next flash] shairport priority.** All 17 shairport
+  threads ran SCHED_OTHER. `chrt`/`renice` are BOTH absent on the device, so no live
+  boost was possible. `build.sh` now injects `procd_set_param nice -12` into the
+  shairport init — a **safe negative nice, deliberately NOT SCHED_FIFO**: blanket RT
+  on a single core risks the decode preempting the network read that feeds it and
+  self-deadlocking into an underrun. Gives audio priority over LED-i²c/SSH/fork churn.
+- **[deferred] LED "party twinkle" throttle.** The 24 Hz ring push is bit-banged i²c
+  AND doubles as the knob-input read (`led_flush`), and animations are frame-coupled
+  to the poll rate — so throttling it cleanly is invasive + alters the calibrated
+  look. With `nice -12` giving audio priority it's likely unnecessary; revisit only
+  if playback still glitches under LED load.
+- **[open] Force S16 output** (half the sample width through swr+DMA) — endianness-risky, test on-device.
+- **[done] Sender/web volume → LED arc (Gap 2).** beepd only read
+  `/var/run/beep/volume` (written by knob/web, never the sender), so phone volume
+  changes moved the sound but not the LED. Now beepd reads the **real `Master`
+  softvol** via alsa-lib (`snd_mixer`, mapped 0..100 like `amixer -M`, event-driven —
+  no fork), so the arc reflects **every** source: knob, web, AND the AirPlay sender.
+  Verified on #2. `beepd` now `DEPENDS +alsa-lib` (already on the image via shairport,
+  so no size cost) and links `-lasound -lm`.
+- **[known limitation] Knob → AirPlay sender UI (Gap 1).** NOT feasible with stock
+  shairport 4.3.2: `audio_alsa.c` only *writes* the mixer (sender→receiver) and never
+  subscribes to external mixer events, and `dacp.c` sends only playback commands (no
+  outbound volume). AirPlay volume is sender-authoritative. Would need a substantial
+  shairport patch (mixer-event subscription + an outbound AP2 volume report of
+  uncertain protocol support) — folds into the same +back-channel rebuild as
+  AGENTS.md issue #7. Deferred, not chased.
+
 ### 1.6 Prior art / minimum hardware
 - Official shairport floor for AP2: **Pi 2 / Pi Zero 2 W** class (~1 GHz, hardware FP,
   NEON). Even a 1 GHz ARMv6 *with* an FPU (original Pi Zero) is borderline.
@@ -157,7 +211,22 @@ honors `OW=` / `SRC=` / `JOBS=` overrides.
 
 ## 4. Open items
 - [ ] Flash multi-room image to unit #1; verify classic AirPlay-1 (low CPU) + 2-Beep sync.
-- [ ] Locate the AAC decode file in shairport-sync **4.3.2** (not player.c); write the
-      `aac_fixed` 3-edit patch (§1.5); build `AIRPLAY2=1` image; real AirPlay-2 test.
+- [x] Locate the AAC decode file in shairport-sync **4.3.2** — it's in **`rtp.c`** (not
+      `player.c` as master is), the `avcodec_find_decoder(AV_CODEC_ID_AAC)` at ~2269.
+- [x] Write the `aac_fixed` decode patch (§1.5) → `scripts/patches/020-aac-fixed-decode.patch`.
+      Verified: applies clean to real 4.3.2, and `codec->sample_fmts[0]` is valid API in the
+      ffmpeg **6.1.4** OpenWrt 24.10 ships (deprecated in 7.0, not removed until later) and is
+      `S32P` for aac_fixed / `FLTP` for the float fallback, so swr is configured correctly in
+      both cases. `build.sh` builds ffmpeg with `--enable-decoder=aac,aac_fixed --enable-parser=aac`.
+- [x] Fix the BE `ntoh64` PTP correctionField bug (audit Finding 1) →
+      `scripts/patches/040-nqptp-bigendian-ntoh64.patch`, wired into `build.sh` (`AIRPLAY2=1`).
+      Endian-agnostic rewrite (assembles from raw bytes like `nctoh64`); no-op on LE. Verified
+      against pinned nqptp **1.2.4**.
+- [ ] **On-device AP2 test (the ballgame):** build `AIRPLAY2=1`, flash unit #1, run
+      `scripts/ap2-bench.sh` during a live Apple-Music session. PASS = PCM stays RUNNING with
+      idle headroom (fixed-point works); FAIL = still XRUNs → next CPU levers in the script's
+      verdict (force S16 output, verify SCHED_FIFO, throttle LED churn). Blocked on the Proxmox
+      build host key unlock. Keep the sysupgrade image ~10 MB.
 - [ ] Recovery slot (initramfs into freed flash; `beep_recovery` slot).
-- [ ] Consider upstreaming the big-endian pair_ap patch and the `aac_fixed` decode option.
+- [ ] Consider upstreaming the big-endian pair_ap patch, the `aac_fixed` decode option, and the
+      `ntoh64` BE fix (all three are correct on LE too, so upstreamable as-is).
