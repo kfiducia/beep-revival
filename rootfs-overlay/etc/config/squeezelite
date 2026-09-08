@@ -1,0 +1,18 @@
+config options 'options'
+	# Player shows up in Lyrion Music Server / controllers under this name.
+	# Empty -> the init falls back to the device hostname (see /etc/init.d/squeezelite).
+	option name ''
+	option model_name 'Beep'
+	# Output through the ALSA softvol plug (see /etc/asound.conf), NOT hw:0,0, so the
+	# shared "Master" control attenuates the stream.
+	option device 'default'
+	# Bind LMS volume to the shared Master softvol -> knob / web / LED arc all track it.
+	option mixer_control 'Master'
+	# Release the ALSA device 5s after playback so AirPlay/Snapcast can take the card
+	# and the LED "playing" animation clears when idle.
+	option close_delay '5'
+	# Leave RT priority OFF on this single-core SoC; the init uses `nice -12` instead.
+	option priority '0'
+	# Empty server_addr -> auto-discover the LMS instance on the LAN.
+	option server_addr ''
+	option enabled '1'

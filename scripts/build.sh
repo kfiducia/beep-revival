@@ -222,6 +222,23 @@ fi
 # Makefile/source changed → force a clean shairport rebuild so the mode switch takes
 make package/feeds/packages/shairport-sync/clean >/dev/null 2>&1 || true
 
+echo "== 1c. squeezelite (Lyrion / LMS player) build-dep trim =="
+# The stock squeezelite package's PKG_BUILD_DEPENDS is the UNION for its full/dynamic
+# variants and includes ffmpeg + faad2. We build only the "custom" variant with the
+# light codecs (FLAC/MP3/Opus) and NO ffmpeg/AAC path (-DNO_FAAD, no -DFFMPEG — those
+# sources are preprocessed out), so those two heavyweight headers are never included.
+# Dropping them from the build-deps keeps the DEFAULT image ffmpeg-free at BUILD time
+# too (a full ffmpeg compile is the single longest step; the whole point of the classic
+# AirPlay-1 default is to avoid it). Persistent, non-idempotent edit — restore pristine
+# from git first, exactly like the shairport Makefile handling above.
+# NOTE: if a build ever fails on a missing <faad.h>/ffmpeg header, restore that one dep.
+SQL="$OW/feeds/packages/sound/squeezelite/Makefile"
+if [ -f "$SQL" ]; then
+  git -C "$OW/feeds/packages" checkout -- sound/squeezelite/Makefile 2>/dev/null || true
+  sed -i 's/^PKG_BUILD_DEPENDS:=.*/PKG_BUILD_DEPENDS:=flac libsoxr libvorbis openssl opusfile/' "$SQL"
+  make package/feeds/packages/squeezelite/clean >/dev/null 2>&1 || true
+fi
+
 echo "== 2. swap in our device tree (keep carambola2 board-name for sysupgrade) =="
 DTS="$OW/target/linux/ath79/dts/ar9331_8dev_carambola2.dts"
 cp "$SRC/dts/ar9331_beep_dial.dts" "$DTS"
@@ -319,6 +336,25 @@ cat >> .config <<CFG
 CONFIG_PACKAGE_snapserver=y
 CONFIG_PACKAGE_snapclient=y
 CONFIG_PACKAGE_libatomic=y
+# Lyrion Music Server (LMS / Squeezebox) player. The "custom" variant compiles ONLY
+# the codecs the 400MHz no-FPU AR9331 can handle in real time — FLAC (fixed-point
+# decoder), MP3 (libmpg123, integer), Opus (fixed-point) — and leaves out the
+# CPU-killers: AAC/HE-AAC (faad), WMA/ALAC (ffmpeg), and soxr resampling. LMS
+# transcodes anything else to FLAC on the server side. Beep ships its own
+# init+config in the rootfs overlay to bind volume to the "Master" softvol.
+CONFIG_PACKAGE_squeezelite-custom=y
+CONFIG_SQUEEZELITE_FLAC=y
+CONFIG_SQUEEZELITE_MP3_MPG123=y
+CONFIG_SQUEEZELITE_OPUS=y
+# Explicitly OFF (defaults are n; pinned for clarity + to document the CPU rationale):
+# CONFIG_SQUEEZELITE_AAC is not set
+# CONFIG_SQUEEZELITE_MP3_MAD is not set
+# CONFIG_SQUEEZELITE_VORBIS is not set
+# CONFIG_SQUEEZELITE_VORBIS_TREMOR is not set
+# CONFIG_SQUEEZELITE_WMA_ALAC is not set
+# CONFIG_SQUEEZELITE_RESAMPLE is not set
+# CONFIG_SQUEEZELITE_DSD is not set
+# CONFIG_SQUEEZELITE_SSL is not set
 # CONFIG_PACKAGE_libffmpeg-full is not set
 # CONFIG_PACKAGE_libffmpeg-audio-dec is not set
 CFG

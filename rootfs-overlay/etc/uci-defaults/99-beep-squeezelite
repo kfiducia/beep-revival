@@ -1,0 +1,7 @@
+#!/bin/sh
+# Enable the Lyrion Music Server player (squeezelite) on boot. It auto-discovers
+# an LMS instance on the LAN; with no server present it idles cheaply, so it's safe
+# to have running by default. Volume/LED integration is via the "Master" softvol
+# (see /etc/config/squeezelite + /etc/init.d/squeezelite).
+[ -x /etc/init.d/squeezelite ] && /etc/init.d/squeezelite enable 2>/dev/null
+exit 0

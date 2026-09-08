@@ -1,0 +1,28 @@
+Beep firmware variant: LMS  (Lyrion Music Server / Squeezebox support — SPIKE / TRL 3)
+
+Audio sources in this image:
+  * AirPlay-1 (classic RAOP)      — shairport-sync
+  * Snapcast (multi-room sync)    — snapserver + snapclient
+  * Lyrion / LMS player (NEW)     — squeezelite
+
+Squeezelite (LMS) details:
+  Codecs built in : FLAC, MP3 (libmpg123), Opus            [all integer / fixed-point paths]
+  Codecs NOT built: AAC/HE-AAC, WMA, ALAC, DSD, soxr resample
+                    -> the LMS server transcodes anything else to FLAC.
+  Volume          : bound to the ALSA "Master" softvol (-V Master), so the LMS app
+                    slider, the volume knob, the web slider and the LED arc all move
+                    ONE shared level (same design as AirPlay).
+  Output          : ALSA "default" PCM (softvol); releases the card 5s after playback.
+  Server          : auto-discovered on the LAN. To pin one:
+                      uci set squeezelite.options.server_addr='<LMS-ip>'; uci commit; \
+                      /etc/init.d/squeezelite restart
+  Player name     : the device hostname.
+  Config / init   : /etc/config/squeezelite , /etc/init.d/squeezelite
+
+How to test:
+  1. Run a Lyrion Music Server on the LAN.
+  2. The Beep should appear as a player (named after its hostname) in the LMS web UI / app.
+  3. Play a FLAC or MP3 track -> audio out the speaker; the LED arc shows "playing".
+  4. Turn the knob and move the LMS/web volume slider -> all should track together.
+  5. LISTEN FOR STATIC. Clean audio = the big-endian output path is correct on this MIPS
+     BE / no-FPU SoC (validated in source, but the DAC clocking is only proven by ear).
