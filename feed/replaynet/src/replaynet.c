@@ -59,6 +59,8 @@
 #include <inttypes.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -285,6 +287,101 @@ static size_t rb_drop(struct pcmring *r, size_t n)
 	return n;
 }
 
+/* ------------------------------------------------------------- grouping consensus (step d)
+ *
+ * Deterministic port of the stock assign_groups() (readable Lua at
+ * u2-backup/.../beepmanager_grouper.lua; docs/PLAYNET-RE.md §3). Every node gossips its
+ * {sink, source, signal, source_time} and runs THIS identically over the shared set, so
+ * all converge on the same grouping with no arbiter. Group id == the source device's id;
+ * "-1" means "no source". A device joins group G by setting sink = G. The stock
+ * "integrations" (app-role round-robin) is orthogonal to audio grouping and omitted.
+ *
+ * Rules: (1) if two devices both claim to source the same group, the OLDEST source_time
+ * keeps it (tie -> lexically-greater id), the rest -> "-1"; (2) a source with no sink
+ * (no listener) is dropped; (3) every group that has listeners but no source elects one
+ * from its members, preferring highest signal then name. Pure + deterministic ->
+ * unit-tested in --selftest and safe to run on every node. */
+
+#define RN_ID_MAX 32
+#define RN_NONE   "-1"
+/* An ELECTED source (rule 3) carries this as its source_time so a VOLUNTARY source
+ * (become-source, real timestamp — always smaller) wins duplicate-resolution against it.
+ * Without this an elected source (time 0 = "infinitely old") would beat a user's explicit
+ * stream-here, and the wrong device would hold the group. */
+#define RN_ELECTED_TIME  ((int64_t)1 << 62)
+
+struct rn_dev {
+	char    id[RN_ID_MAX];
+	char    source[RN_ID_MAX];   /* group this device sources, or "-1" */
+	char    sink[RN_ID_MAX];     /* group this device listens to */
+	int     signal;              /* wifi signal (higher = stronger) */
+	int64_t source_time;         /* when it became a source; lower = older = wins */
+};
+
+/* strictly-deterministic "device d should beat device e as the elected source":
+ * higher signal, then lexically-greater id (matches the stock _sort_signals). */
+static int rn_dev_prefer(const struct rn_dev *d, const struct rn_dev *e)
+{
+	if (d->signal != e->signal) return d->signal > e->signal;
+	return strcmp(d->id, e->id) > 0;
+}
+
+static int rn_has_sink_for(const struct rn_dev *cfg, int n, const char *group)
+{
+	for (int i = 0; i < n; i++)
+		if (strcmp(cfg[i].sink, group) == 0) return 1;
+	return 0;
+}
+
+/* Run consensus in place over cfg[0..n). Only the `source` fields change. */
+static void rn_assign_groups(struct rn_dev *cfg, int n)
+{
+	/* 1. resolve duplicate sources: oldest source_time keeps it (tie -> greater id) */
+	for (int i = 0; i < n; i++) {
+		if (strcmp(cfg[i].source, RN_NONE) == 0) continue;
+		for (int j = 0; j < n; j++) {
+			if (i == j || strcmp(cfg[j].source, RN_NONE) == 0) continue;
+			if (strcmp(cfg[i].source, cfg[j].source) != 0) continue;
+			/* i and j claim the same source group -> one loses */
+			int i_loses;
+			if (cfg[i].source_time != cfg[j].source_time)
+				i_loses = cfg[i].source_time > cfg[j].source_time; /* newer loses */
+			else
+				i_loses = strcmp(cfg[i].id, cfg[j].id) < 0;        /* smaller id loses */
+			if (i_loses) { strcpy(cfg[i].source, RN_NONE); break; }
+			else         { strcpy(cfg[j].source, RN_NONE); }
+		}
+	}
+
+	/* 2. drop sources that have no listener (no device sinks to that group) */
+	for (int i = 0; i < n; i++)
+		if (strcmp(cfg[i].source, RN_NONE) != 0 &&
+		    !rn_has_sink_for(cfg, n, cfg[i].source))
+			strcpy(cfg[i].source, RN_NONE);
+
+	/* 3. every group with listeners but no source elects one from its members
+	 *    (highest signal, then name). A group already sourced is skipped. */
+	for (int i = 0; i < n; i++) {
+		const char *group = cfg[i].sink;
+		/* does this group already have a source? */
+		int sourced = 0;
+		for (int k = 0; k < n; k++)
+			if (strcmp(cfg[k].source, group) == 0) { sourced = 1; break; }
+		if (sourced) continue;
+		/* elect the best member (device whose sink == group) not already a source */
+		int best = -1;
+		for (int k = 0; k < n; k++) {
+			if (strcmp(cfg[k].sink, group) != 0) continue;
+			if (strcmp(cfg[k].source, RN_NONE) != 0) continue;  /* already sources something */
+			if (best < 0 || rn_dev_prefer(&cfg[k], &cfg[best])) best = k;
+		}
+		if (best >= 0) {
+			strcpy(cfg[best].source, group);
+			cfg[best].source_time = RN_ELECTED_TIME;   /* yield to any voluntary source */
+		}
+	}
+}
+
 /* ------------------------------------------------------------- io helpers */
 
 static ssize_t read_full(int fd, void *buf, size_t n)
@@ -450,6 +547,85 @@ static int run_source(const char *pcm_path, const char *host, uint16_t port)
 	}
 
 	close(sock);
+	if (in != STDIN_FILENO) close(in);
+	return rc;
+}
+
+/* ------------------------------------------------------------- fan-out source (step d)
+ *
+ * One source, many sinks: connect to each group member's sink listener (the source
+ * itself is a member via 127.0.0.1) and stream ONE identically-timestamped PCM feed to
+ * all of them. Each sink clock-syncs to this source independently and plays aligned, so
+ * the whole group is in sync. Paced to real time like run_source; clock PINGs from any
+ * sink are answered promptly during the pacing wait to keep every sink's offset tight. */
+#define RN_FANOUT_MAX 16
+
+static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16_t port)
+{
+	int in = STDIN_FILENO;
+	if (pcm_path && strcmp(pcm_path, "-") != 0) {
+		in = open(pcm_path, O_RDONLY);
+		if (in < 0) { plog("ERROR", "open %s: %s", pcm_path, strerror(errno)); return 1; }
+	}
+	int sock[RN_FANOUT_MAX];
+	int nsock = 0;
+	for (int i = 0; i < npeers && nsock < RN_FANOUT_MAX; i++) {
+		int s = connect_peer(peers[i], port);
+		if (s >= 0) sock[nsock++] = s;      /* skip peers we can't reach */
+	}
+	if (nsock == 0) { plog("ERROR", "no sinks reachable"); if (in != STDIN_FILENO) close(in); return 1; }
+	plog("INFO", "fan-out to %d sink(s)", nsock);
+
+	uint8_t frame[RN_HDR_SIZE + RN_AUDIO_FIXED + RN_CHUNK_BYTES];
+	uint8_t *pcm = frame + RN_HDR_SIZE + RN_AUDIO_FIXED;
+	uint64_t track_samples = 0;
+	uint32_t seq = 0;
+	int64_t pace_start = 0;
+	int rc = 0;
+
+	while (!g_stop) {
+		if (pace_start == 0) pace_start = real_now_ns();
+		int64_t target = pace_start + (int64_t)(track_samples * 1000000000ull / RN_RATE);
+		/* pace while promptly answering any sink's PING */
+		for (;;) {
+			int64_t rem = target - real_now_ns();
+			if (rem <= 0 || g_stop) break;
+			int tmo = rem / 1000000ll; if (tmo > 200) tmo = 200;
+			struct pollfd pfd[RN_FANOUT_MAX];
+			for (int i = 0; i < nsock; i++) { pfd[i].fd = sock[i]; pfd[i].events = POLLIN; }
+			int pr = poll(pfd, nsock, tmo);
+			if (pr <= 0) continue;
+			for (int i = 0; i < nsock; i++)
+				if (pfd[i].revents & POLLIN)
+					if (source_answer_ping(sock[i]) != 0) sock[i] = -1;   /* mark dead */
+		}
+		if (g_stop) break;
+
+		ssize_t r = read_upto(in, pcm, RN_CHUNK_BYTES);
+		if (r <= 0) { plog("INFO", "fan-out EOF after %u frames", seq); break; }
+		size_t send_bytes = (size_t)r - (size_t)r % RN_FRAME_BYTES;
+		if (send_bytes == 0) break;
+
+		hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)(RN_AUDIO_FIXED + send_bytes));
+		be64_put(frame + RN_HDR_SIZE + 0, track_samples);
+		be64_put(frame + RN_HDR_SIZE + 8, 0);
+		be64_put(frame + RN_HDR_SIZE + 16, (uint64_t)now_ns());
+		be32_put(frame + RN_HDR_SIZE + 24, (uint32_t)send_bytes);
+		size_t total = RN_HDR_SIZE + RN_AUDIO_FIXED + send_bytes;
+		int alive = 0;
+		for (int i = 0; i < nsock; i++) {
+			if (sock[i] < 0) continue;
+			if (write_full(sock[i], frame, total) < 0) {
+				plog("WARN", "sink %d dropped", i);
+				close(sock[i]); sock[i] = -1;
+			} else alive++;
+		}
+		if (alive == 0) { plog("INFO", "all sinks gone"); break; }
+		track_samples += send_bytes / RN_FRAME_BYTES;
+		seq++;
+		if ((size_t)r < RN_CHUNK_BYTES) { plog("INFO", "fan-out EOF after %u frames", seq); break; }
+	}
+	for (int i = 0; i < nsock; i++) if (sock[i] >= 0) close(sock[i]);
 	if (in != STDIN_FILENO) close(in);
 	return rc;
 }
@@ -886,6 +1062,266 @@ done:
 }
 #endif /* RN_ALSA */
 
+/* ------------------------------------------------------------- node daemon (step d)
+ *
+ * The orchestrator. Each node gossips its {id, source, sink, signal, source_time} over
+ * UDP multicast, runs rn_assign_groups() over {self + live peers} on a timer, and drives
+ * child processes by the result: it always keeps a sink player listening; when it is the
+ * elected source it forks a fan-out that streams to every group member (itself included,
+ * via 127.0.0.1) so the whole group plays in sync. Triggers (shairport "playing",
+ * double-tap "join") arrive as one-line commands on a UNIX control socket — see run_ctl.
+ * This mirrors the stock split (a manager that forks the audio engine). mDNS is the
+ * production discovery transport (avahi _beep._tcp, docs §6); UDP multicast is the
+ * dependency-free spike stand-in and carries the same TXT-equivalent fields. */
+
+#define RN_GOSSIP_GROUP "239.7.42.99"
+#define RN_MAX_PEERS 32
+#define RN_PEER_TTL_NS (6ll * 1000000000ll)
+
+struct rn_peer { struct rn_dev d; char ip[64]; int64_t last_seen; int used; };
+
+static int mc_socket(uint16_t port)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+	int one = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY); sa.sin_port = htons(port);
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { plog("ERROR","gossip bind: %s",strerror(errno)); close(fd); return -1; }
+	struct ip_mreq mr; memset(&mr, 0, sizeof(mr));
+	mr.imr_multiaddr.s_addr = inet_addr(RN_GOSSIP_GROUP);
+	mr.imr_interface.s_addr = htonl(INADDR_ANY);
+	if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr)) < 0)
+		plog("WARN", "multicast join: %s (LAN gossip may not work)", strerror(errno));
+	unsigned char ttl = 1;
+	setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+	return fd;
+}
+
+static void gossip_send(int fd, const struct rn_dev *s, uint16_t port)
+{
+	char buf[256];
+	int n = snprintf(buf, sizeof(buf), "RNG1\t%s\t%s\t%s\t%d\t%lld",
+	                 s->id, s->source, s->sink, s->signal, (long long)s->source_time);
+	struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET; sa.sin_addr.s_addr = inet_addr(RN_GOSSIP_GROUP); sa.sin_port = htons(port);
+	sendto(fd, buf, n, 0, (struct sockaddr *)&sa, sizeof(sa));
+}
+
+static struct rn_peer *peer_find(struct rn_peer *tbl, const char *id)
+{
+	for (int i = 0; i < RN_MAX_PEERS; i++) if (tbl[i].used && strcmp(tbl[i].d.id, id) == 0) return &tbl[i];
+	return NULL;
+}
+static struct rn_peer *peer_slot(struct rn_peer *tbl)
+{
+	for (int i = 0; i < RN_MAX_PEERS; i++) if (!tbl[i].used) return &tbl[i];
+	return NULL;
+}
+
+static pid_t spawn_player(const char *dev, uint16_t port, int no_audio)
+{
+	pid_t p = fork();
+	if (p != 0) return p;
+	/* child: play whatever source connects (loops via parent re-spawn) */
+	signal(SIGINT, SIG_DFL); signal(SIGTERM, SIG_DFL);
+	int rc;
+	if (no_audio) rc = run_sink("/dev/null", port);
+#ifdef RN_ALSA
+	else rc = run_sink_alsa(dev, port);
+#else
+	else { (void)dev; rc = run_sink("/dev/null", port); }
+#endif
+	_exit(rc);
+}
+
+static pid_t spawn_fanout(const char *pcm, char peers[][64], int npeers, uint16_t port)
+{
+	pid_t p = fork();
+	if (p != 0) return p;
+	signal(SIGINT, SIG_DFL); signal(SIGTERM, SIG_DFL);
+	_exit(run_fanout(pcm, peers, npeers, port));
+}
+
+static void node_apply_ctl(struct rn_dev *self, const char *cmd, int64_t now_ms, char *reply, size_t rlen)
+{
+	if (strncmp(cmd, "become-source", 13) == 0) {
+		strncpy(self->sink, self->id, RN_ID_MAX-1);
+		strncpy(self->source, self->id, RN_ID_MAX-1);
+		self->source_time = now_ms;
+		snprintf(reply, rlen, "OK source group=%s\n", self->id);
+	} else if (strncmp(cmd, "join ", 5) == 0) {
+		const char *g = cmd + 5;
+		char group[RN_ID_MAX]; snprintf(group, sizeof(group), "%s", g);
+		char *nl = strpbrk(group, " \t\r\n"); if (nl) *nl = '\0';
+		strncpy(self->sink, group, RN_ID_MAX-1);
+		strcpy(self->source, RN_NONE);
+		snprintf(reply, rlen, "OK joined group=%s\n", group);
+	} else if (strncmp(cmd, "leave", 5) == 0) {
+		strncpy(self->sink, self->id, RN_ID_MAX-1);
+		strcpy(self->source, RN_NONE);
+		snprintf(reply, rlen, "OK left\n");
+	} else if (strncmp(cmd, "status", 6) == 0) {
+		snprintf(reply, rlen, "id=%s sink=%s source=%s\n", self->id, self->sink, self->source);
+	} else {
+		snprintf(reply, rlen, "ERR unknown: %s\n", cmd);
+	}
+}
+
+static int run_node(const char *id, const char *group, int signal_lvl, uint16_t audio_port,
+                    uint16_t gossip_port, const char *pcm, const char *dev,
+                    const char *ctl_path, int no_audio)
+{
+	struct rn_dev self; memset(&self, 0, sizeof(self));
+	snprintf(self.id, sizeof(self.id), "%s", id);
+	snprintf(self.sink, sizeof(self.sink), "%s", group);
+	strcpy(self.source, RN_NONE);
+	self.signal = signal_lvl;
+
+	struct rn_peer peers[RN_MAX_PEERS]; memset(peers, 0, sizeof(peers));
+
+	int mc = mc_socket(gossip_port);
+	if (mc < 0) return 1;
+
+	int ctl = socket(AF_UNIX, SOCK_STREAM, 0);
+	struct sockaddr_un un; memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX; snprintf(un.sun_path, sizeof(un.sun_path), "%s", ctl_path);
+	unlink(ctl_path);
+	if (bind(ctl, (struct sockaddr *)&un, sizeof(un)) < 0 || listen(ctl, 4) < 0) {
+		plog("ERROR", "control socket %s: %s", ctl_path, strerror(errno)); close(mc); return 1;
+	}
+	plog("INFO", "node %s up: group=%s audio:%u gossip:%u ctl=%s%s",
+	     self.id, self.sink, audio_port, gossip_port, ctl_path, no_audio ? " (no-audio)" : "");
+
+	pid_t player = no_audio ? 0 : spawn_player(dev, audio_port, no_audio);
+	pid_t fanout = 0;
+	char cur_members[512] = "";
+	char last_role[128] = "";
+	int64_t last_gossip = 0, last_consensus = 0;
+
+	while (!g_stop) {
+		/* reap children; keep the player alive */
+		int st; pid_t d;
+		while ((d = waitpid(-1, &st, WNOHANG)) > 0) {
+			if (d == fanout) fanout = 0;
+			else if (d == player && !no_audio) player = spawn_player(dev, audio_port, no_audio);
+		}
+
+		int64_t now = now_ns();
+		if (now - last_gossip >= 1000000000ll) { gossip_send(mc, &self, gossip_port); last_gossip = now; }
+
+		struct pollfd pfd[2] = { { mc, POLLIN, 0 }, { ctl, POLLIN, 0 } };
+		int pr = poll(pfd, 2, 200);
+		if (pr < 0) { if (errno == EINTR) continue; break; }
+
+		if (pfd[0].revents & POLLIN) {          /* gossip in */
+			char buf[256]; struct sockaddr_in src; socklen_t sl = sizeof(src);
+			int n = recvfrom(mc, buf, sizeof(buf)-1, 0, (struct sockaddr *)&src, &sl);
+			if (n > 0) {
+				buf[n] = '\0';
+				char pid[RN_ID_MAX], psrc[RN_ID_MAX], psink[RN_ID_MAX]; int psig; long long pt;
+				if (sscanf(buf, "RNG1\t%31[^\t]\t%31[^\t]\t%31[^\t]\t%d\t%lld", pid, psrc, psink, &psig, &pt) == 5
+				    && strcmp(pid, self.id) != 0) {
+					struct rn_peer *pe = peer_find(peers, pid);
+					if (!pe) pe = peer_slot(peers);
+					if (pe) {
+						pe->used = 1; snprintf(pe->d.id, RN_ID_MAX, "%s", pid);
+						snprintf(pe->d.source, RN_ID_MAX, "%s", psrc);
+						snprintf(pe->d.sink, RN_ID_MAX, "%s", psink);
+						pe->d.signal = psig; pe->d.source_time = pt;
+						snprintf(pe->ip, sizeof(pe->ip), "%s", inet_ntoa(src.sin_addr));
+						pe->last_seen = now;
+						if (getenv("RN_DEBUG"))
+							plog("DEBUG", "rx gossip %s: src=%s sink=%s", pid, psrc, psink);
+					}
+				}
+			}
+		}
+		if (pfd[1].revents & POLLIN) {          /* control command */
+			int c = accept(ctl, NULL, NULL);
+			if (c >= 0) {
+				char cmd[128]; int n = read(c, cmd, sizeof(cmd)-1);
+				if (n > 0) { cmd[n] = '\0'; char reply[256];
+					node_apply_ctl(&self, cmd, now / 1000000ll, reply, sizeof(reply));
+					write(c, reply, strlen(reply));
+					plog("INFO", "ctl: %.*s -> %s", (int)strcspn(cmd,"\r\n"), cmd, reply);
+					last_consensus = 0;         /* re-run consensus promptly */
+				}
+				close(c);
+			}
+		}
+
+		/* expire stale peers */
+		for (int i = 0; i < RN_MAX_PEERS; i++)
+			if (peers[i].used && now - peers[i].last_seen > RN_PEER_TTL_NS) peers[i].used = 0;
+
+		if (now - last_consensus < 500000000ll) continue;
+		last_consensus = now;
+
+		/* build config = self + live peers, run consensus, read back my source */
+		struct rn_dev cfg[RN_MAX_PEERS + 1]; int n = 0;
+		cfg[n++] = self;
+		for (int i = 0; i < RN_MAX_PEERS; i++) if (peers[i].used) cfg[n++] = peers[i].d;
+		rn_assign_groups(cfg, n);
+		/* cfg[0].source is MY computed role (the group I should source, or "-1"). This is
+		 * NOT written back into self.source: we gossip only the VOLUNTARY claim (set by
+		 * become-source), and every node recomputes the elected roles deterministically
+		 * from that shared state each round. Feeding the computed/elected result back into
+		 * gossip is what caused source-ownership to oscillate. */
+		char role_src[RN_ID_MAX]; snprintf(role_src, sizeof(role_src), "%s", cfg[0].source);
+		if (getenv("RN_DEBUG"))
+			for (int i = 0; i < n; i++)
+				plog("DEBUG", "cfg[%d] id=%s sink=%s ->src=%s t=%lld", i, cfg[i].id,
+				     cfg[i].sink, cfg[i].source, (long long)cfg[i].source_time);
+
+		char role[128];
+		if (strcmp(role_src, RN_NONE) != 0) {
+			/* I source this group: fan out to every member (myself via localhost) */
+			char members[RN_FANOUT_MAX][64]; int nm = 0;
+			snprintf(members[nm++], 64, "127.0.0.1");
+			for (int i = 0; i < RN_MAX_PEERS && nm < RN_FANOUT_MAX; i++)
+				if (peers[i].used && strcmp(peers[i].d.sink, role_src) == 0)
+					snprintf(members[nm++], 64, "%s", peers[i].ip);
+			char sig[512] = ""; for (int i = 0; i < nm; i++) { strncat(sig, members[i], sizeof(sig)-strlen(sig)-2); strncat(sig, ",", 2); }
+			snprintf(role, sizeof(role), "SOURCE group=%s members=%d", role_src, nm);
+			if (!no_audio && (fanout == 0 || strcmp(sig, cur_members) != 0)) {
+				if (fanout) { kill(fanout, SIGTERM); waitpid(fanout, NULL, 0); }
+				fanout = spawn_fanout(pcm, members, nm, audio_port);
+				snprintf(cur_members, sizeof(cur_members), "%s", sig);
+			}
+		} else {
+			if (fanout) { kill(fanout, SIGTERM); waitpid(fanout, NULL, 0); fanout = 0; cur_members[0] = '\0'; }
+			/* who does consensus say sources my group? (may be a voluntary or elected peer) */
+			const char *src_of = "none";
+			for (int i = 1; i < n; i++)
+				if (strcmp(cfg[i].source, self.sink) == 0) src_of = cfg[i].id;
+			snprintf(role, sizeof(role), "SINK group=%s source=%s", self.sink, src_of);
+		}
+		if (strcmp(role, last_role) != 0) { plog("INFO", "role: %s", role); snprintf(last_role, sizeof(last_role), "%s", role); }
+	}
+
+	if (fanout) { kill(fanout, SIGTERM); waitpid(fanout, NULL, 0); }
+	if (player) { kill(player, SIGTERM); waitpid(player, NULL, 0); }
+	unlink(ctl_path); close(ctl); close(mc);
+	return 0;
+}
+
+static int run_ctl(const char *ctl_path, const char *cmd)
+{
+	int c = socket(AF_UNIX, SOCK_STREAM, 0);
+	struct sockaddr_un un; memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX; snprintf(un.sun_path, sizeof(un.sun_path), "%s", ctl_path);
+	if (connect(c, (struct sockaddr *)&un, sizeof(un)) < 0) {
+		fprintf(stderr, "no node at %s: %s\n", ctl_path, strerror(errno)); close(c); return 1;
+	}
+	write(c, cmd, strlen(cmd));
+	char reply[256]; int n = read(c, reply, sizeof(reply)-1);
+	if (n > 0) { reply[n] = '\0'; fputs(reply, stdout); }
+	close(c);
+	return 0;
+}
+
 /* ------------------------------------------------------------- selftest */
 
 static int selftest(void)
@@ -950,6 +1386,36 @@ static int selftest(void)
 		CHECK(theta == theta_true);
 	}
 
+	/* grouping consensus */
+	{
+		/* A) duplicate source -> oldest source_time keeps it */
+		struct rn_dev c[3];
+		memset(c, 0, sizeof(c));
+		strcpy(c[0].id,"X"); strcpy(c[0].source,"G"); strcpy(c[0].sink,"G"); c[0].signal=5; c[0].source_time=100;
+		strcpy(c[1].id,"Y"); strcpy(c[1].source,"G"); strcpy(c[1].sink,"G"); c[1].signal=9; c[1].source_time=200;
+		rn_assign_groups(c, 2);
+		CHECK(strcmp(c[0].source,"G")==0 && strcmp(c[1].source,RN_NONE)==0);  /* older X keeps G */
+
+		/* B) group with listeners but no source -> elect highest signal */
+		memset(c, 0, sizeof(c));
+		strcpy(c[0].id,"A"); strcpy(c[0].source,RN_NONE); strcpy(c[0].sink,"grpA"); c[0].signal=5;
+		strcpy(c[1].id,"B"); strcpy(c[1].source,RN_NONE); strcpy(c[1].sink,"grpA"); c[1].signal=9;
+		rn_assign_groups(c, 2);
+		CHECK(strcmp(c[1].source,"grpA")==0 && strcmp(c[0].source,RN_NONE)==0);  /* stronger B sources */
+
+		/* C) source whose group has no listener is dropped */
+		memset(c, 0, sizeof(c));
+		strcpy(c[0].id,"A"); strcpy(c[0].source,"X"); strcpy(c[0].sink,"X"); c[0].signal=5; c[0].source_time=10;
+		strcpy(c[1].id,"B"); strcpy(c[1].source,"Y"); strcpy(c[1].sink,"X"); c[1].signal=9; c[1].source_time=5;
+		rn_assign_groups(c, 2);
+		CHECK(strcmp(c[0].source,"X")==0 && strcmp(c[1].source,RN_NONE)==0);  /* orphan Y dropped */
+
+		/* D) idempotent: a converged config is a fixed point */
+		struct rn_dev d0[2]; memcpy(d0, c, sizeof(d0));
+		rn_assign_groups(c, 2);
+		CHECK(memcmp(d0, c, sizeof(d0))==0);
+	}
+
 	if (fails == 0) fprintf(stderr, "SELFTEST OK\n");
 	return fails ? 1 : 0;
 	#undef CHECK
@@ -960,15 +1426,18 @@ static int selftest(void)
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"replaynet — Beep multi-room sync engine (step b: clock sync + drift)\n"
+		"replaynet — Beep multi-room sync engine (a: transport, b: clock/drift, c: ALSA, d: grouping)\n"
 		"usage:\n"
 		"  %s --source --peer <ip:port> [--pcm <file|->]\n"
 		"            [--fake-clock-offset-ns N] [--fake-clock-rate-ppm P]\n"
 		"  %s --sink   --listen <port>  [--out <file|-> | --alsa <device>]\n"
+		"  %s --node   --id <name> [--group <id>] [--listen <audio-port>]\n"
+		"            [--alsa <dev>] [--pcm <src>] [--signal N] [--no-audio]\n"
+		"  %s --ctl <cmd>          (become-source | join <id> | leave | status)\n"
 		"  %s --selftest\n"
 		"\n"
 		"PCM is raw interleaved S16, %d Hz, %d ch (%d bytes/frame).\n",
-		argv0, argv0, argv0, RN_RATE, RN_CHANNELS, RN_FRAME_BYTES);
+		argv0, argv0, argv0, argv0, argv0, RN_RATE, RN_CHANNELS, RN_FRAME_BYTES);
 }
 
 static int split_hostport(const char *s, char *host, size_t hostsz, uint16_t *port)
@@ -989,33 +1458,48 @@ static int split_hostport(const char *s, char *host, size_t hostsz, uint16_t *po
 
 int main(int argc, char **argv)
 {
-	enum { MODE_NONE, MODE_SOURCE, MODE_SINK, MODE_SELFTEST } mode = MODE_NONE;
+	enum { MODE_NONE, MODE_SOURCE, MODE_SINK, MODE_SELFTEST, MODE_NODE, MODE_CTL } mode = MODE_NONE;
 	const char *pcm_path = "-";
 	const char *out_path = "-";
 	const char *alsa_dev = NULL;
+	const char *ctl_cmd = NULL;
+	const char *node_id = NULL, *group = "1", *ctl_path = "/tmp/replaynet.ctl";
+	int signal_lvl = 0, no_audio = 0;
+	uint16_t gossip_port = 5077;
 	char host[64] = "127.0.0.1";
 	uint16_t port = 0;
 
+	enum { O_ID = 1001, O_GROUP, O_GPORT, O_SIGNAL, O_NOAUDIO, O_CTLPATH };
 	static const struct option opts[] = {
 		{ "source", no_argument,       0, 'S' },
 		{ "sink",   no_argument,       0, 'K' },
 		{ "selftest", no_argument,     0, 'T' },
+		{ "node",   no_argument,       0, 'N' },
+		{ "ctl",    required_argument, 0, 'C' },
 		{ "peer",   required_argument, 0, 'p' },
 		{ "listen", required_argument, 0, 'l' },
 		{ "pcm",    required_argument, 0, 'i' },
 		{ "out",    required_argument, 0, 'o' },
 		{ "alsa",   required_argument, 0, 'A' },
+		{ "id",       required_argument, 0, O_ID },
+		{ "group",    required_argument, 0, O_GROUP },
+		{ "gossip-port", required_argument, 0, O_GPORT },
+		{ "signal",   required_argument, 0, O_SIGNAL },
+		{ "no-audio", no_argument,       0, O_NOAUDIO },
+		{ "ctl-path", required_argument, 0, O_CTLPATH },
 		{ "fake-clock-offset-ns", required_argument, 0, 'F' },
 		{ "fake-clock-rate-ppm",  required_argument, 0, 'R' },
 		{ "help",   no_argument,       0, 'h' },
 		{ 0, 0, 0, 0 },
 	};
 	int c;
-	while ((c = getopt_long(argc, argv, "SKTp:l:i:o:A:F:R:h", opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "SKTNC:p:l:i:o:A:F:R:h", opts, NULL)) != -1) {
 		switch (c) {
 		case 'S': mode = MODE_SOURCE; break;
 		case 'K': mode = MODE_SINK; break;
 		case 'T': mode = MODE_SELFTEST; break;
+		case 'N': mode = MODE_NODE; break;
+		case 'C': mode = MODE_CTL; ctl_cmd = optarg; break;
 		case 'p':
 			if (split_hostport(optarg, host, sizeof(host), &port) < 0 || host[0] == '\0') {
 				fprintf(stderr, "--peer needs host:port\n"); return 2;
@@ -1029,6 +1513,12 @@ int main(int argc, char **argv)
 		case 'i': pcm_path = optarg; break;
 		case 'o': out_path = optarg; break;
 		case 'A': alsa_dev = optarg; break;
+		case O_ID: node_id = optarg; break;
+		case O_GROUP: group = optarg; break;
+		case O_GPORT: gossip_port = (uint16_t)atoi(optarg); break;
+		case O_SIGNAL: signal_lvl = atoi(optarg); break;
+		case O_NOAUDIO: no_audio = 1; break;
+		case O_CTLPATH: ctl_path = optarg; break;
 		case 'F': g_fake_clock_offset_ns = strtoll(optarg, NULL, 10); break;
 		case 'R': g_fake_clock_rate_ppm = strtoll(optarg, NULL, 10); break;
 		case 'h': usage(argv[0]); return 0;
@@ -1038,14 +1528,25 @@ int main(int argc, char **argv)
 
 	if (mode == MODE_SELFTEST)
 		return selftest();
-	if (mode == MODE_NONE || port == 0) { usage(argv[0]); return 2; }
+	if (mode == MODE_CTL)
+		return run_ctl(ctl_path, ctl_cmd);
 
-	struct sigaction act;
-	memset(&act, 0, sizeof(act));
-	act.sa_handler = on_signal;
-	sigaction(SIGINT, &act, NULL);
-	sigaction(SIGTERM, &act, NULL);
+	struct sigaction nact;
+	memset(&nact, 0, sizeof(nact));
+	nact.sa_handler = on_signal;
+	sigaction(SIGINT, &nact, NULL);
+	sigaction(SIGTERM, &nact, NULL);
 	signal(SIGPIPE, SIG_IGN);
+
+	if (mode == MODE_NODE) {
+		if (!node_id) { fprintf(stderr, "--node needs --id <name>\n"); return 2; }
+		if (port == 0) port = 5060;                 /* default audio port */
+		g_role = "replaynet-node";
+		return run_node(node_id, group, signal_lvl, port, gossip_port,
+		                pcm_path, alsa_dev, ctl_path, no_audio);
+	}
+
+	if (mode == MODE_NONE || port == 0) { usage(argv[0]); return 2; }
 
 	if (mode == MODE_SOURCE) {
 		g_role = "replaynet-src";

@@ -13,8 +13,8 @@ Snapcast is deliberately dropped (issue #9).
 |------|-------|--------|
 | **(a)** | 2-node PCM stream + on-wire framing | done |
 | **(b)** | timestamp / clock sync + drift correction | done |
-| **(c)** | ALSA sink (the stock `beepi2s` role, WM8524) | done (this PR) |
-| (d) | `assign_groups()` consensus + mDNS + double-tap / shairport play hooks | next |
+| **(c)** | ALSA sink (the stock `beepi2s` role, WM8524) | done |
+| **(d)** | grouping consensus + discovery + fan-out + play hooks | done (this PR) |
 
 ## Wire protocol v2
 
@@ -103,12 +103,50 @@ the spike-level correction; smoothing it with resampling is future work, as is t
 inter-sink alignment below the setpoint tolerance (the synchronized start already aligns
 them to ~1 ms).
 
+## Grouping & orchestration (step d)
+
+`--node` turns replaynet into the multiroom brain (the stock `beepmanager` role). Every
+node:
+
+- **Gossips** its `{id, source, sink, signal, source_time}` on the LAN (UDP multicast
+  `239.7.42.99`; mDNS `_beep._tcp` via avahi is the production transport per §6 — the
+  multicast stand-in carries the same TXT-equivalent fields) and keeps a peer table with
+  a 6 s TTL.
+- **Runs consensus** — `rn_assign_groups()`, a deterministic C port of the stock
+  `assign_groups()` (docs/PLAYNET-RE.md §3): resolve duplicate source claims by oldest
+  `source_time` (tie → greater id); drop sources with no listener; elect a source
+  (highest signal, then id) for any group that has listeners but no source. It is pure
+  and unit-tested (`--selftest`). Crucially the node **gossips only its voluntary claim**
+  (set by `become-source`) and recomputes elected roles locally every ~500 ms — feeding a
+  computed/elected role back into gossip makes ownership oscillate.
+- **Acts on its role**: always keeps a sink player listening; when it is the source of a
+  group it forks a **fan-out** that streams one identically-timestamped feed to every
+  member — including itself via `127.0.0.1` — so the whole group (source included) plays
+  in sync off the step (b) clock sync + step (c) servo.
+
+**Triggers** arrive as one-line commands on a UNIX control socket, so the firmware's
+existing hooks drive it with no code coupling:
+
+```
+replaynet --ctl become-source     # shairport "playing" hook: stream-here -> I am the source
+replaynet --ctl "join <id>"       # double-tap hook: join that device's group
+replaynet --ctl leave             # drop out
+replaynet --ctl status
+```
+
+`become-source` sets `sink = source = my id` (my own group); `join G` sets `sink = G`
+(the source of group G is device G, or the elected fallback). Group id == the source
+device's id, matching the stock model where "join" = point your sink at the source.
+
 ## Usage
 
 ```
 replaynet --source --peer <ip:port> [--pcm <file|->]
           [--fake-clock-offset-ns N] [--fake-clock-rate-ppm P]   # test injectors
 replaynet --sink   --listen <port>  [--out <file|-> | --alsa <device>]
+replaynet --node   --id <name> [--group <id>] [--alsa <dev>] [--pcm <src>]
+          [--signal N] [--no-audio]                              # multiroom node (step d)
+replaynet --ctl <cmd>   (become-source | join <id> | leave | status)
 replaynet --selftest
 ```
 PCM is raw interleaved S16, 44100 Hz, 2 ch (4 B/frame). Without `--alsa` the sink writes
@@ -150,6 +188,16 @@ Confirmed on real hardware, and the 440 Hz tone is **audible** out the speaker:
   latency holds steady (~+/-70 ms of setpoint, net correction ~0) so wifi jitter rides in
   the buffer instead of forcing drops (an 80 ms buffer glitched badly, which drove the
   400 ms choice).
+
+**Grouping (step d)** is unit-tested in `--selftest` (duplicate-source resolution,
+signal-based election, orphan culling, idempotence) and validated live:
+- **3 nodes on one host (`--no-audio`):** all start in group 1 → converge on one elected
+  source, the rest sinks; `--ctl become-source` on A + `--ctl "join A"` on B then makes A
+  the source of group A with B its sink and C alone — stable across repeated runs.
+- **2 Beeps (silver + copper) with `--alsa`:** UDP-multicast gossip crosses the wifi;
+  `become-source` on silver + `join silver` on copper makes silver fan out to itself
+  (127.0.0.1) and copper; **both units report identical playout latency/ring** — i.e. the
+  same samples on the same schedule (in sync), and the tone is **audible on both**.
 
 Package: `feed/replaynet/` (single C file, mirrors `feed/beepd`, `DEPENDS +alsa-lib`,
 built `-DRN_ALSA -lasound`). Selected in the image via `CONFIG_PACKAGE_replaynet=y`
