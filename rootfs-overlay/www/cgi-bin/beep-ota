@@ -102,24 +102,57 @@ sysupgrade -T /tmp/ota.bin >/dev/null 2>&1 \
 
 # --- flash; device reboots. bootb->recovery backstops a bad boot ---
 #
-# ⚠️ KEEP-CONFIG HAZARD (2026-09-08 brick post-mortem, GitHub #8): this uses the stock
-# keep-config sysupgrade (no -n). That brick traced to the keep-config restore HANGING
-# on first boot after the flash, which — with no good-boot bootcount reset and a garbage
-# recovery slot — escalated to a UART-only brick. The clean fix is to stop relying on
-# stock keep-config: preserve only our small identity set (beep-code, cert/key, wireless
-# client + system config) ourselves and flash with `sysupgrade -n`, so a variant-mismatch
-# can never hang the restore. That is DEFERRED here because `-n` drops the wifi client
-# config -> the unit falls back to the setup AP, and that AP's DHCP is still being fixed
-# (PR #18); shipping -n before it works would strand a unit on an unreachable AP. Switch
-# to controlled-preserve + -n once the setup-AP DHCP is verified. See RECOVERY-DESIGN.md.
+# We do NOT use stock keep-config. A stock keep-config sysupgrade preserves ALL of
+# /etc/config/* (OpenWrt's base /lib/upgrade/keep.d), so a stale variant config
+# (snapcast/shairport/squeezelite) rides onto an image that no longer ships that
+# package and the FIRST-BOOT RESTORE HANGS — the exact chain that bricked a unit on
+# 2026-09-08 (GitHub #8/#22): a hung restore + no good-boot bootcount reset + a garbage
+# recovery pointer escalated to a UART-only brick, while the primary squashfs was 100%
+# intact. Instead we hand sysupgrade a CURATED tarball via `-f`, which makes it restore
+# ONLY that tar (OpenWrt sysupgrade: `-f` sets CONF_IMAGE, restored verbatim — no broad
+# keep.d expansion). The set is identity + connectivity ONLY, no variant-specific
+# service config, so a variant mismatch can't hang the restore. Crucially it INCLUDES
+# /etc/config/wireless, so the unit rejoins home wifi after the flash — this is why we
+# no longer need `-n` (which would strand the unit on the setup AP) and are no longer
+# blocked on the setup-AP DHCP fix (PR #18). See docs/RECOVERY-DESIGN.md.
+if [ -f /etc/beep-recovery ]; then
+	# From-recovery reflash of a primary: there is no owner identity here to keep
+	# (recovery is stateless); the fresh primary self-provisions from its MAC via
+	# 99-beep. Flash clean so nothing stale can hang first boot.
+	FLASH_ARGS="-n"
+	logger -t beep "OTA: recovery->primary reflash (clean, -n)"
+else
+	# Curated preserve. Paths are RELATIVE to / (how sysupgrade's restore untars them),
+	# and only files that actually exist are added. Deliberately EXCLUDES
+	# /etc/config/{snapcast,shairport,squeezelite,...} and the SSH-enable toggle —
+	# anything variant-specific that could trip the restore.
+	KEEP=/tmp/beep-keep.tar.gz; rm -f "$KEEP"
+	KEEP_FILES=""
+	for f in etc/beep-code etc/beep-uhttpd.crt etc/beep-uhttpd.key etc/shadow \
+	         etc/config/wireless etc/config/network etc/config/system; do
+		[ -e "/$f" ] && KEEP_FILES="$KEEP_FILES $f"
+	done
+	( cd / && tar czf "$KEEP" $KEEP_FILES ) 2>/dev/null
+	# NEVER flash into an identity wipe: the tar must exist and carry the device code.
+	# If staging failed, abort BEFORE flashing rather than reset the owner's password
+	# and TLS cert to factory.
+	if [ ! -s "$KEEP" ] || ! tar tzf "$KEEP" 2>/dev/null | grep -q '^etc/beep-code$'; then
+		rm -f "$KEEP"
+		fail '500 Internal Server Error' '{"error":"could not stage config preserve — flash aborted to protect device identity"}'
+	fi
+	FLASH_ARGS="-f $KEEP"
+	logger -t beep "OTA: curated-preserve flash (-f); keeping:$KEEP_FILES"
+fi
+
 say '200 OK' '{"ok":true,"note":"flashing and rebooting"}'
-logger -t beep "OTA: starting sysupgrade ($([ "$want_unsigned" = 1 ] && echo unsigned || echo signed), keep-config)"
+logger -t beep "OTA: starting sysupgrade ($([ "$want_unsigned" = 1 ] && echo unsigned || echo signed), args: $FLASH_ARGS)"
 # Detach the flash into its own session with setsid so uhttpd tearing down this CGI's
 # process group can't signal sysupgrade MID-WRITE — a half-written primary is exactly
 # the brick we're guarding against. Fall back to a plain background if setsid is absent.
+# $FLASH_ARGS is intentionally unquoted (word-split into flags; paths carry no spaces).
 if command -v setsid >/dev/null 2>&1; then
-	setsid sh -c 'sleep 1; sysupgrade /tmp/ota.bin' </dev/null >/dev/null 2>&1 &
+	setsid sh -c "sleep 1; sysupgrade $FLASH_ARGS /tmp/ota.bin" </dev/null >/dev/null 2>&1 &
 else
-	( sleep 1; sysupgrade /tmp/ota.bin ) </dev/null >/dev/null 2>&1 &
+	( sleep 1; sysupgrade $FLASH_ARGS /tmp/ota.bin ) </dev/null >/dev/null 2>&1 &
 fi
 exit 0
