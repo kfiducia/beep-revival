@@ -255,6 +255,10 @@ CONFIG_PACKAGE_alsa-utils=y
 CONFIG_PACKAGE_kmod-i2c-gpio=y
 CONFIG_PACKAGE_i2c-tools=y
 CONFIG_PACKAGE_libgpiod=y
+# fw_printenv/fw_setenv — the ONLY safe lever to reset U-Boot's bootcount (rewrites
+# the env sector). Used by the guarded good-boot reset (/usr/libexec/beep/bootcount-
+# reset), which stays a no-op until a bench-verified /etc/beep-fwenv-verified exists.
+CONFIG_PACKAGE_uboot-envtools=y
 # debug loop: rz/sz for fast serial .ko transfer into the running system,
 # devmem2 for live MBOX/stereo register peeking (busybox devmem also present)
 CONFIG_PACKAGE_lrzsz=y

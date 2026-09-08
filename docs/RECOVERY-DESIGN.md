@@ -148,8 +148,19 @@ verified `/etc/fw_env.config`, treat a lost env as a brick risk) is binding.
 
 ### Revised action order (supersedes the "Sequencing" section at the bottom)
 
-1. **Good-boot bootcount reset** in the primary firmware (prevents a *hang* from ever
-   reaching recovery-or-brick). Highest value; independent of the slot.
+1. **Good-boot bootcount reset** in the primary firmware. *Implemented, gated OFF:*
+   `/usr/libexec/beep/bootcount-reset` (called from `/etc/rc.local` after a 60 s
+   settle — reaching there means the boot cleared early-init, a reasonable "healthy"
+   proxy) rewrites the env sector via `fw_setenv` to clear U-Boot's wear-leveled
+   bootcount. It is a **no-op until `/etc/beep-fwenv-verified` exists** and until
+   `fw_printenv` reads back `beep_primary=0x9f050000` through the shipped
+   `/etc/fw_env.config` — because a wrong env geometry would reinit the env to
+   U-Boot's stock defaults and brick this layout. **Bench step to enable:** on a
+   UART unit, prove `fw_printenv beep_primary` → `0x9f050000` and a `fw_setenv`
+   round-trip, confirm on serial the bootcount region returns to `0xFF`, then
+   `touch /etc/beep-fwenv-verified`. Honest scope: this is defense-in-depth for a
+   *good* primary that reboots a lot — it does **not** fix a deterministic early hang
+   (that never reaches rc.local); the valid recovery slot + OTA hardening cover that.
 2. **OTA keep-config hardening** (`-n`, or robust/timeout-guarded first-boot restore;
    stop fire-and-forget backgrounding). Likely a separate issue.
 3. **Recovery slot**: build the ~5.57 MB minimal initramfs (bake `/etc/beep-ota.pub`

@@ -1,0 +1,12 @@
+#!/bin/sh
+# rc.local — runs at the very end of boot, on every boot, no enable step needed.
+#
+# Good-boot bootcount reset (defense-in-depth; self-guarded + OFF until a bench
+# round-trip is proven — see /usr/libexec/beep/bootcount-reset). Reaching rc.local and
+# surviving the settle delay means the system booted PAST early init / config restore
+# (the point the 2026-09-08 brick hung at), so it is a reasonable "healthy boot" proxy:
+# a hung boot never gets here, so a hung boot never resets the counter. Backgrounded so
+# a slow/blocked reset can never delay boot completion.
+( sleep 60; /usr/libexec/beep/bootcount-reset ) >/dev/null 2>&1 &
+
+exit 0
