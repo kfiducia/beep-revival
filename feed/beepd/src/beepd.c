@@ -341,6 +341,7 @@ static int read_master_pct(void)
 	snd_mixer_handle_events(mixer);
 	long dB, mindB, maxdB;
 	if (snd_mixer_selem_get_playback_dB_range(master_elem, &mindB, &maxdB) < 0) return -1;
+	if (maxdB <= mindB) return -1;   /* degenerate range → avoid 0/0 NaN; fall back to file */
 	if (snd_mixer_selem_get_playback_dB(master_elem, SND_MIXER_SCHN_FRONT_LEFT, &dB) < 0) return -1;
 	double norm;
 	if (maxdB - mindB <= 2400) {                        /* <=24 dB: linear */
@@ -568,6 +569,9 @@ int main(int argc, char **argv)
 		 * (shairport drives the same "Master"). Cheap in-process read, no fork; a
 		 * change trips the arc for VOL_HOLD_MS just like a knob turn does. */
 		if ((loops % 3) == 1) {
+			/* If ALSA wasn't up when we started (boot-order race), keep retrying
+			 * every ~5s so the arc doesn't degrade to knob-only for the whole run. */
+			if (!mixer && (loops % 128) == 1) mixer_open();
 			int m = read_master_pct();
 			if (m >= 0) {
 				if (last_master >= 0 && m != last_master) { last_vol_ms = t; vol = m; }
