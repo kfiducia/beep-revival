@@ -370,6 +370,23 @@ static int read_vol_file(void)
 	return (v < 0) ? 0 : (v > 100) ? 100 : v;
 }
 
+/* Keep /var/run/beep/volume in step with the REAL Master when something other
+ * than the knob moves it (the AirPlay sender, the web slider). beep-action's
+ * volume-turn path reads this file for its starting level and only the knob/web
+ * write it, so without this an AirPlay volume change leaves the file stale and
+ * the next knob turn jumps back to the last knob value instead of continuing
+ * from the current level. beepd is the single writer for external changes;
+ * knob-driven writes stay with beep-action (see the guard at the call site). */
+static void write_vol_file(int pct)
+{
+	int fd = open("/var/run/beep/volume", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) return;
+	char b[8];
+	int n = snprintf(b, sizeof b, "%d\n", pct);
+	if (n > 0) { ssize_t w = write(fd, b, n); (void)w; }
+	close(fd);
+}
+
 /* Volume level as an arc: lit LEDs proportional to vol (0..100), the rest a
  * faint track so the full scale is visible. Matches the stock knob feedback. */
 static void led_render_volume(int vol)
@@ -486,6 +503,8 @@ int main(int argc, char **argv)
 	int  vol = 40, playing = 0; /* vol 0..100 (display), PCM-running latch */
 	int  last_master = -1;      /* last seen "Master" level; detects sender/web changes */
 	int64_t last_vol_ms = -100000;       /* last knob turn / volume change — gates the arc */
+	int64_t last_knob_ms = -100000;      /* last physical knob turn — so beepd defers the
+	                                        state-file write to beep-action mid-turn */
 	int64_t btn_pulse_ms = -100000;      /* last button-down — one-shot press pulse */
 	int64_t last_turn_exec = -100000;    /* coalesce knob execs (perf) */
 	int  pending_turn = 0;               /* net detents awaiting a single exec */
@@ -515,6 +534,7 @@ int main(int argc, char **argv)
 				vol += knob * 4;               /* local model for the arc */
 				if (vol < 0) vol = 0; else if (vol > 100) vol = 100;
 				last_vol_ms = t;
+				last_knob_ms = t;              /* beep-action owns the file write for knob turns */
 				pending_turn += knob;          /* coalesced; applied below */
 			}
 
@@ -574,7 +594,20 @@ int main(int argc, char **argv)
 			if (!mixer && (loops % 128) == 1) mixer_open();
 			int m = read_master_pct();
 			if (m >= 0) {
-				if (last_master >= 0 && m != last_master) { last_vol_ms = t; vol = m; }
+				if (last_master < 0) {
+					/* First read (startup/boot): the file may be stale from a
+					 * change that happened while beepd was down (e.g. AirPlay set
+					 * volume). Establish truth so the next knob turn resumes from
+					 * the real level — but don't flash the arc for it. */
+					if (t - last_knob_ms > 600) write_vol_file(m);
+				} else if (m != last_master) {
+					last_vol_ms = t; vol = m;
+					/* External change (AirPlay/web): keep the knob's starting
+					 * point truthful. Skip when a knob turn is in flight —
+					 * beep-action is the writer then (avoids the fork the
+					 * lighter-volume-path removed, and a mid-turn stale write). */
+					if (t - last_knob_ms > 600) write_vol_file(m);
+				}
 				last_master = m;
 			}
 		}
