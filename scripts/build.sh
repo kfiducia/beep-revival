@@ -269,6 +269,16 @@ cat > .config <<CFG
 CONFIG_TARGET_ath79=y
 CONFIG_TARGET_ath79_generic=y
 CONFIG_TARGET_ath79_generic_DEVICE_8dev_carambola2=y
+# ccache — cache compiler objects so the packages we deliberately clean/dirclean to
+# re-apply the BE/AAC patches (ffmpeg, shairport-sync, snapcast, squeezelite, nqptp)
+# recompile from cached objects instead of from scratch. CONFIG_DEVEL=y is REQUIRED:
+# the CONFIG_CCACHE prompt is gated `if DEVEL`, so without DEVEL `make defconfig`
+# silently drops CONFIG_CCACHE=y. CCACHE_DIR is pinned outside staging_dir so it
+# survives the staging wipes below and is separately cacheable in CI (see
+# .github/workflows/release.yml). OpenWrt builds its own host ccache tool if absent.
+CONFIG_DEVEL=y
+CONFIG_CCACHE=y
+CONFIG_CCACHE_DIR="/build/ccache"
 # our packages
 CONFIG_PACKAGE_beepd=y
 CONFIG_PACKAGE_kmod-beep-i2s=y

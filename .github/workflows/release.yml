@@ -11,6 +11,28 @@ name: Release
 #   gh secret set BEEP_OTA_SEC < ~/beep-ota-signing/beep-ota.sec
 # (Its public half lives in rootfs-overlay/etc/beep-ota.pub and is baked into
 # every image, so devices verify the signature before flashing.)
+#
+# ---------------------------------------------------------------------------
+# Job graph (fan-out / fan-in) — built for speed:
+#   prepare ─┬─▶ build (ap1) ─┐
+#            └─▶ build (ap2) ─┴─▶ release
+#
+#   * prepare  — builds the OpenWrt cross-toolchain ONCE (cold) and saves the
+#                toolchain/staging + downloads cache + a seed ccache, so neither
+#                build job cold-builds the toolchain. Exposes the version string.
+#   * build    — a matrix over {ap1, ap2}; the two images compile IN PARALLEL,
+#                each restoring the warm caches. ccache (below) makes the packages
+#                that build.sh force-`clean`s (ffmpeg/shairport/snapcast/…) recompile
+#                from cached objects instead of from scratch.
+#   * release  — fans back in: signs BOTH sysupgrades, assembles + publishes.
+#
+# ccache: OpenWrt's compiler cache (CONFIG_CCACHE=y, needs CONFIG_DEVEL=y for the
+# symbol's prompt to survive `make defconfig`). It caches at the compiler-object
+# level, so it SURVIVES the `make clean`/`dirclean` that build.sh runs to re-apply
+# the big-endian / AAC patches — the exact packages that recompiled every run before.
+# CCACHE_DIR is pinned to /build/ccache (outside staging_dir) via CONFIG_CCACHE_DIR
+# so it's stable and separately cacheable with its own rolling cache key.
+# ---------------------------------------------------------------------------
 
 on:
   push:
@@ -29,9 +51,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-sign-release:
+  # ===========================================================================
+  # prepare — build the cross-toolchain once (cold) and warm the shared caches.
+  # ===========================================================================
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 300   # two full image builds; first run also builds the toolchain (~45-90 min)
+    timeout-minutes: 180   # first run also builds the toolchain (~45-90 min)
+    env:
+      CCACHE_DIR: /build/ccache   # pinned outside staging_dir; matches CONFIG_CCACHE_DIR
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - name: Reclaim runner disk (OpenWrt build needs ~25 GB)
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
@@ -62,7 +91,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             build-essential clang flex bison g++ gawk gettext git \
             libncurses-dev libssl-dev python3 python3-setuptools rsync swig \
-            unzip zlib1g-dev file wget time bc quilt cmake
+            unzip zlib1g-dev file wget time bc quilt cmake ccache
 
       - name: Prepare build root (/build) — matches the scripts' default paths
         run: sudo mkdir -p /build && sudo chown "$(id -u):$(id -g)" /build
@@ -77,6 +106,18 @@ jobs:
           key: openwrt-v24.10.0-ath79-${{ hashFiles('scripts/docker-build-setup.sh') }}
           restore-keys: |
             openwrt-v24.10.0-ath79-
+
+      # ccache gets its OWN cache with a ROLLING key (github.run_id), so it updates
+      # every run — the toolchain cache above uses a static content key and would
+      # never pick up newly-cached compiler objects. This entry seeds the ccache
+      # from the toolchain compile; the build jobs restore it and add package objects.
+      - name: Cache ccache (seed from toolchain build)
+        uses: actions/cache@v4
+        with:
+          path: /build/ccache
+          key: ccache-toolchain-${{ github.run_id }}
+          restore-keys: |
+            ccache-
 
       - name: Set up OpenWrt + build cross-toolchain
         run: |
@@ -102,37 +143,176 @@ jobs:
           CONFIG_TARGET_ath79=y
           CONFIG_TARGET_ath79_generic=y
           CONFIG_TARGET_ath79_generic_DEVICE_8dev_carambola2=y
+          # ccache: DEVEL=y is required or `make defconfig` drops CONFIG_CCACHE (its
+          # menuconfig prompt is gated `if DEVEL`). CCACHE_DIR pinned outside staging_dir.
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_CCACHE_DIR="/build/ccache"
           CFG
           make defconfig >/dev/null
           # low -j for the toolchain (gcc bootstrap races at high parallelism)
           make -j"$(nproc)" tools/install toolchain/install
 
-      - name: Stamp firmware version
-        run: echo "Beep Revival ${{ steps.ver.outputs.version }}" > rootfs-overlay/etc/beep-version
+  # ===========================================================================
+  # build — matrix: compile AP1 and AP2 IN PARALLEL, restoring the warm caches.
+  # ===========================================================================
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 240   # one full image build; toolchain is warm from `prepare`
+    strategy:
+      fail-fast: false     # a flake in one variant shouldn't cancel the other's build
+      matrix:
+        variant: [ap1, ap2]
+    env:
+      CCACHE_DIR: /build/ccache   # pinned outside staging_dir; matches CONFIG_CCACHE_DIR
+    steps:
+      - name: Reclaim runner disk (OpenWrt build needs ~25 GB)
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
-      - name: Build both images (AP1 default + AP2); collect each before the next overwrites
-        id: img
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
         run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget time bc quilt cmake ccache
+
+      - name: Prepare build root (/build) — matches the scripts' default paths
+        run: sudo mkdir -p /build && sudo chown "$(id -u):$(id -g)" /build
+
+      # Restore ONLY (never save) the toolchain/staging cache — `prepare` already
+      # saved it under this static content key, and two matrix jobs racing to save
+      # the same key is pointless. On a warm restore, the toolchain `make` below is a
+      # near-no-op, so the build job does NOT cold-rebuild the toolchain.
+      - name: Restore OpenWrt toolchain + downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /build/openwrt/dl
+            /build/openwrt/staging_dir
+            /build/openwrt/build_dir/toolchain-*
+          key: openwrt-v24.10.0-ath79-${{ hashFiles('scripts/docker-build-setup.sh') }}
+          restore-keys: |
+            openwrt-v24.10.0-ath79-
+
+      # Per-variant ccache with a rolling key (github.run_id). Each variant restores
+      # its OWN previous ccache (then any ccache, incl. prepare's seed) and saves a
+      # fresh entry at job end. Scoping by variant avoids the two matrix jobs colliding
+      # on one key; ap1/ap2 also build different package sets, so separate is a better fit.
+      - name: Cache ccache (${{ matrix.variant }})
+        uses: actions/cache@v4
+        with:
+          path: /build/ccache
+          key: ccache-${{ matrix.variant }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.variant }}-
+            ccache-
+
+      - name: Set up OpenWrt (toolchain warm from cache — near-no-op)
+        run: |
+          set -e
+          export FORCE_UNSAFE_CONFIGURE=1
+          cd /build
+          # Same clone-guard as `prepare`: the cache re-creates /build/openwrt/{dl,
+          # staging_dir,build_dir} without scripts/feeds, so detect a REAL checkout
+          # (openwrt/scripts/feeds) rather than a bare `[ -d openwrt ]`, and merge a
+          # fresh clone over the cache-restored subdirs so downloads/toolchain survive.
+          if [ ! -e openwrt/scripts/feeds ]; then
+            rm -rf /build/openwrt.src
+            git clone --depth 1 -b v24.10.0 https://git.openwrt.org/openwrt/openwrt.git /build/openwrt.src
+            mkdir -p openwrt
+            cp -a /build/openwrt.src/. openwrt/
+            rm -rf /build/openwrt.src
+          fi
+          cd openwrt
+          ./scripts/feeds update -a >/dev/null
+          ./scripts/feeds install -a >/dev/null
+          cat > .config <<'CFG'
+          CONFIG_TARGET_ath79=y
+          CONFIG_TARGET_ath79_generic=y
+          CONFIG_TARGET_ath79_generic_DEVICE_8dev_carambola2=y
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_CCACHE_DIR="/build/ccache"
+          CFG
+          make defconfig >/dev/null
+          # Warm cache → toolchain/tools already installed, so this is a fast no-op that
+          # just re-verifies the stamps. Cold (cache miss) → it rebuilds, but `prepare`
+          # is meant to have populated the cache first, so this should not happen.
+          make -j"$(nproc)" tools/install toolchain/install
+
+      - name: Stamp firmware version
+        run: echo "Beep Revival ${{ needs.prepare.outputs.version }}" > rootfs-overlay/etc/beep-version
+
+      - name: Build image (${{ matrix.variant }})
+        run: |
+          set -e
           export OW=/build/openwrt SRC="$GITHUB_WORKSPACE"
           OUT=/build/openwrt/bin/targets/ath79/generic
-          V="${{ steps.ver.outputs.version }}"
+          V="${{ needs.prepare.outputs.version }}"
           mkdir -p /tmp/collected
           # build.sh writes a FRESH .config and restores the shairport/ffmpeg Makefiles
-          # to pristine on every run, so these two builds don't leak into each other.
-          echo "::group::AP1 build (AirPlay-1 + Snapcast, SSH OFF — no BEEP_DEV)"
-          bash "$SRC/scripts/build.sh"
-          echo "::endgroup::"
-          cp "$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)" "/tmp/collected/beep-revival-${V}-ap1-sysupgrade.bin"
-          # ship one initramfs (from the default build) for the first-time UART RAM-boot
-          cp "$(ls "$OUT"/*8dev_carambola2-initramfs-kernel.bin)"    "/tmp/collected/beep-revival-${V}-initramfs-kernel.bin"
-          echo "::group::AP2 build (AirPlay-2, no Snapcast)"
-          AIRPLAY2=1 bash "$SRC/scripts/build.sh"
-          echo "::endgroup::"
-          cp "$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)" "/tmp/collected/beep-revival-${V}-ap2-sysupgrade.bin"
-          echo "ap1=/tmp/collected/beep-revival-${V}-ap1-sysupgrade.bin" >> "$GITHUB_OUTPUT"
-          echo "ap2=/tmp/collected/beep-revival-${V}-ap2-sysupgrade.bin" >> "$GITHUB_OUTPUT"
-          echo "initramfs=/tmp/collected/beep-revival-${V}-initramfs-kernel.bin" >> "$GITHUB_OUTPUT"
+          # to pristine on every run, so the two variant builds never leak into each other.
+          if [ "${{ matrix.variant }}" = "ap2" ]; then
+            echo "::group::AP2 build (AirPlay-2, no Snapcast)"
+            AIRPLAY2=1 bash "$SRC/scripts/build.sh"
+            echo "::endgroup::"
+          else
+            echo "::group::AP1 build (AirPlay-1 + Snapcast, SSH OFF — no BEEP_DEV)"
+            bash "$SRC/scripts/build.sh"
+            echo "::endgroup::"
+          fi
+          cp "$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)" \
+             "/tmp/collected/beep-revival-${V}-${{ matrix.variant }}-sysupgrade.bin"
+          # ship one initramfs (from the default/AP1 build) for the first-time UART RAM-boot
+          if [ "${{ matrix.variant }}" = "ap1" ]; then
+            cp "$(ls "$OUT"/*8dev_carambola2-initramfs-kernel.bin)" \
+               "/tmp/collected/beep-revival-${V}-initramfs-kernel.bin"
+          fi
           ls -la /tmp/collected/
+
+      - name: Upload image artifacts (${{ matrix.variant }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.variant }}
+          path: /tmp/collected/beep-revival-*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ===========================================================================
+  # release — fan-in: sign BOTH sysupgrades, assemble assets, publish the Release.
+  # ===========================================================================
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pull both variants' artifacts back into /tmp/collected with their original
+      # filenames (merge-multiple flattens images-ap1 + images-ap2 into one dir).
+      - name: Download image artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: images-*
+          merge-multiple: true
+          path: /tmp/collected
+
+      - name: List collected images
+        run: ls -la /tmp/collected/
 
       - name: Build usign (matches the baked-in key format)
         run: |
@@ -147,7 +327,7 @@ jobs:
         run: |
           [ -n "$BEEP_OTA_SEC" ] || { echo "::error::secret BEEP_OTA_SEC is not set"; exit 1; }
           umask 077; printf '%s\n' "$BEEP_OTA_SEC" > /tmp/beep-ota.sec
-          V="${{ steps.ver.outputs.version }}"
+          V="${{ needs.prepare.outputs.version }}"
           for variant in ap1 ap2; do
             RAW="/tmp/collected/beep-revival-${V}-${variant}-sysupgrade.bin"
             SIGNED="/tmp/collected/beep-revival-${V}-${variant}-sysupgrade.signed.bin"
@@ -163,7 +343,7 @@ jobs:
       - name: Assemble release assets + checksums
         id: assets
         run: |
-          V="${{ steps.ver.outputs.version }}"
+          V="${{ needs.prepare.outputs.version }}"
           mkdir -p release
           cp /tmp/collected/beep-revival-${V}-ap1-sysupgrade.bin        release/
           cp /tmp/collected/beep-revival-${V}-ap1-sysupgrade.signed.bin release/
@@ -177,13 +357,13 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: Beep Revival ${{ steps.ver.outputs.version }}
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          name: Beep Revival ${{ needs.prepare.outputs.version }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.prepare.outputs.version) }}
           draft: ${{ github.ref_type != 'tag' }}   # manual runs land as a draft to review
           generate_release_notes: true
           files: release/*
           body: |
-            **Beep Revival firmware — ${{ steps.ver.outputs.version }}**
+            **Beep Revival firmware — ${{ needs.prepare.outputs.version }}**
 
             Open OpenWrt-based firmware for the orphaned Beep "Dial" speaker (AR9331 / Carambola 2).
 
