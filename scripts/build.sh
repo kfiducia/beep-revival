@@ -40,6 +40,18 @@ git -C "$OW/feeds/packages" checkout -- sound/shairport-sync/Makefile multimedia
 # The patch compiles out on little-endian hosts, so it's harmless everywhere else.
 mkdir -p "$SPP"
 cp "$SRC/scripts/patches/030-pipe-output-little-endian.patch" "$SPP/" 2>/dev/null || true
+# Give shairport a scheduling edge on the single-core AR9331 so the LED bit-banged-i2c
+# churn / SSH / knob->amixer forks can't starve the audio thread and XRUN playback
+# (measured: AP2 AAC decode leaves only ~45% idle, and concurrent load glitches it).
+# A safe NEGATIVE NICE via procd — deliberately NOT SCHED_FIFO: blanket real-time on a
+# single core risks the decode preempting the network read that feeds it and
+# self-deadlocking into an underrun. Idempotent (the feed's init isn't git-restored).
+SPI="$OW/feeds/packages/sound/shairport-sync/files/shairport-sync.init"
+if [ -f "$SPI" ] && ! grep -q 'procd_set_param nice' "$SPI"; then
+  # '#' delimiter avoids escaping the command path; \n\t inserts a tab-indented line
+  # right after the command set (order among procd params is irrelevant at instance close).
+  sed -i 's#\(procd_set_param command /usr/bin/shairport-sync\)#\1\n\tprocd_set_param nice -12#' "$SPI"
+fi
 if [ -n "${AIRPLAY2:-}" ]; then
   echo "   [AIRPLAY2] AirPlay-2 build — experimental on this silicon; ffmpeg full->audio-dec + BE crypto patch"
   # shairport-sync hardcodes +libffmpeg-full (~12MB). AirPlay 2 only needs AAC+ALAC

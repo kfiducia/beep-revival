@@ -78,6 +78,51 @@ Planned 3-edit patch (adapt line numbers to 4.3.2):
    to S32 for free — no extra shim needed.
 Plus: ensure ffmpeg is built `--enable-decoder=aac_fixed` (audio-dec preset omits it).
 
+### 1.5.1 ON-HARDWARE RESULT (2026-09-08) — fixed-point AP2 WORKS on the AR9331
+First-ever confirmed AirPlay-2 buffered-AAC playback on the FPU-less 24Kc. Built
+`BEEP_DEV=1 AIRPLAY2=1` (patches 010 pairing + 020 aac_fixed + 040 nqptp-ntoh64),
+flashed unit #2 (`beep-copper`). Live Apple Music session, `scripts/ap2-bench.sh`:
+```
+44 s steady state: PCM RUNNING, 0 XRUN, idle ~42–52%, shairport ~35–38% CPU,
+                   MemAvailable stable ~6.2 MB (no leak).
+```
+`aac_fixed` carries the AAC decode in ~36% of one core instead of pegging it — the
+decisive proof the fixed-point lever works (float pegged the core + XRUN'd in
+seconds, §1.1). **AP2 is viable on this silicon.**
+
+⚠️ **But the margin is thin.** ~45% idle is eaten instantly by *any* concurrent
+load — the bench's own per-second sampling + SSH induced the single XRUN at t=45
+(sampler also mis-reported that tick's per-proc CPU as 277%, an interval artifact).
+Transient spikes alone hit 16% idle (t=6). Real-world corroboration: on-device
+diagnostics during playback audibly glitch the audio. So AP2 needs the core mostly
+to itself.
+
+### 1.5.2 Hardening the margin (2026-09-08)
+- **[done, deployed live] Volume knob fork-storm.** A knob turn fired
+  `beep-action`→`amixer set` up to ~12×/s; on AP2's thin margin that concurrent
+  fork load XRUN'd the decode (Kyle's earlier b082d90 killed the `amixer get`+logger
+  forks on AP1, but the remaining `set` fork now bites on the heavier AP2 path).
+  Fix: `beepd` coalesces knob execs to ~5×/s **only while the PCM is decoding**
+  (`VOL_COALESCE_MS_PLAY`), staying snappy (80 ms) when idle/AP1. Deployed to #2's
+  running beepd (no audio cut); in the source so it survives reflash.
+- **[done, baked — effective next flash] shairport priority.** All 17 shairport
+  threads ran SCHED_OTHER. `chrt`/`renice` are BOTH absent on the device, so no live
+  boost was possible. `build.sh` now injects `procd_set_param nice -12` into the
+  shairport init — a **safe negative nice, deliberately NOT SCHED_FIFO**: blanket RT
+  on a single core risks the decode preempting the network read that feeds it and
+  self-deadlocking into an underrun. Gives audio priority over LED-i²c/SSH/fork churn.
+- **[deferred] LED "party twinkle" throttle.** The 24 Hz ring push is bit-banged i²c
+  AND doubles as the knob-input read (`led_flush`), and animations are frame-coupled
+  to the poll rate — so throttling it cleanly is invasive + alters the calibrated
+  look. With `nice -12` giving audio priority it's likely unnecessary; revisit only
+  if playback still glitches under LED load.
+- **[open] Force S16 output** (half the sample width through swr+DMA) — endianness-risky, test on-device.
+- **[open] Volume push-back to the AirPlay sender UI.** On AP2, shairport monitors
+  `mixer_control_name` (our `Master`) and reports mixer changes back to the sender —
+  so knob→sender-UI is likely a small lift / mostly on-device verification (the new
+  200 ms settle-coalesce is the debounce it wants). AP1 push-back is the larger job
+  (needs the DACP/back-channel build that's absent — see AGENTS.md issue #7).
+
 ### 1.6 Prior art / minimum hardware
 - Official shairport floor for AP2: **Pi 2 / Pi Zero 2 W** class (~1 GHz, hardware FP,
   NEON). Even a 1 GHz ARMv6 *with* an FPU (original Pi Zero) is borderline.

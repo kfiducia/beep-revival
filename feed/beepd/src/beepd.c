@@ -56,6 +56,15 @@
 #define MULTI_TAP_MS       380    /* window between taps for double/triple detection */
 #define VOL_HOLD_MS       1500    /* keep the volume arc up this long after a turn */
 #define PLAY_GRACE_MS     3000    /* latch "playing" this long after PCM stops (anti-flicker) */
+/* Knob->beep-action coalescing. Each turn exec forks beep-action (sh) -> amixer set;
+ * a fast spin at the idle rate is ~24 process spawns/s. That's free on the light
+ * AirPlay-1/ALAC path but SATURATES the AR9331 while it's decoding AirPlay-2 AAC
+ * (~55% core already), causing PCM XRUN / choppy audio during a volume turn. So back
+ * the exec rate off while the PCM is actively pushing samples (AP2 decode running),
+ * and keep it snappy otherwise. The LED arc uses the instant local `vol` model, so
+ * only the DAC level lags by the window — imperceptible for a volume ramp. */
+#define VOL_COALESCE_MS_IDLE  80  /* ~12 execs/s: snappy for idle / AirPlay-1 */
+#define VOL_COALESCE_MS_PLAY 200  /* ~5 execs/s: protects the AP2 decode from the fork storm */
 /* Party = a faithful port of the stock 'twinkle' view (etc/config/io: audio_playing
  * -> twinkle). Each sparkle lives PARTY_LIFE_MIN..+RAND frames, ramps up over its
  * first 1/4 then fades over the last 3/4; a new one seeds every other 24Hz tick. */
@@ -480,9 +489,12 @@ int main(int argc, char **argv)
 			last_tap_at = -1; tap_count = 0;
 		}
 
-		/* apply accumulated knob turns at most ~12x/s — one fork per detent at
-		 * 24 Hz would swamp the AR9331; the arc already updates instantly. */
-		if (pending_turn != 0 && t - last_turn_exec >= 80) {
+		/* apply accumulated knob turns, coalescing to one fork per window — 24 Hz
+		 * per-detent execs would swamp the AR9331; the arc already updates instantly.
+		 * Back the rate off while the PCM is decoding (AP2) so the volume fork storm
+		 * doesn't XRUN the audio; stay snappy when idle / on the light AP1 path. */
+		if (pending_turn != 0 &&
+		    t - last_turn_exec >= (playing ? VOL_COALESCE_MS_PLAY : VOL_COALESCE_MS_IDLE)) {
 			run_action("turn", pending_turn);
 			last_turn_exec = t; pending_turn = 0;
 		}
