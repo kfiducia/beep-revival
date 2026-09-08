@@ -76,7 +76,8 @@
 #define LED_TOP            0      /* 12 o'clock */
 #define LED_BOT           12      /* 6 o'clock */
 #define EYE_L             20      /* ~10 o'clock */
-#define EYE_R              4      /* ~2 o'clock  */
+#define EYE_R              3      /* ~2 o'clock (wire 3 = 3.5 steps from the top axis,
+                                  * symmetric with EYE_L=20; wire 4 sat too low) */
 /* logical->wire rotation. BENCH-CALIBRATED on hardware: lighting wire index 0
  * lands at ~12:15 and the index runs clockwise (wire 6 ~3:15, wire 12 ~6:15),
  * i.e. the wire order already matches our logical clock convention — so logical
@@ -202,10 +203,13 @@ static void led_render_ap(int64_t frame)
 static void led_render_smiley(void)
 {
 	memset(led_target, 0, sizeof led_target);
-	led_target[EYE_L] = 255;
-	led_target[EYE_R] = 255;
-	for (int i = LED_BOT - 2; i <= LED_BOT + 2; i++)   /* smile arc across 6 o'clock */
-		led_target[(i + NLED) % NLED] = 200;
+	led_target[EYE_L] = 255;                           /* ~10 o'clock */
+	led_target[EYE_R] = 255;                           /* ~2 o'clock  */
+	/* wide smile: 8 LEDs across the bottom (~4:15..7:45, matching the stock's 8-LED
+	 * mouth), following the ring so it reads as an upturned smile. Uniform full
+	 * brightness now that output is linear (no gamma to dim the mid values). */
+	for (int i = LED_BOT - 4; i <= LED_BOT + 3; i++)
+		led_target[(i + NLED) % NLED] = 255;
 }
 
 /* Boot progress: two LEDs sweep down both sides in mirror (12->6, then back), the
