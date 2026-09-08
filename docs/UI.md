@@ -49,7 +49,9 @@ and apply **signed firmware updates**.
 ### First-time setup
 
 A never-configured Beep raises a **`BeepRevival-Setup-XXXXXX`** Wi-Fi network (WPA2).
-Join it and a captive portal pops up — pick your Wi-Fi and a name, done.
+Join it and a captive portal pops up. If it doesn't, browse to
+**`http://192.168.60.1`** — the Beep's fixed address on its own setup network.
+Either way: pick your Wi-Fi and a name, done.
 
 - **Device password / setup code** = **`C49300`** + the 6 characters at the end of
   the setup SSID. Example: `BeepRevival-Setup-A7F3E1` → **`C49300A7F3E1`**. It's the

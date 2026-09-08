@@ -147,20 +147,20 @@ into ~hours of failures. Every failure below was self-inflicted and is now preve
    parallel build I/O — another reason to prefer a **native-Linux** build host.
 
 ### 3.2 The durable build host (use this going forward)
-**Proxmox LXC `build-lxc`** — VMID **102**, IP **10.0.0.10**, on `pve` (10.0.0.1).
-- Unprivileged Ubuntu **22.04** LXC, 6 cores / 24 GB / 60 GB on `nvme-lvm`, `vmbr0`, nesting on.
-- Non-root **`build`** user (so `FORCE_UNSAFE_CONFIGURE` isn't even needed).
-- OpenWrt v24.10.0 clone at `~build/openwrt`; the beep tree at `~build/beep-firmware`.
-- Symlinks `/build -> /home/build` and `/src -> /home/build/beep-firmware` so `build.sh`'s
-  default paths resolve; `build.sh` also honors `OW=` / `SRC=` overrides now.
+Build on a **native-Linux host** — an unprivileged **Ubuntu 22.04 LXC/VM** works well
+(≈6 cores / 24 GB RAM / 60 GB disk, nesting on if it's a container).
+- Use a **non-root build user** (so `FORCE_UNSAFE_CONFIGURE` isn't even needed).
+- Keep an OpenWrt v24.10.0 clone and this repo checked out beside it; point `build.sh`
+  at them with its `OW=` / `SRC=` overrides (or symlink `/build` and `/src` to match the
+  defaults).
 - Run builds as a **systemd transient unit** so they survive ssh disconnects:
-  `systemd-run --unit=beep-img --uid=build --gid=build --setenv=HOME=/home/build \`
-  `  --setenv=BEEP_DEV=1 --working-directory=/home/build/openwrt /bin/bash /src/scripts/build.sh`
-  (logs: `journalctl -u beep-img`; make output in `/home/build/image-build.log`).
-- Native x86_64 Linux, consistent glibc — none of the Mac's issues recur here.
-- This CT built the whole toolchain (gcc/final at `-j6`, zero races) + the multi-room
-  image cleanly. **Preferred host for all future builds.** k3s was considered and rejected
-  — buildroot is one long single job wanting a full FS + lots of disk, an LXC/VM workload,
+  `systemd-run --unit=beep-img --uid=build --gid=build --setenv=HOME=<build-home> \`
+  `  --setenv=BEEP_DEV=1 --working-directory=<openwrt-dir> /bin/bash /src/scripts/build.sh`
+  (logs: `journalctl -u beep-img`).
+- Native x86_64 Linux with a consistent glibc avoids all of the macOS/Docker issues above.
+  It built the whole toolchain (gcc/final at `-j6`, zero races) + the multi-room image
+  cleanly. **Preferred host for all future builds.** k3s was considered and rejected —
+  buildroot is one long single job wanting a full FS + lots of disk, an LXC/VM workload,
   not a k8s pod.
 
 ### 3.3 Result
