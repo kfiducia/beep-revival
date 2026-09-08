@@ -84,6 +84,21 @@ This confirmed the process/audio model in §2. `playnet` loads and runs on our i
 bundled uClibc (feasible), but revival-as-binary is a dead end for production (2015 uClibc +
 must fork `beepi2s` + needs `beepmanager`); the harness is for **understanding**, not shipping.
 
+## 5.1 CPU budget (measured) + the Snapcast decision
+
+Measured the always-on `codec=pcm` sync pipeline on real hardware (unit `beep-silver`,
+AR9331) by driving PCM through `shairport->pipe->snapserver->snapclient`: **~81% idle**
+(snapserver ~5%, snapclient low, ~18% sys). A second client (a Mac `snapclient` 0.35)
+connected to silver's snapserver and negotiated the 44100:16:2 synced stream in <1s. So
+**an always-on peer-sync engine is affordable on this chip**, and the "always-on source +
+double-tap-to-join-the-active-source" UX model works. This was validated *with Snapcast as
+a stand-in* only to prove the budget/UX.
+
+**Decision: drop Snapcast; build the fresh integrated engine (playnet revamp).** Snapcast's
+rigid server/client topology + role churn is the wrong fit; the goal is one clean daemon in
+the stock playnet mould (decode + peer sync + consensus + ALSA sink), no Snapcast. The
+budget measurement above says that's feasible.
+
 ## 6. Reimplementation sketch (the actual deliverable)
 
 A fresh, small daemon on musl/OpenWrt that reproduces the *design*, not the binary:
