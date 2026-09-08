@@ -50,6 +50,16 @@ uci -q commit firewall
 
 mkdir -p /var/run/beep; echo ap > /var/run/beep/led-mode   # ring -> AP comet
 wifi reload
+# `wifi reload` is ASYNC — the AP (beepap / phy0-ap0) interface comes up a moment later.
+# If we restart dnsmasq before it has its 192.168.60.1, dnsmasq generates its config with
+# NO dhcp-range for 192.168.60.0/24, and every client then gets "no address range
+# available" — the setup AP is joinable but hands out no lease (the whole point). Wait
+# for the L3 interface to be up (bounded), THEN restart dnsmasq so the range is generated.
+i=0
+while [ "$i" -lt 15 ]; do
+	[ "$(ubus call network.interface.beepap status 2>/dev/null | jsonfilter -e '@.up')" = true ] && break
+	i=$((i + 1)); sleep 1
+done
 /etc/init.d/dnsmasq restart 2>/dev/null
 /etc/init.d/firewall reload 2>/dev/null
 /etc/init.d/uhttpd restart 2>/dev/null
