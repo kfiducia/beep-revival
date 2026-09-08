@@ -58,10 +58,18 @@ if [ "$want_unsigned" = 1 ]; then
 	# UNSIGNED: physical presence is mandatory; an admin session is NOT sufficient.
 	phys_valid || fail '403 Forbidden' '{"error":"unsigned upload requires a physical triple-tap on the device (within 60s)"}'
 else
-	# SIGNED: a signature must be supplied AND an admin session held (the signature
-	# itself is verified after the body arrives). A stolen session still can't forge it.
+	# SIGNED: a signature must be supplied AND (on the primary) an admin session held
+	# — the signature itself is verified after the body arrives; a stolen session still
+	# can't forge it. In the RECOVERY initramfs there is no rpcd/session at all, so the
+	# usign signature IS the sole authenticator: a valid signature against the baked
+	# pubkey is proof the image is a genuine Beep release, which is exactly what a
+	# from-recovery reflash needs. The /etc/beep-recovery marker (present only in the
+	# recovery image) waives the session requirement; the signature check below is not
+	# waived, so an unsigned image can still never reach sysupgrade this way.
 	[ -n "$sig_b64u" ] || fail '400 Bad Request' '{"error":"no signature — upload a signed .bin (or triple-tap for an unsigned install)"}'
-	[ "$admin" = 1 ] || fail '401 Unauthorized' '{"error":"sign in as admin, or triple-tap the device for an unsigned install"}'
+	if [ ! -f /etc/beep-recovery ]; then
+		[ "$admin" = 1 ] || fail '401 Unauthorized' '{"error":"sign in as admin, or triple-tap the device for an unsigned install"}'
+	fi
 fi
 
 # --- receive image (raw body), hard-capped. Refuse an over-large Content-Length up
@@ -92,7 +100,26 @@ fi
 sysupgrade -T /tmp/ota.bin >/dev/null 2>&1 \
 	|| fail '400 Bad Request' '{"error":"not a valid firmware image for this device"}'
 
-# --- flash (keep config); device reboots. bootb->recovery backstops a bad boot ---
+# --- flash; device reboots. bootb->recovery backstops a bad boot ---
+#
+# ⚠️ KEEP-CONFIG HAZARD (2026-09-08 brick post-mortem, GitHub #8): this uses the stock
+# keep-config sysupgrade (no -n). That brick traced to the keep-config restore HANGING
+# on first boot after the flash, which — with no good-boot bootcount reset and a garbage
+# recovery slot — escalated to a UART-only brick. The clean fix is to stop relying on
+# stock keep-config: preserve only our small identity set (beep-code, cert/key, wireless
+# client + system config) ourselves and flash with `sysupgrade -n`, so a variant-mismatch
+# can never hang the restore. That is DEFERRED here because `-n` drops the wifi client
+# config -> the unit falls back to the setup AP, and that AP's DHCP is still being fixed
+# (PR #18); shipping -n before it works would strand a unit on an unreachable AP. Switch
+# to controlled-preserve + -n once the setup-AP DHCP is verified. See RECOVERY-DESIGN.md.
 say '200 OK' '{"ok":true,"note":"flashing and rebooting"}'
-( sleep 1; sysupgrade /tmp/ota.bin ) >/dev/null 2>&1 &
+logger -t beep "OTA: starting sysupgrade ($([ "$want_unsigned" = 1 ] && echo unsigned || echo signed), keep-config)"
+# Detach the flash into its own session with setsid so uhttpd tearing down this CGI's
+# process group can't signal sysupgrade MID-WRITE — a half-written primary is exactly
+# the brick we're guarding against. Fall back to a plain background if setsid is absent.
+if command -v setsid >/dev/null 2>&1; then
+	setsid sh -c 'sleep 1; sysupgrade /tmp/ota.bin' </dev/null >/dev/null 2>&1 &
+else
+	( sleep 1; sysupgrade /tmp/ota.bin ) </dev/null >/dev/null 2>&1 &
+fi
 exit 0

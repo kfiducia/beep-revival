@@ -4,6 +4,180 @@ Goal: after one final UART-backstopped flash (the one that installs the recovery
 slot), **no future software failure should require a serial console.** This
 composes three layers; only the third (bad *flash*) is still missing today.
 
+---
+
+## ⚠️ 2026-09-08 — READ FIRST: verified sizes + a live brick post-mortem
+
+Two things happened on 2026-09-08 that **correct assumptions baked into the rest of
+this doc**. Where the older sections below conflict with this one, this one wins.
+
+### A. A real unit bricked today — and it was NOT a bad flash
+
+An unsigned/physical-tap web-OTA install bricked a unit into a UART-only state
+(recovered at the bench via a lean-initramfs rescue boot). The chain, from serial +
+the rescue system:
+
+1. The OTA ran `sysupgrade` **with keep-config** (no `-n`), stashing the old config
+   as `sysupgrade.tgz` in the overlay.
+2. First boot after the flash **hung processing that config restore** — the overlay
+   was left holding *only* `sysupgrade.tgz`, never extracted into `/etc/config`.
+3. With **no good-boot bootcount reset**, each stuck reboot ticked the counter until
+   `bootb` hit **`Bootcount exceeded booting recovery partition`**.
+4. It fell to `beep_recovery = 0x9f550000` (garbage, mid-rootfs) → `## Booting image
+   at 9f550000 ... Bad Magic Number` → **`Failed to boot either partitions`** → UART.
+5. **The primary squashfs was 100 % intact** — mounted read-only from the rescue
+   system, full read-through, 0 I/O errors. This was a bad *first-boot config
+   restore*, escalated to a brick by the missing bootcount reset + the garbage
+   recovery slot. A working recovery slot turns step 4 into a network reflash.
+
+**Re-prioritized consequence — two cheap fixes would have PREVENTED this brick, and
+should land alongside (or before) the slot:**
+
+1. **Good-boot bootcount reset is NO LONGER optional.** The section below
+   ("Bootcount — decoded empirically") deferred it as "astronomically far off." The
+   incident disproves that: bootcount-exceeded stranded a *perfectly good* primary
+   because a *hang* (not a bad image) kept rebooting and the counter never reset.
+   Clear the counter from userspace once a boot is healthy (e.g. beepd up + network
+   up). This is arguably the single highest-value change here.
+2. **Harden the OTA flash path** (likely its own issue). The keep-config restore is
+   the true root cause. Either use `sysupgrade -n` for OTA (drop config, never hang),
+   or make the first-boot restore robust (sanitize config across variant changes;
+   timeout → fall back to defaults). Today's `beep-ota` also backgrounds `sysupgrade`
+   fire-and-forget on RAM-tight firmware — its own hazard.
+
+### B. The recovery slot size was re-measured on the build host — ≤4.6 MB is NOT achievable
+
+The "slim to ~10 MB to fit a ~5 MB recovery slot" premise (and the 4.625 MB slot in
+the layout below) does **not** survive contact with a modern (kernel 6.6) build.
+Measured on the iMac `beep-build` container, ath79/generic, `8dev_carambola2`:
+
+| Recovery build (initramfs unless noted) | Flash size | vs stock 5 MB slot |
+|---|---|---|
+| **Full-featured** (wifi AP + rpcd/ubus + dnsmasq + px5g + iwinfo + usign + beepd) | **6.51 MB** | +1.5 MB over |
+| **Minimal** (wifi AP + uhttpd + usign + busybox udhcpd only) | **5.57 MB** | +0.57 MB over |
+| Minimal, **squashfs** sysupgrade (stock's packaging) | **5.75 MB** | +0.75 MB over |
+
+Stripping every optional feature *and* switching to squashfs (stock's own approach)
+still lands ~5.5–5.75 MB. **Packaging is not the lever** — the floor is the modern
+**6.6 kernel (~1.9 MB) + ath9k/mac80211 + the mbedtls WPA2 stack**.
+
+**Second, harder ceiling — RAM, confirmed live during today's rescue:** a *full*
+initramfs (~9.6 MB → ~30 MB unpacked) **OOM-panics on 64 MB**
+(`Kernel panic - System is deadlocked on memory`); the lean one (~5.1 MB → ~14 MB)
+boots. So the recovery build is **doubly constrained** — flash slot *and* unpacked
+tmpfs — and must stay **lean-initramfs-class** (audio stack / wifi-full / opkg all
+stripped). This independently rules out the 6.51 MB full-featured variant and points
+at the **~5.57 MB minimal** build.
+
+### C. How stock fit recovery in 5 MB (teardown of unit #2's dump, mtd2 `recovery`)
+
+Stock's 5 MB slot = a **0.92 MB LZMA uImage kernel (OpenWrt Linux-3.7.9)** at
+offset 0 + a **2.21 MB xz squashfs** at 0x200000 = only 4.25 MB used. That squashfs
+is **not a stripped recovery — it's a near-full OpenWrt Barrier Breaker (r35770,
+2014)**: full **LuCI** (`index.html` → `/cgi-bin/luci`), `uhttpd`, full `wpad`
+(WPA2), `dnsmasq`, `dropbear`, `avahi`. Recovery flashing was just LuCI's
+"Flash new firmware" page → `sysupgrade`/`mtd`, accepting **any unsigned image over
+plain HTTP**. It fit because 2014 parts are a fraction of today's size and it carried
+**no TLS library at all** (only `libcrypt` for password hashing; its old `wpad` had
+self-contained crypto). We can't replicate that: our 6.6 kernel is ~2× the 3.7.9
+one, and modern `wpad-basic-mbedtls` + uhttpd-HTTPS + px5g pull in `libmbedtls`.
+
+Also note the **stock geometry**: recovery is at the **front** (0x050000, 5 MB),
+primary **after** it (0x550000), with **dual env** copies (0x040000 + 0xFE0000).
+bootb's compiled defaults (`beep_primary=0x9f550000`, `beep_recovery=0x9f050000`)
+are exactly this stock geometry — the "swapped defaults" noted below are just stock's
+layout, not a bug.
+
+### D. Decision (2026-09-08): shrink the primary to buy a ~5.75 MB recovery slot
+
+The usable region between `u-boot-env` and `art` is **0x050000..0xff0000 = 15.625 MB**.
+Primary (current default image ≈ **10.06–10.55 MB**) + a 5.6 MB recovery slot
+overshoots that **before any primary overlay**. So the primary must lose ~0.6–1 MB.
+Measured primary-trim budget (uncompressed → ~35–40 % of that compressed in xz):
+
+- **opkg metadata** `/usr/lib/opkg` = **2.1 MB uncompressed (~0.6 MB compressed)** —
+  the light lever; `build.sh` already strips it in the LEAN path
+  (`rm -rf $R/usr/lib/opkg`). Recovery never installs packages, and the primary can
+  keep opkg's *binary* while dropping the package lists.
+- **Snapcast** cascade — dropping multi-room removes `snapserver` (2.25 MB) +
+  `snapclient` (0.69 MB) + `libstdc++` (2.06 MB) + **OpenSSL** `libcrypto`+`libssl`
+  (3.6 MB, pulled only by Snapcast) + libvorbis/opus + libatomic ≈ **3–4 MB
+  uncompressed (~1.5–2 MB compressed)**. Heavy lever; costs the multi-room feature
+  (already flagged as saturating the AR9331 — see AGENTS "lighter multi-room").
+
+**Fit check against the 16 MB ceiling — measured from the real `RECOVERY=1`
+`build.sh` (2026-09-08).** The shipped recovery variant (wifi WPA2 AP +
+`dnsmasq`/DHCP reused from the primary + `uhttpd` + `usign` + the stripped
+`recovery-overlay` reflash UI; NO audio/rpcd/opkg; signed-only) builds to
+**5.80 MB** (6,083,832 B). The optional `beepd`/i2c triple-tap unsigned path adds
+~0.25 MB (→ ~6.05 MB) and is omitted from the lean build.
+
+| Recovery feature set | Recovery img | Slot 0x5E0000 (5.875 MB) | Primary slot 0x9C0000 (9.75 MB) | Fits 15.625 MB? |
+|---|---|---|---|---|
+| **Shipped: signed-only + dnsmasq** | **5.80 MB** | 75 KB headroom | primary img ≤ ~9.4 MB (after opkg strip) | ✅ **with opkg strip only — no Snapcast loss** |
+| + `beepd` triple-tap (optional) | ~6.05 MB | needs 0x600000 slot | primary must drop ~0.2 MB more | ⚠️ tighter — weigh vs multi-room |
+
+**Good outcome: the signed-only recovery fits alongside the current primary with only
+the lossless opkg-metadata strip** (`rm -rf $R/usr/lib/opkg`, ~0.6 MB, already done in
+LEAN) — Snapcast/AirPlay stay. The RAM ceiling (§B) also favors this lean build.
+Triple-tap-in-recovery is a later upgrade that costs ~0.2 MB more of primary. *Note:*
+recovery reuses the primary's `dnsmasq` setup-AP, so it inherits whatever DHCP fix
+lands on PR #18 — do not give it a separate DHCP path.
+
+**Chosen target geometry** (custom offsets; keep a proper WPA2 + `usign`-verified
+recovery, minimal package set to satisfy the RAM ceiling):
+
+Recovery is anchored to **end at `art` (0xFF0000)**, so its start = 0xFF0000 −
+slot-size. Sized to the measured 5.80 MB image with ~75 KB headroom:
+
+```
+0x000000  u-boot        256K   [preserve]
+0x040000  u-boot-env     64K
+0x050000  firmware     9.75M   reg = <0x050000 0x9C0000>   primary (opkg-stripped img ~9.4M + overlay)
+0xA10000  recovery    5.875M   reg = <0xA10000 0x5E0000>   signed-reflash initramfs (5.80M measured)
+0xFF0000  art            64K    [preserve]
+```
+
+→ `setenv beep_primary 0x9f050000; setenv beep_recovery 0x9fa10000; saveenv`.
+
+If the optional `beepd` triple-tap is added to recovery (~6.05 MB), bump the slot to
+**6.0 MB** (0x600000, start 0xA00000 → `beep_recovery=0x9fa00000`, primary slot
+9.625 MB) and trim the primary ~0.2 MB further. Either way, **both** `beep_primary`
+and `beep_recovery` become non-default offsets, so correction #3 below (ship a
+verified `/etc/fw_env.config`, treat a lost env as a brick risk) is binding.
+
+### Revised action order (supersedes the "Sequencing" section at the bottom)
+
+1. **Good-boot bootcount reset** in the primary firmware. *Implemented, gated OFF:*
+   `/usr/libexec/beep/bootcount-reset` (called from `/etc/rc.local` after a 60 s
+   settle — reaching there means the boot cleared early-init, a reasonable "healthy"
+   proxy) rewrites the env sector via `fw_setenv` to clear U-Boot's wear-leveled
+   bootcount. It is a **no-op until `/etc/beep-fwenv-verified` exists** and until
+   `fw_printenv` reads back `beep_primary=0x9f050000` through the shipped
+   `/etc/fw_env.config` — because a wrong env geometry would reinit the env to
+   U-Boot's stock defaults and brick this layout. **Bench step to enable:** on a
+   UART unit, prove `fw_printenv beep_primary` → `0x9f050000` and a `fw_setenv`
+   round-trip, confirm on serial the bootcount region returns to `0xFF`, then
+   `touch /etc/beep-fwenv-verified`. Honest scope: this is defense-in-depth for a
+   *good* primary that reboots a lot — it does **not** fix a deterministic early hang
+   (that never reaches rc.local); the valid recovery slot + OTA hardening cover that.
+2. **OTA keep-config hardening.** *Partly done:* `beep-ota` now `setsid`-detaches the
+   flash so a uhttpd CGI teardown can't kill `sysupgrade` mid-write, and logs the
+   attempt. *Deferred (the real fix):* stop relying on stock keep-config — preserve
+   only our identity set (beep-code, cert/key, wireless + system config) ourselves and
+   flash `-n`, so a variant-mismatch can't hang the restore. Blocked on the setup-AP
+   DHCP fix (PR #18): `-n` drops the wifi client config → the unit lands on the setup
+   AP, which must be reachable first. Likely its own issue.
+3. **Recovery slot**: build the ~5.57 MB minimal initramfs (bake `/etc/beep-ota.pub`
+   + the `99-beep` MAC→code derivation + a tap detector; strip audio/wifi-full/opkg),
+   repartition to the geometry above, `setenv beep_recovery 0x9fa30000; saveenv`,
+   write with a **read-back checksum** (single un-mirrored copy next to `art`).
+4. Sequence on the bench unit that already has UART clipped (that's how today's brick
+   was recovered) — the slot-installing flash is the last one that wants a UART
+   backstop.
+
+---
+
 | Failure mode | Self-heals without UART? | Mechanism |
 |---|---|---|
 | Wrong wifi pw / router moved / dead AP | 🔧 implemented, unverified on HW | netcheck watchdog → `Beep-Setup` WPA2 AP + web reconfig |
@@ -35,7 +209,9 @@ Current (single big firmware partition):
 0xff0000  art            64K    [preserve — wifi cal + MACs]
 ```
 
-Proposed (carve a recovery slot out of the oversized overlay):
+Proposed (carve a recovery slot out of the oversized overlay) — **⚠️ the 11M/4.625M
+split below is SUPERSEDED by §D above; the recovery build measures ~5.57 MB, not
+≤4.6 MB. Kept for history:**
 
 ```
 0x000000  u-boot        256K   [preserve]
@@ -140,6 +316,11 @@ The stock 16 MB flash dump settled the remaining unknowns:
   if ever wanted. **Green light to repoint `beep_recovery`.**
 
 ## Recovery image contents (task #8)
+
+> ⚠️ Measured 2026-09-08 (§B): even this minimal set is **~5.57 MB** and must stay
+> lean-initramfs-class to clear the **64 MB RAM** unpack ceiling — so `beepd`/rpcd/
+> dnsmasq are the first things to drop if the size or RAM budget is tight (use a
+> plain CGI + busybox `udhcpd`; the signed path needs no rpcd session).
 
 A separate build target (`initramfs`, minimal package set):
 - kernel + ath9k/mac80211 (wifi), wpad-basic-mbedtls

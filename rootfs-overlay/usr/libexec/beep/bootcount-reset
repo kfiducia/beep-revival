@@ -1,0 +1,51 @@
+#!/bin/sh
+# Good-boot bootcount reset (guarded, OFF by default).
+#
+# What it does: clears U-Boot's wear-leveled bootcount by rewriting the env sector, so
+# a run of transient reboots (power blips, etc.) can't slowly walk a HEALTHY primary
+# toward "Bootcount exceeded -> recovery". It is DEFENSE-IN-DEPTH, not the fix for the
+# 2026-09-08 brick: a deterministic early-boot hang never reaches here, so it never
+# resets a hung boot (correct). The valid recovery slot + OTA hardening are what cover
+# the hang case. See docs/RECOVERY-DESIGN.md.
+#
+# Why it is dangerous without proof: the reset uses fw_setenv, and a wrong
+# /etc/fw_env.config can make libubootenv reinit the env to U-Boot's stock defaults
+# (beep_primary=0x9f550000) which is a BRICK on our layout. Hence two HARD gates —
+# both must pass or this is a silent no-op:
+#   1. /etc/beep-fwenv-verified exists (created BY HAND only after a bench round-trip).
+#   2. fw_printenv reads back beep_primary=0x9f050000 through fw_env.config (proves the
+#      config offset/size/CRC are correct). Any mismatch or Bad CRC -> abort, no write.
+LOGT=beep-goodboot
+MARK=/etc/beep-fwenv-verified
+
+[ -f "$MARK" ] || { logger -t "$LOGT" "bootcount-reset: disabled (no $MARK) — skipping"; exit 0; }
+command -v fw_printenv >/dev/null 2>&1 || { logger -t "$LOGT" "bootcount-reset: fw_printenv absent — skipping"; exit 0; }
+[ -f /etc/fw_env.config ] || { logger -t "$LOGT" "bootcount-reset: no /etc/fw_env.config — skipping"; exit 0; }
+
+# Readback guard: only proceed if the env is readable AND carries the value we expect.
+cur="$(fw_printenv -n beep_primary 2>/dev/null || true)"
+if [ "$cur" != "0x9f050000" ]; then
+	logger -t "$LOGT" "bootcount-reset: readback guard FAILED (beep_primary='$cur') — refusing to write env"
+	exit 0
+fi
+
+# Rewrite the env sector with an idempotent marker var. libubootenv erases the whole
+# 64K sector and rewrites the 32K env, so the bootcount region (0x8000-0xFFFF) returns
+# to erased 0xFF = reset. Storing uptime-at-reset is harmless and aids debugging.
+val="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+if fw_setenv beep_lastgood "$val" 2>/dev/null; then
+	# Post-write readback. The env sector is a SINGLE un-mirrored copy, so a power loss
+	# mid-erase can corrupt it (brick-class). We can't prevent that until a redundant env
+	# lands with the repartition, but verify the write took AND beep_primary survived, and
+	# log loudly on mismatch so a corrupted env is caught early rather than at next boot.
+	rb="$(fw_printenv -n beep_lastgood 2>/dev/null || true)"
+	pri="$(fw_printenv -n beep_primary 2>/dev/null || true)"
+	if [ "$rb" = "$val" ] && [ "$pri" = "0x9f050000" ]; then
+		logger -t "$LOGT" "bootcount-reset: env rewritten + verified — U-Boot bootcount cleared"
+	else
+		logger -t "$LOGT" "bootcount-reset: WARNING readback mismatch after write (beep_lastgood='$rb' beep_primary='$pri') — env may be inconsistent"
+	fi
+else
+	logger -t "$LOGT" "bootcount-reset: fw_setenv failed — bootcount NOT cleared"
+fi
+exit 0

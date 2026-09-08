@@ -1,0 +1,19 @@
+#!/bin/sh
+# Recovery initramfs: bring the reflash AP up UNCONDITIONALLY on every boot.
+#
+# Why unconditional: the recovery slot is a stateless initramfs — there is no
+# persistent overlay and no client Wi-Fi config to try, so every boot is "fresh"
+# and the device's sole job here is to serve the network reflash UI. We therefore
+# raise the AP directly instead of leaning on the STA self-heal watchdog
+# (beep-netcheck is pruned from this image). This also dodges the two bugs PR #18
+# fixed in the primary path (a dormant, never-enabled watchdog; a setup branch that
+# keyed off a non-empty ssid) — here the AP bring-up is explicit and always runs.
+#
+# It reuses the primary's wifi-setup-enable verbatim, so the SSID, WPA2 key
+# (per-device MAC->code), captive-portal dnsmasq + DHCP, and firewall zoning are
+# identical to normal setup — and any fix to that machinery (e.g. the in-flight
+# DHCP fix) lands here too. 99-beep has already derived /etc/beep-code by now
+# (alphabetically earlier), so the AP key matches the unit's label.
+[ -x /usr/libexec/beep/wifi-setup-enable ] && /usr/libexec/beep/wifi-setup-enable
+logger -t beep "recovery: reflash AP raised (signed-OTA web reflash ready)"
+exit 0
