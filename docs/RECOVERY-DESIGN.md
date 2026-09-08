@@ -161,13 +161,20 @@ verified `/etc/fw_env.config`, treat a lost env as a brick risk) is binding.
    `touch /etc/beep-fwenv-verified`. Honest scope: this is defense-in-depth for a
    *good* primary that reboots a lot — it does **not** fix a deterministic early hang
    (that never reaches rc.local); the valid recovery slot + OTA hardening cover that.
-2. **OTA keep-config hardening.** *Partly done:* `beep-ota` now `setsid`-detaches the
-   flash so a uhttpd CGI teardown can't kill `sysupgrade` mid-write, and logs the
-   attempt. *Deferred (the real fix):* stop relying on stock keep-config — preserve
-   only our identity set (beep-code, cert/key, wireless + system config) ourselves and
-   flash `-n`, so a variant-mismatch can't hang the restore. Blocked on the setup-AP
-   DHCP fix (PR #18): `-n` drops the wifi client config → the unit lands on the setup
-   AP, which must be reachable first. Likely its own issue.
+2. **OTA keep-config hardening.** ✅ **Done** — the root cause of the 2026-09-08 brick
+   is fixed. `beep-ota` no longer uses stock keep-config (which preserved all of
+   `/etc/config/*`, letting a stale variant config hang the first-boot restore).
+   Instead it stages a **curated identity+connectivity tarball** — `beep-code`,
+   `beep-uhttpd.{crt,key}`, `shadow`, `config/{wireless,network,system}` — and flashes
+   `sysupgrade -f <tar>`, which restores *only* that set (no broad keep.d expansion),
+   so a variant mismatch can't hang the restore. It aborts before flashing if the tar
+   can't be staged (never wipes identity). Because the set **includes `wireless`**, the
+   unit rejoins home wifi after the flash — so this is **no longer blocked on the
+   setup-AP DHCP fix (PR #18)** (the reason `-n` was deferred). The `setsid` mid-write
+   guard is retained. From-recovery reflash flashes `-n` (stateless, self-provisions).
+   *Residual (defense-in-depth, not the fix):* a first-boot restore timeout is still
+   worth adding in case the restore *mechanism* (not content) ever stalls — items 1
+   and the recovery slot cover that case until then.
 3. **Recovery slot**: build the ~5.57 MB minimal initramfs (bake `/etc/beep-ota.pub`
    + the `99-beep` MAC→code derivation + a tap detector; strip audio/wifi-full/opkg),
    repartition to the geometry above, `setenv beep_recovery 0x9fa30000; saveenv`,
