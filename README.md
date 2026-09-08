@@ -43,7 +43,8 @@ load-bearing that can be killed by a vanished app or server.
 - **Open (Phase 3):** build a recovery-slot initramfs into the freed ~5.6 MB so
   `bootb` auto-recovers a bad update without a UART; multiroom (Snapcast).
 
-New here? See **[`docs/INSTALL.md`](docs/INSTALL.md)** (rescue/flash your own Beep),
+New here? See **[`docs/UI.md`](docs/UI.md)** (how the LED ring + knob work — the
+device UI), **[`docs/INSTALL.md`](docs/INSTALL.md)** (rescue/flash your own Beep),
 **[`docs/RECOVERY-DESIGN.md`](docs/RECOVERY-DESIGN.md)** (recover without a serial
 console), and **[`docs/COMPARISON.md`](docs/COMPARISON.md)** (stock vs. open).
 
