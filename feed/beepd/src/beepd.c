@@ -273,9 +273,11 @@ static void led_render_sleep(int64_t frame)
 	int ph  = (int)(frame % period);
 	int tri = (ph < period / 2) ? ph : (period - ph);/* 0..60 */
 	uint8_t lvl = (uint8_t)(3 + tri / 2);            /* ~3..33, soft */
+	/* SAME bottom pair as the idle breathe (wire 11+12), just dimmer/slower — the
+	 * dots must not shift when idle drifts into sleep. (Was LED_BOT+1 = wire 13.) */
 	memset(led_target, 0, sizeof led_target);
-	led_target[LED_BOT]              = lvl;
-	led_target[(LED_BOT + 1) % NLED] = lvl;
+	led_target[LED_BOT]                     = lvl;
+	led_target[(LED_BOT - 1 + NLED) % NLED] = lvl;
 }
 
 /* Is the PCM actually pushing samples? (drives "playing" party mode.) */
