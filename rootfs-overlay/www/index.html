@@ -174,6 +174,21 @@ summary::-webkit-details-marker{display:none}
     </div>
 
     <div class="card">
+      <h2>🎵 Lyrion Music Server</h2>
+      <p class="mut">Play from a Lyrion Music Server (LMS / Squeezebox) on your network.
+        This Beep appears as a player named after its hostname.</p>
+      <div class="seg" role="group" aria-label="LMS player" style="margin-top:10px">
+        <button id="lms-off" aria-pressed="true"  onclick="setLms(0)">Off</button>
+        <button id="lms-on"  aria-pressed="false" onclick="setLms(1)">On</button>
+      </div>
+      <div style="margin-top:12px">
+        <label for="lms-srv">Server address <span class="mut">(blank = auto-discover; pin the IP if the server is wired and the Beep is on Wi-Fi)</span></label>
+        <input id="lms-srv" type="text" placeholder="auto (broadcast)">
+      </div>
+      <p class="mut" id="lms-status" style="margin-top:10px"></p>
+    </div>
+
+    <div class="card">
       <h2>System</h2>
       <details class="mb">
         <summary>Set admin password</summary>
@@ -265,6 +280,7 @@ function refresh(){return call("status").then(function(s){
   if(!el("nm").matches(":focus"))el("nm").value=s.name||"";
   if(s.volume!=null && !el("vol")._live){el("vol").value=s.volume;el("volpct").textContent=s.volume+"%";}
   setGroupUI(s);
+  setLmsUI(s);
   setSshUI(s);
   el("foot").textContent="Beep Revival — open firmware · "+(s.name||"");
 }).catch(function(e){ // status failed -> needs login
@@ -336,6 +352,22 @@ function setGroup(r){
   el("grp-status").textContent="Applying…";
   call("set_group",body).then(function(){setTimeout(refresh,1200);})
     .catch(function(e){el("grp-status").textContent="Failed: "+(e&&e.message||e);});
+}
+function setLmsUI(s){
+  var en=(s&&s.lms_enabled)?1:0;
+  el("lms-off").setAttribute("aria-pressed",en===0);
+  el("lms-on").setAttribute("aria-pressed",en===1);
+  if(document.activeElement!==el("lms-srv")) el("lms-srv").value=(s&&s.lms_server)||"";
+  var msg;
+  if(en) msg=(s&&s.lms_running)?"On — look for this Beep as a player in your LMS.":"On — starting…";
+  else msg="Off. Turn on to appear as a player in a Lyrion Music Server.";
+  el("lms-status").textContent=msg;
+}
+function setLms(en){
+  var body={enabled:en,server:el("lms-srv").value.trim()};
+  el("lms-status").textContent="Applying…";
+  call("set_lms",body).then(function(){setTimeout(refresh,1200);})
+    .catch(function(e){el("lms-status").textContent="Failed: "+(e&&e.message||e);});
 }
 function savePw(){var p=el("np").value;if(p.length<6){toast("Min 6 characters",true);return;}
   call("set_password",{password:p}).then(function(){el("np").value="";toast("Password set");})
