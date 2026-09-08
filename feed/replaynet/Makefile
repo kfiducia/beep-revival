@@ -6,16 +6,18 @@ define Package/replaynet
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=Beep multi-room sync engine (fresh reimplementation of stock playnet)
-  # Step (a): PCM transport + on-wire framing only. No audio/ALSA deps yet — the
-  # WM8524 ALSA sink is step (c). See docs/PLAYNET-RE.md §4.
-  DEPENDS:=+libc
+  # PCM transport + framing (a) + clock sync/drift (b) + ALSA/WM8524 sink (c).
+  # alsa-lib: the -DRN_ALSA sink writes decoded PCM to the "default" (softvol->hw:0,0)
+  # device. See docs/REPLAYNET.md and docs/PLAYNET-RE.md §4.
+  DEPENDS:=+libc +alsa-lib
 endef
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/* $(PKG_BUILD_DIR)/
 endef
 define Build/Compile
-	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -Wall -Wextra -o $(PKG_BUILD_DIR)/replaynet $(PKG_BUILD_DIR)/replaynet.c
+	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -Wall -Wextra -DRN_ALSA \
+		-o $(PKG_BUILD_DIR)/replaynet $(PKG_BUILD_DIR)/replaynet.c -lasound
 endef
 define Package/replaynet/install
 	$(INSTALL_DIR) $(1)/usr/sbin

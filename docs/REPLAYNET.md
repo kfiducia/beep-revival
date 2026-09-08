@@ -12,9 +12,9 @@ Snapcast is deliberately dropped (issue #9).
 | step | scope | status |
 |------|-------|--------|
 | **(a)** | 2-node PCM stream + on-wire framing | done |
-| **(b)** | timestamp / clock sync + drift correction | done (this PR) |
-| (c) | ALSA sink (the stock `beepi2s` role, WM8524) | next |
-| (d) | `assign_groups()` consensus + mDNS + double-tap / shairport play hooks | |
+| **(b)** | timestamp / clock sync + drift correction | done |
+| **(c)** | ALSA sink (the stock `beepi2s` role, WM8524) | done (this PR) |
+| (d) | `assign_groups()` consensus + mDNS + double-tap / shairport play hooks | next |
 
 ## Wire protocol v2
 
@@ -78,18 +78,43 @@ deterministic so it is unit-tested (`--selftest`) and reused verbatim by the ste
 DAC writer. Step (b) computes and logs the correction trajectory; step (c) applies the
 drops/inserts to the real device.
 
+## ALSA sink (step c)
+
+`--alsa <device>` makes the sink play to a real ALSA device (the stock `beepi2s` role)
+instead of writing PCM to a file. On the Beep that is `default` → `softvol("Master")` →
+`hw:0,0` (the WM8524); `plug` handles any rate conversion, so we open at 44100/S16/2ch.
+
+Playout path: a jitter ring buffer sits between the network reader and the DAC writer.
+On start the sink locks the clock offset, anchors the schedule, waits until the anchor
+sample's local presentation time (`source_time_ns - theta + RN_BUFFER_NS`), **trims the
+prebuffer that accumulated during the lock to the setpoint**, then feeds the device.
+`snd_pcm_writei` paces consumption at the DAC clock; between writes the socket is drained
+into the ring.
+
+Drift is corrected by a **buffer-level servo** (Snapcast style): hold the total latency
+(ring bytes + `snd_pcm_delay()` queued frames) at the setpoint (`RN_BUFFER_NS`, 400 ms —
+the Beep is on wifi, where bursts overflow/starve a small buffer; wired LANs are fine far
+lower). If the DAC clock runs slow the latency grows → drop frames; if it runs fast →
+insert silence. The buffer level is the integrator, so a fixed offset is corrected once
+(not every iteration) — rate-limited (250 ms) with a ~100 ms tolerance so transient wifi
+jitter rides *in* the buffer and only sustained drift triggers a correction.
+`rn_drift_decide()` (unit-tested) makes the drop/insert decision. Sample-drop/insert is
+the spike-level correction; smoothing it with resampling is future work, as is tightening
+inter-sink alignment below the setpoint tolerance (the synchronized start already aligns
+them to ~1 ms).
+
 ## Usage
 
 ```
 replaynet --source --peer <ip:port> [--pcm <file|->]
           [--fake-clock-offset-ns N] [--fake-clock-rate-ppm P]   # test injectors
-replaynet --sink   --listen <port>  [--out <file|->]
+replaynet --sink   --listen <port>  [--out <file|-> | --alsa <device>]
 replaynet --selftest
 ```
-PCM is raw interleaved S16, 44100 Hz, 2 ch (4 B/frame). Step (a/b) sink writes received
-PCM straight through (file/stdout/fifo); the ALSA/WM8524 device is step (c). The
+PCM is raw interleaved S16, 44100 Hz, 2 ch (4 B/frame). Without `--alsa` the sink writes
+received PCM straight through (file/stdout/fifo) — used by the host/qemu regression. The
 `--fake-clock-*` flags make a source lie about its clock (constant offset / rate ppm) so
-the sink's estimator and drift controller can be validated end-to-end over the socket.
+the sink's estimator and drift servo can be validated end-to-end over the socket.
 
 ## Testing
 
@@ -104,7 +129,28 @@ scripts/replaynet/loopback-test.sh ./replaynet                    # host build
 scripts/replaynet/loopback-test.sh "qemu-mips /tmp/rn/replaynet"  # cross-built, on-target
 ```
 
-Both pass on the host and under qemu-mips (MIPS32 big-endian).
+Both pass on the host and under qemu-mips (MIPS32 big-endian). The `--alsa` path can't run
+under qemu (no sound device); it is validated on the real unit:
 
-Package: `feed/replaynet/` (single C file, mirrors `feed/beepd`). Selected in the image
-via `CONFIG_PACKAGE_replaynet=y` (built for CI coverage; not auto-started yet).
+```
+# same-unit loopback into the WM8524:
+replaynet --sink --listen 5056 --alsa default &   # opens default -> softvol -> hw:0,0
+replaynet --source --peer 127.0.0.1:5056 --pcm sine.pcm
+# cross-device (real multiroom): sink on one Beep, source on another
+#   copper$  replaynet --sink   --listen 5060 --alsa default
+#   silver$  replaynet --source --peer <copper-ip>:5060 --pcm sine8.pcm
+```
+Confirmed on real hardware, and the 440 Hz tone is **audible** out the speaker:
+- **Same-unit (beep-silver):** ALSA opens 44100/S16/2ch; clock locks (~40 us loopback);
+  buffer servo holds latency stable; the small steady net drop is the WM8524 I2S clock
+  drifting vs the system clock, corrected — clean drain.
+- **Cross-device (beep-silver -> beep-copper, over wifi):** clock sync locks across two
+  independent units (theta absorbs the per-boot CLOCK_MONOTONIC uptime difference,
+  ~3295 s here); the full 8 s streams and plays on copper; with the 400 ms buffer the
+  latency holds steady (~+/-70 ms of setpoint, net correction ~0) so wifi jitter rides in
+  the buffer instead of forcing drops (an 80 ms buffer glitched badly, which drove the
+  400 ms choice).
+
+Package: `feed/replaynet/` (single C file, mirrors `feed/beepd`, `DEPENDS +alsa-lib`,
+built `-DRN_ALSA -lasound`). Selected in the image via `CONFIG_PACKAGE_replaynet=y`
+(built for CI coverage; not auto-started yet).
