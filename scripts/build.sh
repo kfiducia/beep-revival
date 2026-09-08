@@ -19,6 +19,105 @@ grep -q 'src-link beepfeed' feeds.conf.default || echo "src-link beepfeed $SRC/f
 ./scripts/feeds update beepfeed >/dev/null
 ./scripts/feeds install -a -p beepfeed >/dev/null
 
+# ============================================================================
+# RECOVERY=1 — build the minimal signed-reflash initramfs for the recovery slot.
+# Self-contained (returns before the primary/audio build). See docs/RECOVERY-DESIGN.md.
+#
+# It reuses the SAME device tree and the SAME rootfs-overlay machinery as the primary
+# (per-device MAC->code identity, the wifi-setup AP + dnsmasq captive portal, the
+# beep-ota cgi + baked /etc/beep-ota.pub) so a fix to any of those — e.g. the setup-AP
+# DHCP — lands in recovery too, then layers recovery-overlay/ on top (a stripped
+# reflash-only UI + a boot hook that raises the AP unconditionally, since a stateless
+# initramfs is "fresh" every boot). Package set is lean-initramfs-class to clear BOTH
+# the ~5.75 MB recovery slot AND the 64 MB unpacked-RAM ceiling: wifi AP + uhttpd +
+# usign + dnsmasq only — NO audio/snapcast/ffmpeg/rpcd/px5g/opkg. Signed images verify
+# by signature alone (no rpcd session exists here); the unsigned triple-tap path needs
+# beepd + i2c and is deliberately omitted from this lean build (recovery restores a
+# genuine SIGNED release — sufficient to un-brick).
+# ============================================================================
+if [ -n "${RECOVERY:-}" ]; then
+  echo "== [RECOVERY] minimal signed-reflash initramfs =="
+  DTS="$OW/target/linux/ath79/dts/ar9331_8dev_carambola2.dts"
+  cp "$SRC/dts/ar9331_beep_dial.dts" "$DTS"
+  sed -i 's/"beep,dial"/"8dev,carambola2"/' "$DTS"   # board_name match (sysupgrade target)
+
+  echo "   [RECOVERY] overlay = rootfs-overlay (shared machinery) + recovery-overlay"
+  rm -rf "$OW/files"; mkdir -p "$OW/files"
+  cp -a "$SRC/rootfs-overlay/." "$OW/files/"
+  # Drop primary-only first-boot hooks that have no place in a stateless reflash
+  # initramfs (no audio, no multiroom, no STA watchdog, no persistent SSH pref).
+  # 99-recovery-ap (from recovery-overlay) raises the AP explicitly instead.
+  rm -f "$OW"/files/etc/uci-defaults/99-beep-audio \
+        "$OW"/files/etc/uci-defaults/99-beep-group \
+        "$OW"/files/etc/uci-defaults/99-beep-ssh \
+        "$OW"/files/etc/uci-defaults/99-beep-netcheck \
+        "$OW"/files/etc/init.d/beep-audio \
+        "$OW"/files/etc/init.d/beep-netcheck \
+        "$OW"/files/etc/config/beep \
+        "$OW"/files/etc/asound.conf \
+        "$OW"/files/etc/shairport-sync.conf \
+        "$OW"/files/etc/snapserver.conf 2>/dev/null || true
+  cp -a "$SRC/recovery-overlay/." "$OW/files/"
+
+  cat > .config <<CFG
+CONFIG_TARGET_ath79=y
+CONFIG_TARGET_ath79_generic=y
+CONFIG_TARGET_ath79_generic_DEVICE_8dev_carambola2=y
+CONFIG_TARGET_ROOTFS_INITRAMFS=y
+CONFIG_TARGET_INITRAMFS_COMPRESSION_XZ=y
+# wifi + the setup/recovery AP (WPA2)
+CONFIG_PACKAGE_kmod-ath9k=y
+CONFIG_PACKAGE_wpad-basic-mbedtls=y
+# web reflash plane + DHCP/captive portal (reuses the primary's dnsmasq machinery)
+CONFIG_PACKAGE_uhttpd=y
+CONFIG_PACKAGE_dnsmasq=y
+# recovery serves an AP + a single upload form — it never scans, so drop iwinfo
+# CONFIG_PACKAGE_iwinfo is not set
+# signed OTA: usign verifies the uploaded image against the baked-in pubkey
+CONFIG_PACKAGE_usign=y
+CONFIG_BUSYBOX_CONFIG_BASE64=y
+# explicitly OMIT everything heavy (audio / multiroom / rpcd / opkg): keeps the
+# initramfs lean-class for the flash slot AND the 64MB unpacked-RAM ceiling.
+# CONFIG_PACKAGE_beepd is not set
+# CONFIG_PACKAGE_kmod-beep-i2s is not set
+# CONFIG_PACKAGE_kmod-sound-soc-wm8524 is not set
+# CONFIG_PACKAGE_kmod-sound-soc-simple-card is not set
+# CONFIG_PACKAGE_alsa-utils is not set
+# CONFIG_PACKAGE_shairport-sync-mbedtls is not set
+# CONFIG_PACKAGE_avahi-daemon is not set
+# CONFIG_PACKAGE_snapserver is not set
+# CONFIG_PACKAGE_snapclient is not set
+# CONFIG_PACKAGE_rpcd is not set
+# CONFIG_PACKAGE_uhttpd-mod-ubus is not set
+# CONFIG_PACKAGE_px5g-mbedtls is not set
+# CONFIG_PACKAGE_opkg is not set
+CFG
+  make defconfig >/dev/null
+
+  echo "== [RECOVERY] build =="
+  # Same staleness guards as the primary build: wipe deselected files + our stale ipks.
+  rm -rf "$OW"/build_dir/target-*/root-* 2>/dev/null || true
+  find "$OW"/bin "$OW"/build_dir -name '*beepd*.ipk' -delete 2>/dev/null || true
+  set -o pipefail
+  JOBS="${JOBS:-$(n=$(nproc); [ "$n" -gt 6 ] && echo 6 || echo "$n")}"
+  echo "   building with -j$JOBS"
+  make -j"$JOBS" 2>&1 | tee /build/recovery-build.log | tail -1
+  # Drop the ALSA UCM profiles if any snuck in (harmless here; keeps it lean).
+  for R in "$OW"/build_dir/target-*/root-*; do
+    [ -d "$R/usr/share/alsa" ] && rm -rf "$R/usr/share/alsa/ucm2" "$R/usr/share/alsa/ucm"
+  done
+  echo "== [RECOVERY] image =="
+  IMG="$(ls "$OW"/bin/targets/ath79/generic/*8dev_carambola2*initramfs-kernel.bin 2>/dev/null | head -1)"
+  if [ -n "$IMG" ]; then
+    SZ="$(stat -c%s "$IMG" 2>/dev/null || wc -c < "$IMG")"
+    printf '   %s\n   %d bytes = %.2f MB (recovery slot target: 5.875 MB / 0x5E0000)\n' "$IMG" "$SZ" "$(awk "BEGIN{print $SZ/1048576}")"
+    [ "$SZ" -gt 6160384 ] && echo "   ⚠️  over 5.875 MB — re-check the package set or enlarge the slot (see RECOVERY-DESIGN.md §D)"
+  else
+    echo "   !! no initramfs image produced — check /build/recovery-build.log"
+  fi
+  exit 0
+fi
+
 echo "== 1b. AirPlay build mode (default: classic AirPlay-1 for Snapcast; AIRPLAY2=1: buffered AAC) =="
 # The AR9331 (400MHz, no SIMD) CANNOT decode AirPlay-2 buffered AAC in real time —
 # measured 0% idle + instant PCM XRUN the moment playback starts (see BUILD-STATUS).

@@ -105,28 +105,46 @@ Measured primary-trim budget (uncompressed → ~35–40 % of that compressed in 
   uncompressed (~1.5–2 MB compressed)**. Heavy lever; costs the multi-room feature
   (already flagged as saturating the AR9331 — see AGENTS "lighter multi-room").
 
+**Fit check against the 16 MB ceiling — measured from the real `RECOVERY=1`
+`build.sh` (2026-09-08).** The shipped recovery variant (wifi WPA2 AP +
+`dnsmasq`/DHCP reused from the primary + `uhttpd` + `usign` + the stripped
+`recovery-overlay` reflash UI; NO audio/rpcd/opkg; signed-only) builds to
+**5.80 MB** (6,083,832 B). The optional `beepd`/i2c triple-tap unsigned path adds
+~0.25 MB (→ ~6.05 MB) and is omitted from the lean build.
+
+| Recovery feature set | Recovery img | Slot 0x5E0000 (5.875 MB) | Primary slot 0x9C0000 (9.75 MB) | Fits 15.625 MB? |
+|---|---|---|---|---|
+| **Shipped: signed-only + dnsmasq** | **5.80 MB** | 75 KB headroom | primary img ≤ ~9.4 MB (after opkg strip) | ✅ **with opkg strip only — no Snapcast loss** |
+| + `beepd` triple-tap (optional) | ~6.05 MB | needs 0x600000 slot | primary must drop ~0.2 MB more | ⚠️ tighter — weigh vs multi-room |
+
+**Good outcome: the signed-only recovery fits alongside the current primary with only
+the lossless opkg-metadata strip** (`rm -rf $R/usr/lib/opkg`, ~0.6 MB, already done in
+LEAN) — Snapcast/AirPlay stay. The RAM ceiling (§B) also favors this lean build.
+Triple-tap-in-recovery is a later upgrade that costs ~0.2 MB more of primary. *Note:*
+recovery reuses the primary's `dnsmasq` setup-AP, so it inherits whatever DHCP fix
+lands on PR #18 — do not give it a separate DHCP path.
+
 **Chosen target geometry** (custom offsets; keep a proper WPA2 + `usign`-verified
 recovery, minimal package set to satisfy the RAM ceiling):
 
 Recovery is anchored to **end at `art` (0xFF0000)**, so its start = 0xFF0000 −
-slot-size. For a 5.75 MB (0x5C0000) slot:
+slot-size. Sized to the measured 5.80 MB image with ~75 KB headroom:
 
 ```
 0x000000  u-boot        256K   [preserve]
 0x040000  u-boot-env     64K
-0x050000  firmware    9.875M   reg = <0x050000 0x9E0000>   primary (image <=~9.3M + overlay)
-0xA30000  recovery     5.75M   reg = <0xA30000 0x5C0000>   minimal signed-reflash initramfs
+0x050000  firmware     9.75M   reg = <0x050000 0x9C0000>   primary (opkg-stripped img ~9.4M + overlay)
+0xA10000  recovery    5.875M   reg = <0xA10000 0x5E0000>   signed-reflash initramfs (5.80M measured)
 0xFF0000  art            64K    [preserve]
 ```
 
-→ `setenv beep_primary 0x9f050000; setenv beep_recovery 0x9fa30000; saveenv`.
+→ `setenv beep_primary 0x9f050000; setenv beep_recovery 0x9fa10000; saveenv`.
 
-If the primary can only shed the opkg metadata (not Snapcast), fall back to a
-**5.625 MB** recovery slot (0x5A0000, start 0xA50000 → primary slot exactly 10.0 MB) —
-it still holds the 5.57 MB minimal image, with near-zero growth headroom, and
-`beep_recovery=0x9fa50000`. Either way, **both** `beep_primary` and `beep_recovery`
-become non-default offsets, so correction #3 below (ship a verified
-`/etc/fw_env.config`, treat a lost env as a brick risk) is binding.
+If the optional `beepd` triple-tap is added to recovery (~6.05 MB), bump the slot to
+**6.0 MB** (0x600000, start 0xA00000 → `beep_recovery=0x9fa00000`, primary slot
+9.625 MB) and trim the primary ~0.2 MB further. Either way, **both** `beep_primary`
+and `beep_recovery` become non-default offsets, so correction #3 below (ship a
+verified `/etc/fw_env.config`, treat a lost env as a brick risk) is binding.
 
 ### Revised action order (supersedes the "Sequencing" section at the bottom)
 

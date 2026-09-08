@@ -58,10 +58,18 @@ if [ "$want_unsigned" = 1 ]; then
 	# UNSIGNED: physical presence is mandatory; an admin session is NOT sufficient.
 	phys_valid || fail '403 Forbidden' '{"error":"unsigned upload requires a physical triple-tap on the device (within 60s)"}'
 else
-	# SIGNED: a signature must be supplied AND an admin session held (the signature
-	# itself is verified after the body arrives). A stolen session still can't forge it.
+	# SIGNED: a signature must be supplied AND (on the primary) an admin session held
+	# — the signature itself is verified after the body arrives; a stolen session still
+	# can't forge it. In the RECOVERY initramfs there is no rpcd/session at all, so the
+	# usign signature IS the sole authenticator: a valid signature against the baked
+	# pubkey is proof the image is a genuine Beep release, which is exactly what a
+	# from-recovery reflash needs. The /etc/beep-recovery marker (present only in the
+	# recovery image) waives the session requirement; the signature check below is not
+	# waived, so an unsigned image can still never reach sysupgrade this way.
 	[ -n "$sig_b64u" ] || fail '400 Bad Request' '{"error":"no signature — upload a signed .bin (or triple-tap for an unsigned install)"}'
-	[ "$admin" = 1 ] || fail '401 Unauthorized' '{"error":"sign in as admin, or triple-tap the device for an unsigned install"}'
+	if [ ! -f /etc/beep-recovery ]; then
+		[ "$admin" = 1 ] || fail '401 Unauthorized' '{"error":"sign in as admin, or triple-tap the device for an unsigned install"}'
+	fi
 fi
 
 # --- receive image (raw body), hard-capped. Refuse an over-large Content-Length up

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beep Recovery</title>
+<style>
+  :root{--bg:#0d0f12;--card:#171a1f;--fg:#e7ebf0;--muted:#9aa3ad;--accent:#4a9eff;--warn:#f2b134;--ok:#39d98a;--err:#ff5c5c;--line:#262b32}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:24px}
+  .wrap{max-width:560px;margin:0 auto}
+  h1{font-size:22px;margin:.2em 0}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin:16px 0}
+  .banner{border-color:var(--warn)}
+  .muted{color:var(--muted)}
+  label{display:block;margin:10px 0 6px;font-weight:600}
+  input[type=file]{width:100%;color:var(--fg)}
+  .btn{appearance:none;border:1px solid var(--line);background:#20262e;color:var(--fg);border-radius:9px;padding:10px 16px;font-size:15px;cursor:pointer;margin-top:12px}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#04122a;font-weight:700}
+  .btn:disabled{opacity:.6;cursor:default}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#20262e;border:1px solid var(--line);border-radius:9px;padding:10px 16px;max-width:90%;opacity:0;transition:opacity .2s;pointer-events:none}
+  #toast.show{opacity:1}
+  #toast.err{border-color:var(--err)}
+  code{background:#0b0d10;padding:1px 5px;border-radius:5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🛟 Beep Recovery</h1>
+  <p class="muted">This speaker booted into its <b>recovery firmware</b> because the
+  main firmware failed to start. Recovery has no audio — its only job is to get a
+  known-good firmware back on the device over the network. Nothing is wrong with the
+  hardware.</p>
+
+  <div class="card banner">
+    <b>How to restore:</b>
+    <ol class="muted" style="margin:.4em 0 0;padding-left:1.2em">
+      <li>Download the latest <b>signed</b> Beep release <code>.bin</code>.</li>
+      <li>Upload it below. Recovery <b>verifies its signature</b> against the key baked
+          into this device, then flashes it and reboots.</li>
+      <li>Only genuine, signed releases are accepted — an unsigned or tampered image is
+          rejected before it can touch the flash.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <label for="img">Signed firmware (.bin)</label>
+    <input id="img" type="file" accept=".bin,.img">
+    <button class="btn primary" id="go" onclick="flash()">Verify &amp; install</button>
+    <p class="muted" id="hint" style="margin:.8em 0 0">The device will reboot into the
+      restored firmware automatically. Keep the power on.</p>
+  </div>
+</div>
+<div id="toast"></div>
+<script>
+function el(id){return document.getElementById(id);}
+var _t;
+function toast(m,err){var t=el("toast");t.textContent=m;t.className="show"+(err?" err":"");
+  clearTimeout(_t);_t=setTimeout(function(){t.className="";},err?6000:4000);}
+
+/* Signed install — ONE signed .bin (usign sig = first two lines, image = the rest).
+ * uhttpd drops custom headers, so the signature rides in the query (base64url) and the
+ * image in the body. No session in recovery: the signature is the sole authenticator,
+ * and the cgi waives the admin-session check when /etc/beep-recovery is present. */
+function flash(){
+  var f=el("img").files[0];
+  if(!f){toast("Pick the signed .bin first",true);return;}
+  var b=el("go");b.disabled=true;b.innerHTML='<span class="spin"></span> Verifying…';
+  var done=function(){b.disabled=false;b.textContent="Verify & install";};
+  var r=new FileReader();
+  r.onload=function(){
+    var bytes=new Uint8Array(r.result),nl=0,pos=-1,i;
+    for(i=0;i<bytes.length;i++){ if(bytes[i]===10 && ++nl===2){ pos=i+1; break; } }
+    if(pos<0){ toast("That doesn't look like a signed Beep image",true); done(); return; }
+    var sig="",j; for(j=0;j<pos;j++) sig+=String.fromCharCode(bytes[j]);
+    var sigb64=btoa(sig).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+    fetch("/cgi-bin/beep-ota?session=&sig="+sigb64,
+      {method:"POST",headers:{"Content-Type":"application/octet-stream"},body:bytes.subarray(pos)})
+      .then(function(x){return x.json().catch(function(){return {error:"upload failed"};});})
+      .then(function(jj){ if(jj.ok){toast("Verified — flashing, the device will reboot");
+                            el("hint").textContent="Flashing now. Do not power off. This page will stop responding as the device reboots into the restored firmware.";}
+                          else toast(jj.error||"update rejected",true); })
+      .catch(function(){toast("upload failed",true);})
+      .then(done);
+  };
+  r.readAsArrayBuffer(f);
+}
+</script>
+</body>
+</html>
