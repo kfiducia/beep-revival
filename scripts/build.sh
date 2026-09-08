@@ -367,12 +367,25 @@ MAKE_RC=$?
 # GUARD: an AIRPLAY2 build MUST actually contain AirPlay 2. This silently regressed
 # once when a prior default build's --with-airplay-2 strip leaked into the Makefile,
 # producing a classic binary that no one caught until it was flashed. Fail loudly.
+#
+# NOTE (why the old form always false-failed): with `set -o pipefail` on, the old
+# `strings "$SPB" | grep -qi airplay2` returned non-zero whenever the match was found.
+# `grep -q` exits at the FIRST match and closes the pipe; `strings` then dies of SIGPIPE
+# (141), and pipefail promotes that to the pipeline's status — so a genuine AP2 binary
+# tripped the "not AP2" branch. Capture the count instead (grep -c reads all input, no
+# early close, no SIGPIPE) and test a DEFINITIVE AP2-only marker, distinguishing
+# "couldn't find the binary" from "found, but classic".
 if [ -n "${AIRPLAY2:-}" ]; then
   SPB="$(ls "$OW"/staging_dir/target-*/root-*/usr/bin/shairport-sync 2>/dev/null | head -1)"
-  if [ -n "$SPB" ] && strings "$SPB" 2>/dev/null | grep -qi airplay2; then
-    echo "   [AIRPLAY2] verified: shairport binary contains AirPlay 2"
+  if [ -z "$SPB" ] || [ ! -f "$SPB" ]; then
+    echo "!! AIRPLAY2=1 guard: no built shairport-sync found to verify — check the build"; exit 3
+  fi
+  # "Startup in AirPlay 2 mode" is emitted only by an AirPlay-2 build; a classic binary
+  # lacks it. grep -c (not -q) so the pipe is fully drained under pipefail.
+  if [ "$(strings "$SPB" 2>/dev/null | grep -c 'AirPlay 2 mode')" -gt 0 ]; then
+    echo "   [AIRPLAY2] verified: $SPB is an AirPlay-2 binary"
   else
-    echo "!! AIRPLAY2=1 but the built shairport-sync is NOT an AirPlay-2 binary — aborting"
+    echo "!! AIRPLAY2=1 but $SPB is a CLASSIC (AirPlay-1) binary — --with-airplay-2 strip likely leaked; aborting"
     exit 3
   fi
 fi
