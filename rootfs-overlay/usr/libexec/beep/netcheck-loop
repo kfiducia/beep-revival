@@ -15,6 +15,24 @@ sta_ok() {
 }
 ap_up() { [ "$(uci -q get wireless.setup.disabled)" = "0" ]; }
 
+# Guarantee the radio actually comes up. Cold boot on this ath9k SoC is racy: the PHY
+# only registers ~24s in (EEPROM-calibration hotplug), and if netifd processed the
+# wireless config before the PHY existed, wireless can silently never start — no
+# phy0-* netdev is ever created, so the STA doesn't even TRY to associate and the ring
+# spins forever with no self-heal (the 2026-09-08 "wifi never started at boot"
+# failure — netifd brought up lan/wan but never the radio). radio_up is true once any
+# wireless netdev exists; ensure_radio runs an idempotent `wifi up` ONLY when none
+# does — so it never disrupts a live or mid-association radio — and never force-enables
+# a radio that's deliberately disabled (fresh unit / no client configured).
+radio_up()     { ls /sys/class/net/ 2>/dev/null | grep -q '^phy0-'; }
+ensure_radio() {
+	radio_up && return 0
+	[ "$(uci -q get wireless.radio0.disabled)" = 1 ] && return 0
+	logger -t beep-netcheck "radio not up (cold-boot race?) -> running 'wifi up'"
+	wifi up 2>/dev/null
+	sleep 8    # let netifd create the netdev before the next check
+}
+
 # set_wifi (and boot, below) drop this marker — a deadline in *uptime* seconds —
 # when we are DELIBERATELY switching the single radio AP->STA. While it's live we
 # must NOT fall back to the setup AP: the radio can't be AP+STA at once, so a
@@ -34,6 +52,7 @@ joining() {
 set_net() { mkdir -p /var/run/beep 2>/dev/null; printf '%s' "$1" > /var/run/beep/net-state; }
 
 set_net connecting   # we come up trying to associate
+ensure_radio         # cold-boot guarantee: start the radio if netifd's racy boot bring-up missed it
 # On boot with a configured STA, give the first (cold) association the same
 # protected window the portal switch gets — a cold associate + DHCP on this SoC
 # can outlast the base grace, and there's no set_wifi involved to drop the marker.
@@ -54,6 +73,7 @@ while :; do
 			uci -q set beep.main.ssh_mode=off; uci -q delete beep.main.ssh_expires; uci -q commit beep
 			logger -t beep "ssh: temporary window expired -> disabled"; };; esac
 	fi
+	ensure_radio   # keep the radio up: re-start it if a cold-boot race (or a later drop) left it down
 	# "Provisioned" == a real client STA. set_wifi (the portal join) sets iface[0]
 	# mode=sta/network=wwan; a fresh/factory-reset unit instead carries OpenWrt's
 	# auto-generated placeholder (mode=ap, ssid='OpenWrt'). The old `[ -z ssid ]`
