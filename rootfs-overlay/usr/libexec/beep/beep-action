@@ -12,44 +12,14 @@
 # (beepd fires hold/factory_reset ON RELEASE by duration, with a growing LED
 #  "arming" ring, so neither triggers accidentally.)
 #
-# Requires: nc (busybox), jsonfilter (OpenWrt base). Snapserver reachable at
-# $SNAP_HOST:1705 (localhost when this unit is server, else the helper box —
-# set in /etc/config/beep).
+# Multi-room join/leave is delegated to /usr/libexec/beep/beep-group, which owns the
+# snapclient/snapserver services and the shairport backend switch.
 
 GESTURE="$1"; ARG="$2"
-SNAP_HOST="$(uci -q get beep.main.snapserver || echo 127.0.0.1)"
-SNAP_PORT=1705
 NLEDS=24              # LED ring resolution == number of volume levels (1 LED per detent)
 LOGT="beep-action"
 
 log() { logger -t "$LOGT" "$*"; }
-
-# rpc <method> <params-json> -> prints result json (one-shot newline-delimited JSON-RPC)
-rpc() {
-	printf '{"id":1,"jsonrpc":"2.0","method":"%s","params":%s}\n' "$1" "$2" \
-		| nc -w2 "$SNAP_HOST" "$SNAP_PORT" 2>/dev/null | head -1
-}
-
-# this snapclient's id == its MAC-derived hostname id; Server.GetStatus lists clients
-my_client_id() {
-	# snapclient identifies by host; match on our hostname
-	local host; host="$(cat /proc/sys/kernel/hostname)"
-	rpc "Server.GetStatus" '{}' \
-		| jsonfilter -e '@.result.server.groups[*].clients[*]' 2>/dev/null \
-		| while read -r c; do :; done
-	# jsonfilter can't easily filter-by-field in one pass here; resolve in the
-	# helper below instead.
-	snap_find_client "$host"
-}
-
-# crude but dependency-light: pull "id" whose "host.name" matches $1
-snap_find_client() {
-	local want="$1" json
-	json="$(rpc "Server.GetStatus" '{}')"
-	echo "$json" | tr ',' '\n' | grep -A1 "\"name\":\"$want\"" >/dev/null 2>&1
-	# fall back to the first client id if we can't disambiguate
-	echo "$json" | grep -oE '"id":"[^"]+"' | head -1 | cut -d'"' -f4
-}
 
 case "$GESTURE" in
 	turn)
@@ -103,13 +73,16 @@ case "$GESTURE" in
 		fi
 		;;
 	double_tap)
-		# join the group that currently has a playing stream
-		json="$(rpc "Server.GetStatus" '{}')"
-		gid="$(echo "$json" | grep -oE '"id":"[^"]+"' | head -1 | cut -d'"' -f4)"
-		cid="$(snap_find_client "$(cat /proc/sys/kernel/hostname)")"
-		[ -n "$gid" ] && [ -n "$cid" ] && \
-			rpc "Group.SetClients" "{\"id\":\"$gid\",\"clients\":[\"$cid\"]}" >/dev/null
-		log "double_tap: join group $gid"
+		# Toggle multi-room membership. beep-group owns the services and does the work:
+		#   solo   -> member (stop local AirPlay receive, start snapclient, mDNS-discover
+		#             the primary and play its sample-synced stream)
+		#   member -> solo   (leave the group, resume solo AirPlay)
+		# The old version fired a Group.SetClients JSON-RPC directly, which silently
+		# no-op'd on a solo Beep: snapclient wasn't running yet, and beep-group is what
+		# starts it. With a single stream the snapclient auto-plays the primary's only
+		# stream, so no explicit group assignment is needed here.
+		new="$(/usr/libexec/beep/beep-group toggle 2>/dev/null | tail -1)"
+		log "double_tap: multi-room now ${new:-toggled}"
 		;;
 	hold)
 		# released after a >=10s hold (see beepd tiers) -> Wi-Fi reconfig AP

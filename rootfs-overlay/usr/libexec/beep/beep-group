@@ -67,8 +67,15 @@ case "$role" in
 	primary) uci -q set beep.main.group_role=primary; uci -q commit beep; apply_primary ;;
 	member)  uci -q set beep.main.group_role=member;  uci -q commit beep; apply_member ;;
 	solo)    uci -q set beep.main.group_role=solo;    uci -q commit beep; apply_solo ;;
-	toggle)  # double-tap: leave the group if in it, else (re)join as member
-		if [ -f "$RUNDIR/group" ]; then apply_solo; else apply_member; fi ;;
+	toggle)  # double-tap: leave the group if in it, else (re)join as member.
+		# Persist the role (so it survives reboot, like the explicit cases above) and
+		# echo it on the last line so callers (beep-action / LED feedback) can tell
+		# join from leave.
+		if [ -f "$RUNDIR/group" ]; then
+			uci -q set beep.main.group_role=solo;   uci -q commit beep; apply_solo;   echo solo
+		else
+			uci -q set beep.main.group_role=member; uci -q commit beep; apply_member; echo member
+		fi ;;
 	status)
 		printf 'role=%s snapserver=%s snapclient=%s\n' \
 			"$(uci -q get beep.main.group_role || echo solo)" \
