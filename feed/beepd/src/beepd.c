@@ -38,6 +38,8 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <math.h>
+#include <alsa/asoundlib.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
 
@@ -302,6 +304,56 @@ static int pcm_running(void)
 	return strstr(b, "RUNNING") != NULL;
 }
 
+/* --- ALSA "Master" softvol: read the REAL system volume ----------------------
+ * The knob (beep-action) and the web slider poke this control directly, but so
+ * does shairport-sync when the AirPlay SENDER changes volume (it drives the same
+ * "Master" mixer via mixer_control_name). beepd used to read only
+ * /var/run/beep/volume — which the sender never writes — so phone-driven volume
+ * changes moved the sound but not the LED arc. Reading the control itself makes
+ * the arc reflect EVERY source. Mapped 0..100 exactly like `amixer -M` so it
+ * agrees with what beep-action writes and the web shows. */
+static snd_mixer_t *mixer;
+static snd_mixer_elem_t *master_elem;
+
+static void mixer_open(void)
+{
+	snd_mixer_selem_id_t *sid;
+	if (snd_mixer_open(&mixer, 0) < 0) { mixer = NULL; return; }
+	if (snd_mixer_attach(mixer, "default") < 0 ||
+	    snd_mixer_selem_register(mixer, NULL, NULL) < 0 ||
+	    snd_mixer_load(mixer) < 0) {
+		snd_mixer_close(mixer); mixer = NULL; return;
+	}
+	snd_mixer_selem_id_alloca(&sid);
+	snd_mixer_selem_id_set_index(sid, 0);
+	snd_mixer_selem_id_set_name(sid, "Master");
+	master_elem = snd_mixer_find_selem(mixer, sid);
+	if (!master_elem) { snd_mixer_close(mixer); mixer = NULL; }
+}
+
+/* Current "Master" as a mapped 0..100 percent (the amixer -M / alsamixer curve:
+ * linear for narrow ranges, cubic-ish for wide dB ranges like our -60..0 dB).
+ * snd_mixer_handle_events() picks up external (sender/web) changes without a fork
+ * or a block. Returns -1 if the mixer isn't available (fall back to the file). */
+static int read_master_pct(void)
+{
+	if (!mixer || !master_elem) return -1;
+	snd_mixer_handle_events(mixer);
+	long dB, mindB, maxdB;
+	if (snd_mixer_selem_get_playback_dB_range(master_elem, &mindB, &maxdB) < 0) return -1;
+	if (snd_mixer_selem_get_playback_dB(master_elem, SND_MIXER_SCHN_FRONT_LEFT, &dB) < 0) return -1;
+	double norm;
+	if (maxdB - mindB <= 2400) {                        /* <=24 dB: linear */
+		norm = (double)(dB - mindB) / (double)(maxdB - mindB);
+	} else {                                            /* wide range: match amixer -M */
+		norm = pow(10, (double)(dB - maxdB) / 6000.0);
+		double minnorm = pow(10, (double)(mindB - maxdB) / 6000.0);
+		norm = (norm - minnorm) / (1.0 - minnorm);
+	}
+	int pct = (int)(norm * 100.0 + 0.5);
+	return pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+}
+
 /* Actual system volume (0..100) as written by beep-action / the web set_volume
  * after they poke the ALSA "Master". Lets the arc show the true level (and web
  * changes), not just beepd's own knob estimate. -1 if unavailable. */
@@ -420,6 +472,10 @@ int main(int argc, char **argv)
 		fprintf(stderr, "beepd: warning: STM8 info read failed (%s); assuming v0\n", strerror(errno));
 	}
 
+	/* open the ALSA "Master" so the arc can track sender/web volume, not just the knob */
+	mixer_open();
+	if (!mixer) fprintf(stderr, "beepd: warning: ALSA Master mixer unavailable; arc uses the knob/file only\n");
+
 	/* gesture state machine */
 	int64_t btn_down_at = -1;   /* ms of current press, -1 = up */
 	int64_t last_tap_at = -1;   /* ms of the last tap in a tap burst */
@@ -427,7 +483,8 @@ int main(int argc, char **argv)
 	int  read_pending = 0;
 	int64_t loops = 0, anim = 0;/* LED-mode poll counter + animation frame */
 	int  vol = 40, playing = 0; /* vol 0..100 (display), PCM-running latch */
-	int64_t last_vol_ms = -100000;       /* last knob turn — gates the volume arc */
+	int  last_master = -1;      /* last seen "Master" level; detects sender/web changes */
+	int64_t last_vol_ms = -100000;       /* last knob turn / volume change — gates the arc */
 	int64_t btn_pulse_ms = -100000;      /* last button-down — one-shot press pulse */
 	int64_t last_turn_exec = -100000;    /* coalesce knob execs (perf) */
 	int  pending_turn = 0;               /* net detents awaiting a single exec */
@@ -507,6 +564,16 @@ int main(int argc, char **argv)
 		if ((loops   % 12) == 3) refresh_net_state();
 		if ((loops   % 12) == 6) refresh_muted();
 		if ((loops++ %  6) == 0) playing = pcm_running();
+		/* Reflect ANY volume change on the arc — knob, web, OR the AirPlay sender
+		 * (shairport drives the same "Master"). Cheap in-process read, no fork; a
+		 * change trips the arc for VOL_HOLD_MS just like a knob turn does. */
+		if ((loops % 3) == 1) {
+			int m = read_master_pct();
+			if (m >= 0) {
+				if (last_master >= 0 && m != last_master) { last_vol_ms = t; vol = m; }
+				last_master = m;
+			}
+		}
 		int64_t held = (btn_down_at >= 0) ? (t - btn_down_at) : -1;
 		int64_t f = anim++;                 /* free-running animation frame */
 		/* any activity (knob, button, playback) refeeds the sleep timer */
@@ -522,7 +589,8 @@ int main(int argc, char **argv)
 		else if (led_mode)                            led_render_ap(f);
 		else if (held >= ARM_SHOW_MS)                 led_render_arming(held);
 		else if (t - btn_pulse_ms < BTN_PULSE_MS)     led_render_button_pulse(t - btn_pulse_ms);
-		else if (t - last_vol_ms < VOL_HOLD_MS)     { int sv = read_vol_file();
+		else if (t - last_vol_ms < VOL_HOLD_MS)     { int sv = (last_master >= 0) ? last_master
+		                                                        : read_vol_file();
 		                                              led_render_volume(sv < 0 ? vol : sv); }
 		else if (muted)                               led_render_muted(f);
 		else if (playing)                             led_render_party();

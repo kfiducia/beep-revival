@@ -117,11 +117,20 @@ to itself.
   look. With `nice -12` giving audio priority it's likely unnecessary; revisit only
   if playback still glitches under LED load.
 - **[open] Force S16 output** (half the sample width through swr+DMA) — endianness-risky, test on-device.
-- **[open] Volume push-back to the AirPlay sender UI.** On AP2, shairport monitors
-  `mixer_control_name` (our `Master`) and reports mixer changes back to the sender —
-  so knob→sender-UI is likely a small lift / mostly on-device verification (the new
-  200 ms settle-coalesce is the debounce it wants). AP1 push-back is the larger job
-  (needs the DACP/back-channel build that's absent — see AGENTS.md issue #7).
+- **[done] Sender/web volume → LED arc (Gap 2).** beepd only read
+  `/var/run/beep/volume` (written by knob/web, never the sender), so phone volume
+  changes moved the sound but not the LED. Now beepd reads the **real `Master`
+  softvol** via alsa-lib (`snd_mixer`, mapped 0..100 like `amixer -M`, event-driven —
+  no fork), so the arc reflects **every** source: knob, web, AND the AirPlay sender.
+  Verified on #2. `beepd` now `DEPENDS +alsa-lib` (already on the image via shairport,
+  so no size cost) and links `-lasound -lm`.
+- **[known limitation] Knob → AirPlay sender UI (Gap 1).** NOT feasible with stock
+  shairport 4.3.2: `audio_alsa.c` only *writes* the mixer (sender→receiver) and never
+  subscribes to external mixer events, and `dacp.c` sends only playback commands (no
+  outbound volume). AirPlay volume is sender-authoritative. Would need a substantial
+  shairport patch (mixer-event subscription + an outbound AP2 volume report of
+  uncertain protocol support) — folds into the same +back-channel rebuild as
+  AGENTS.md issue #7. Deferred, not chased.
 
 ### 1.6 Prior art / minimum hardware
 - Official shairport floor for AP2: **Pi 2 / Pi Zero 2 W** class (~1 GHz, hardware FP,
