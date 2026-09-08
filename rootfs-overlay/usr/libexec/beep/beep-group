@@ -30,12 +30,23 @@ sp_backend() {  # $1 = alsa|pipe
 
 svc() { /etc/init.d/"$1" "$2" >/dev/null 2>&1; }
 
+# Start/stop the AirPlay receiver per the uniform source switch (beep.sources.airplay,
+# default ON). Lets `beep-source airplay off` survive a role re-apply. Members never
+# receive AirPlay regardless, so they call svc directly instead of this.
+sp_apply() {
+	if [ "$(uci -q get beep.sources.airplay 2>/dev/null || echo 1)" = 0 ]; then
+		svc shairport-sync disable; svc shairport-sync stop
+	else
+		svc shairport-sync enable;  svc shairport-sync restart
+	fi
+}
+
 apply_solo() {
 	log "role=solo"
 	sp_backend alsa
 	svc snapclient disable; svc snapclient stop
 	svc snapserver disable; svc snapserver stop
-	svc shairport-sync enable; svc shairport-sync restart
+	sp_apply
 	rm -f "$RUNDIR/group" 2>/dev/null
 }
 
@@ -46,7 +57,7 @@ apply_primary() {
 	sp_backend pipe
 	svc snapserver enable;  svc snapserver restart
 	svc snapclient enable;  svc snapclient restart
-	svc shairport-sync enable; svc shairport-sync restart
+	sp_apply
 	echo primary > "$RUNDIR/group"
 }
 

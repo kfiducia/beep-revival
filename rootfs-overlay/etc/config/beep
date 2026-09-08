@@ -3,3 +3,10 @@ config main 'main'
 	option snapserver '127.0.0.1' # helper-box IP when role=client
 	option i2c_dev '/dev/i2c-0'
 	option ssh_mode 'off'         # SSH setting: off|on|temp; preserved across updates
+
+# Uniform per-source switches — one firmware carries every source; each runs (and
+# costs RAM/CPU) only when on. Toggle/inspect via `beep-source` (status|<src> on|off).
+# Snapcast is not a boolean here: it's governed by the group role (see beep-group);
+# `beep-source snapcast on|off` wraps member/solo. LMS lives in /etc/config/squeezelite.
+config sources 'sources'
+	option airplay '1'            # AirPlay-1 receiver (shairport-sync). Default ON.

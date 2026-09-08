@@ -20,6 +20,23 @@ players did.
 
 On-device marker: `cat /etc/beep-build-variant`.
 
+## Source control — one image, toggle per source
+
+Every source is baked into a single firmware and runs only when on (flash is the only
+always-on cost). One uniform switch:
+
+```sh
+beep-source status                 # airplay / snapcast / lms — enabled + running
+beep-source airplay on|off         # AirPlay receiver (shairport-sync)
+beep-source lms      on|off        # Lyrion / LMS player (squeezelite)
+beep-source snapcast on|off        # wraps the group role: on=join member, off=solo
+```
+
+Defaults: **AirPlay ON**, **Snapcast** governed by the group role (`solo` = off, the
+default — see `beep-group` for `primary`/`member`), **LMS OFF**. Each source keeps its
+natural config home so there's no duplicated state: `beep.sources.airplay`,
+`beep.main.group_role`, `squeezelite.options.enabled`.
+
 ## Why codecs were restricted (AR9331 = 400 MHz, big-endian, **no FPU**)
 
 - The squeezelite audio pipeline is **integer end-to-end**: internal samples are `s32_t`,
@@ -49,7 +66,7 @@ docker exec -d beep-build bash -lc 'cd /build/openwrt && env BEEP_DEV=1 SRC=/src
 
 ## Test on a Beep
 
-0. Enable it (OFF by default): `uci set squeezelite.options.enabled=1; uci commit squeezelite; /etc/init.d/squeezelite restart`
+0. Enable it (OFF by default): `beep-source lms on`   (check state any time with `beep-source status`)
 1. Run a Lyrion Music Server on the LAN.
 2. The Beep appears as a player (its hostname) in the LMS web UI / app.
 3. Play FLAC/MP3 → audio out; LED arc shows "playing".
