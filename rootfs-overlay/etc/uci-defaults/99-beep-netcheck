@@ -1,0 +1,15 @@
+#!/bin/sh
+# Enable the Wi-Fi self-heal watchdog (beep-netcheck) on first boot / factory reset.
+#
+# beep-netcheck ships as a rootfs-overlay init script, NOT a package — so unlike
+# packaged services (beepd, shairport, ...) it is NOT auto-enabled at image build,
+# and nothing else turned it on. The result: the watchdog never ran, and a fresh or
+# factory-reset unit never brought up its "BeepRevival-Setup" reconfig AP — leaving a
+# sealed, wifi-less device unreachable (no UART after deploy). This is the recovery-
+# critical service, so enable AND start it now (uci-defaults run late enough that
+# procd is up; starting here avoids waiting for the next reboot).
+if [ -x /etc/init.d/beep-netcheck ]; then
+	/etc/init.d/beep-netcheck enable 2>/dev/null
+	/etc/init.d/beep-netcheck start  2>/dev/null
+fi
+exit 0
