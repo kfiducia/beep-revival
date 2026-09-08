@@ -1,10 +1,11 @@
 #!/bin/sh /etc/rc.common
 # Prime the ALSA softvol "Master" control BEFORE shairport-sync starts. The WM8524
 # is a no-hardware-volume DAC, so /etc/asound.conf inserts a softvol plugin whose
-# "Master" mixer control is created LAZILY on first PCM open. shairport
-# (mixer_control_name=Master) and the knob (beep-action) both need it to exist at
-# startup, or shairport crash-loops. Opening the softvol PCM once creates it, and
-# it persists until reboot. START is low so this runs before shairport.
+# "Master" mixer control is created LAZILY on first PCM open. The knob (beep-action)
+# and web slider (rpcd) need it to exist at startup, so we prime it here. (shairport
+# no longer touches it — it runs ignore_volume_control and plays full-scale — but we
+# still open the softvol PCM early so the control is present for the knob path.)
+# Opening the softvol PCM once creates it, and it persists until reboot.
 START=44
 boot() {
 	# 1s of silence through the softvol PCM instantiates the "Master" control
