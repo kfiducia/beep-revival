@@ -271,6 +271,10 @@ CONFIG_TARGET_ath79_generic=y
 CONFIG_TARGET_ath79_generic_DEVICE_8dev_carambola2=y
 # our packages
 CONFIG_PACKAGE_beepd=y
+# replaynet: fresh multi-room sync engine (reimplements stock playnet, docs/REPLAYNET.md).
+# STEP (a) = PCM transport + wire framing only; built into the image so CI cross-checks
+# the mips_24kc/BE build, but NOT auto-started (no init.d) — orchestration is step (d).
+CONFIG_PACKAGE_replaynet=y
 CONFIG_PACKAGE_kmod-beep-i2s=y
 # audio: codec + machine glue + ALSA
 CONFIG_PACKAGE_kmod-sound-core=y
