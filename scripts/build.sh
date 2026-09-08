@@ -76,6 +76,7 @@ CONFIG_PACKAGE_dnsmasq=y
 # signed OTA: usign verifies the uploaded image against the baked-in pubkey
 CONFIG_PACKAGE_usign=y
 CONFIG_BUSYBOX_CONFIG_BASE64=y
+CONFIG_BUSYBOX_CONFIG_SETSID=y
 # explicitly OMIT everything heavy (audio / multiroom / rpcd / opkg): keeps the
 # initramfs lean-class for the flash slot AND the 64MB unpacked-RAM ceiling.
 # CONFIG_PACKAGE_beepd is not set
@@ -227,7 +228,13 @@ cp "$SRC/dts/ar9331_beep_dial.dts" "$DTS"
 sed -i 's/"beep,dial"/"8dev,carambola2"/' "$DTS"   # board_name match
 
 echo "== 3. bake in the rootfs overlay =="
-mkdir -p "$OW/files"
+# Start FRESH (rm before mkdir) — symmetric with the RECOVERY path. Without this, a
+# prior RECOVERY=1 build's overlay lingers in $OW/files (this container is reused for
+# back-to-back variant builds), and `cp -a` never deletes destination files absent
+# from the source. recovery-overlay/ has files with NO rootfs-overlay counterpart
+# (/etc/beep-recovery — which weakens beep-ota auth — and 99-recovery-ap), so they'd
+# silently ride into a subsequent production image. Wipe first so that can't happen.
+rm -rf "$OW/files"; mkdir -p "$OW/files"
 cp -a "$SRC/rootfs-overlay/." "$OW/files/"
 # dev builds keep SSH enabled (see 99-beep-ssh); shipping builds disable it
 if [ -n "${BEEP_DEV:-}" ]; then mkdir -p "$OW/files/etc"; touch "$OW/files/etc/beep-dev"
@@ -266,6 +273,10 @@ CONFIG_PACKAGE_devmem2=y
 # busybox base64 applet — the signed-OTA cgi base64-decodes the release signature
 # passed in the query string (uhttpd drops custom headers, so it can't ride in one).
 CONFIG_BUSYBOX_CONFIG_BASE64=y
+# busybox setsid applet — beep-ota detaches sysupgrade with setsid so a uhttpd CGI
+# teardown can't kill it mid-write. Without this applet the cgi silently falls back to
+# a plain background (the weaker old behavior), so select it explicitly.
+CONFIG_BUSYBOX_CONFIG_SETSID=y
 CFG
 
 # Extra userspace (AirPlay + web admin + dnsmasq) — FULL build only.

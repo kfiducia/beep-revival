@@ -32,8 +32,19 @@ fi
 # Rewrite the env sector with an idempotent marker var. libubootenv erases the whole
 # 64K sector and rewrites the 32K env, so the bootcount region (0x8000-0xFFFF) returns
 # to erased 0xFF = reset. Storing uptime-at-reset is harmless and aids debugging.
-if fw_setenv beep_lastgood "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)" 2>/dev/null; then
-	logger -t "$LOGT" "bootcount-reset: env rewritten — U-Boot bootcount cleared"
+val="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+if fw_setenv beep_lastgood "$val" 2>/dev/null; then
+	# Post-write readback. The env sector is a SINGLE un-mirrored copy, so a power loss
+	# mid-erase can corrupt it (brick-class). We can't prevent that until a redundant env
+	# lands with the repartition, but verify the write took AND beep_primary survived, and
+	# log loudly on mismatch so a corrupted env is caught early rather than at next boot.
+	rb="$(fw_printenv -n beep_lastgood 2>/dev/null || true)"
+	pri="$(fw_printenv -n beep_primary 2>/dev/null || true)"
+	if [ "$rb" = "$val" ] && [ "$pri" = "0x9f050000" ]; then
+		logger -t "$LOGT" "bootcount-reset: env rewritten + verified — U-Boot bootcount cleared"
+	else
+		logger -t "$LOGT" "bootcount-reset: WARNING readback mismatch after write (beep_lastgood='$rb' beep_primary='$pri') — env may be inconsistent"
+	fi
 else
 	logger -t "$LOGT" "bootcount-reset: fw_setenv failed — bootcount NOT cleared"
 fi
