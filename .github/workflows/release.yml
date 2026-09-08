@@ -83,7 +83,18 @@ jobs:
           set -e
           export FORCE_UNSAFE_CONFIGURE=1
           cd /build
-          [ -d openwrt ] || git clone --depth 1 -b v24.10.0 https://git.openwrt.org/openwrt/openwrt.git
+          # Restoring the cache re-creates /build/openwrt/{dl,staging_dir,build_dir},
+          # so a bare `[ -d openwrt ]` guard wrongly concludes "already cloned" and
+          # skips the clone — leaving scripts/feeds missing (exit 127). Detect a REAL
+          # checkout instead, and when cloning, clone into a temp dir and merge it over
+          # the cache-restored subdirs so the downloads/toolchain cache is preserved.
+          if [ ! -e openwrt/scripts/feeds ]; then
+            rm -rf /build/openwrt.src
+            git clone --depth 1 -b v24.10.0 https://git.openwrt.org/openwrt/openwrt.git /build/openwrt.src
+            mkdir -p openwrt
+            cp -a /build/openwrt.src/. openwrt/
+            rm -rf /build/openwrt.src
+          fi
           cd openwrt
           ./scripts/feeds update -a >/dev/null
           ./scripts/feeds install -a >/dev/null
