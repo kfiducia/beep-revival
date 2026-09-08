@@ -1,0 +1,63 @@
+Sign the AirPlay-1 "Apple-Response" with the private key on mbedTLS 3 (fixes iOS).
+
+Classic AirPlay-1 (RAOP) authenticates the receiver with an Apple-Challenge /
+Apple-Response exchange: the sender sends a 16-byte nonce and the receiver must
+return it -- concatenated with its own IP and device id -- SIGNED with the leaked
+"AirPort Express" RSA private key. The sender does the public-key operation and
+checks the nonce comes back intact.
+
+shairport-sync's mbedTLS path builds that response with mbedtls_rsa_pkcs1_encrypt().
+Under mbedTLS 2 the call passed MBEDTLS_RSA_PRIVATE, so it transformed with the
+PRIVATE key (a signature). mbedTLS 3 REMOVED that mode parameter and
+mbedtls_rsa_pkcs1_encrypt() now ALWAYS uses the PUBLIC key. OpenWrt's
+100-mbedtls3fix.patch adapted the call for the new prototype by simply dropping the
+mode argument -- which silently turned the signature into a public-key encryption.
+
+Consequence: the receiver returns response = payload^e (public) instead of
+payload^d (private). The sender's public-key verify then computes (payload^e)^e =
+garbage, so the Apple-Response no longer decodes to the challenge. Modern iOS
+(User-Agent AirPlay/960.x) VERIFIES the response, so it rejects it, loops the
+OPTIONS/Apple-Challenge handshake and never reaches ANNOUNCE -- classic AirPlay-1
+from an iPhone fails. macOS does not verify the response, so it still works:
+exactly the "iOS won't stream, macOS will" symptom seen on the big-endian AR9331.
+
+Proven on unit "beep-silver": RSA-verifying the on-wire Apple-Response yielded
+random bytes, but RSA-*decrypting* it (private op) recovered challenge||IPv6||
+deviceID exactly -- i.e. it had been public-key encrypted.
+
+Fix: in the mbedTLS-3 branch, do a real private-key operation on a hand-built
+PKCS#1 v1.5 type-1 padded block (00 01 FF..FF 00 M) via mbedtls_rsa_private() --
+the same bytes an OpenSSL build produces with EVP_PKEY_sign(RSA_PKCS1_PADDING),
+which is why OpenSSL builds never hit this. No new dependency; the mbedTLS-2 path
+is untouched. Upstreamable -- shairport-sync master carries the same latent bug on
+mbedTLS 3. Applies AFTER OpenWrt's 100-mbedtls3fix.patch (hence 110-).
+
+--- a/common.c
++++ b/common.c
+@@ -935,8 +935,24 @@ uint8_t *rsa_apply(uint8_t *input, int inlen, int *outlen, int mode) {
+     mbedtls_rsa_set_padding(trsa, MBEDTLS_RSA_PKCS_V15, MBEDTLS_MD_NONE);
+     outbuf = malloc(trsa->MBEDTLS_PRIVATE_V3_ONLY(len));
+ #if MBEDTLS_VERSION_MAJOR == 3
+-    rc = mbedtls_rsa_pkcs1_encrypt(trsa, mbedtls_ctr_drbg_random, &ctr_drbg,
+-                                   inlen, input, outbuf);
++    /* beep-revival: the AirPlay-1 "Apple-Response" must be SIGNED with the private
++       key. In mbedTLS 3, mbedtls_rsa_pkcs1_encrypt() always uses the PUBLIC key (the
++       mode argument that selected the private key in mbedTLS 2 was removed), so the
++       OpenWrt 100-mbedtls3fix port silently produced a public-key-encrypted response
++       that modern iOS rejects during the RTSP handshake (iOS verifies the signature;
++       macOS does not -- which is why only iOS failed). Sign a hand-built PKCS#1 v1.5
++       type-1 block with the private key instead. */
++    {
++      size_t rk = mbedtls_rsa_get_len(trsa);
++      size_t pslen = rk - inlen - 3;
++      unsigned char em[512];
++      em[0] = 0x00;
++      em[1] = 0x01;
++      memset(em + 2, 0xff, pslen);
++      em[2 + pslen] = 0x00;
++      memcpy(em + 3 + pslen, input, inlen);
++      rc = mbedtls_rsa_private(trsa, mbedtls_ctr_drbg_random, &ctr_drbg, em, outbuf);
++    }
+ #else
+     rc = mbedtls_rsa_pkcs1_encrypt(trsa, mbedtls_ctr_drbg_random, &ctr_drbg, MBEDTLS_RSA_PRIVATE,
+                                    inlen, input, outbuf);

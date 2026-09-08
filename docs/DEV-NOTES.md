@@ -143,7 +143,76 @@ to itself.
 
 ---
 
-## 2. Multi-room architecture (Snapcast)
+## 2. AirPlay-1 (classic RAOP): why iOS refused it — the mbedTLS-3 Apple-Response bug
+
+### 2.1 Symptom
+On the classic AirPlay-1 image, **iOS would not stream to the Beep; macOS would** — to
+the *same* unit, same network. The device was discoverable (it showed in the AirPlay
+list); the connection died mid-handshake. This is what originally motivated building
+AirPlay 2 (§1). It turns out AP1 was never fundamentally broken — one crypto call was.
+
+### 2.2 Root cause (found 2026-09-08, proven on `beep-silver`)
+Classic RAOP authenticates the receiver with an **Apple-Challenge / Apple-Response**:
+the sender sends a 16-byte nonce, the receiver returns `nonce || its-IP || its-id`
+**RSA-signed with the leaked "AirPort Express" private key**, and the sender verifies it
+with the matching public key.
+
+shairport-sync's mbedTLS path signs via `mbedtls_rsa_pkcs1_encrypt()`. Under mbedTLS 2
+the call passed `MBEDTLS_RSA_PRIVATE` → transform with the **private** key (a signature).
+**mbedTLS 3 removed that mode parameter and the function now always uses the PUBLIC key.**
+OpenWrt's `100-mbedtls3fix.patch` adapted the call for the new prototype by just dropping
+the mode arg — silently turning the signature into a **public-key encryption**.
+
+So the receiver sends `response = payload^e` (public) instead of `payload^d` (private).
+The sender's verify computes `(payload^e)^e` = garbage → the response no longer decodes
+to the challenge. **Modern iOS (`AirPlay/960.x`) verifies the response → rejects it, loops
+the OPTIONS/Apple-Challenge handshake, never reaches ANNOUNCE. macOS does not verify →
+still works.** Exactly the observed iOS-no/macOS-yes split, on the big-endian AR9331.
+
+### 2.3 Proof (decisive)
+Live `shairport-sync -vv` capture during an iOS attempt: handshake dies right after
+`OPTIONS` + `Apple-Challenge` → `Apple-Response` (200) → iOS immediately closes, retries,
+gives up. Then, offline, using the AirPort Express key pulled from the device binary:
+```
+RSA-VERIFY (public op) of the on-wire Apple-Response  -> random bytes, no PKCS#1 padding,
+                                                          challenge absent
+RSA-DECRYPT (private op) of the same response          -> recovers EXACTLY:
+   challenge(16) || fe80::c493:ff:fe02:7430 (IPv6,16) || deviceID 0798112E1172 (6)
+```
+Recovering the payload with the *private* key is only possible if it was *public*-key
+encrypted → confirms the inversion. Re-signing that payload the correct way (type-1 pad +
+private key, i.e. `openssl rsautl -sign`) produces a response that verifies back to the
+challenge — the iOS-acceptable form. (Not big-endian, not IPv6, not discovery — the IPv6
+address is embedded perfectly; purely public-vs-private key.)
+
+### 2.3.1 On-hardware confirmation (2026-09-08)
+Built the fix (classic mbedTLS image, iMac `beep-build`) and hot-ran the patched binary
+on unit `beep-silver`. A controlled `OPTIONS`+`Apple-Challenge` probe returns an
+`Apple-Response` that RSA-**verifies** (public op) straight back to `challenge ‖ IP ‖
+deviceID` — the iOS-acceptable form (the unpatched binary returned random bytes here). A
+live iPhone (`AirPlay/960.x`) then completed the full handshake — `ANNOUNCE → SETUP →
+RECORD → first frame` — and **played audio**, no XRUN/crash. Fix confirmed end-to-end.
+(Deployed from `/tmp` for the test; ships permanently via the full signed image.)
+
+### 2.4 Fix — `scripts/patches/110-ap1-apple-response-mbedtls3-sign.patch`
+In the mbedTLS-3 branch of `rsa_apply(RSA_MODE_AUTH)`, do a real private-key op on a
+hand-built PKCS#1 v1.5 **type-1** block (`00 01 FF..FF 00 M`) via `mbedtls_rsa_private()`
+— the same bytes an OpenSSL build makes with `EVP_PKEY_sign(RSA_PKCS1_PADDING)`, which is
+why OpenSSL builds never hit this. ~15 lines, no new dependency, mbedTLS-2 path untouched.
+Applies **after** OpenWrt's `100-mbedtls3fix.patch` (hence `110-`). Upstreamable — current
+shairport-sync master carries the same latent bug on mbedTLS 3. **No version bump fixes it:
+4.3.7 and 5.5.1 both public-encrypt on mbedTLS 3.** (Working third-party AP1 receivers
+avoid it by building against OpenSSL or mbedTLS 2.)
+
+### 2.5 Why this matters
+Reviving classic AP1 (lossless ALAC, ~10× lighter than AP2 AAC on this core) makes the
+self-contained Snapcast multi-room in §3 actually fit the CPU budget — and means the AP1
+blocker that drove the whole AP2 effort was a small fixable crypto bug, not iOS abandoning
+RAOP.
+
+---
+
+## 3. Multi-room architecture (Snapcast)
 
 **Requirement:** two Beeps must play in sample-accurate sync. **AirPlay-2 grouping is
 out** (needs buffered AAC on every speaker → §1.1 wall). **AirPlay-1 has no grouping.**
@@ -175,7 +244,7 @@ Builds `snapserver` (756 KB) + `snapclient` (242 KB) for mips_24kc BE.
 
 ---
 
-## 3. Build environment — the saga, root causes, and the rules that fix it
+## 4. Build environment — the saga, root causes, and the rules that fix it
 
 This section exists because a **single mistake (running two builds in one tree)** snowballed
 into ~hours of failures. Every failure below was self-inflicted and is now prevented.
@@ -209,7 +278,7 @@ honors `OW=` / `SRC=` / `JOBS=` overrides.
 
 ---
 
-## 4. Open items
+## 5. Open items
 - [ ] Flash multi-room image to unit #1; verify classic AirPlay-1 (low CPU) + 2-Beep sync.
 - [x] Locate the AAC decode file in shairport-sync **4.3.2** — it's in **`rtp.c`** (not
       `player.c` as master is), the `avcodec_find_decoder(AV_CODEC_ID_AAC)` at ~2269.

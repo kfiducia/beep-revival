@@ -40,6 +40,13 @@ git -C "$OW/feeds/packages" checkout -- sound/shairport-sync/Makefile multimedia
 # The patch compiles out on little-endian hosts, so it's harmless everywhere else.
 mkdir -p "$SPP"
 cp "$SRC/scripts/patches/030-pipe-output-little-endian.patch" "$SPP/" 2>/dev/null || true
+# Universal (both modes): make the AirPlay-1 Apple-Response a real private-key SIGNATURE
+# again. OpenWrt's 100-mbedtls3fix.patch ports the mbedTLS call to v3 by dropping the
+# MBEDTLS_RSA_PRIVATE mode arg, which silently switches it to a PUBLIC-key encrypt — so
+# modern iOS rejects the classic RAOP handshake (macOS, which doesn't verify, still works).
+# Applies AFTER 100- (hence 110-); restores signing via mbedtls_rsa_private. See the patch
+# header + docs/DEV-NOTES.md for the on-device proof.
+cp "$SRC/scripts/patches/110-ap1-apple-response-mbedtls3-sign.patch" "$SPP/" 2>/dev/null || true
 # Give shairport a scheduling edge on the single-core AR9331 so the LED bit-banged-i2c
 # churn / SSH / knob->amixer forks can't starve the audio thread and XRUN playback
 # (measured: AP2 AAC decode leaves only ~45% idle, and concurrent load glitches it).
