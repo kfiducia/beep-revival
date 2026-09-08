@@ -276,7 +276,11 @@ even a bug here couldn't explain a pre-`SETRATEANCHORTIME` stall. None found reg
    `streams != NULL` branch required decrypting SETUP #2 and encrypting the SETUP #1 response.
 
 ### Suggested patch ordering
-Apply Finding 1 as `030-nqptp-bigendian-ntoh64.patch` (self-contained, harmless, removes a latent
+**Status:** Finding 1 is now shipped as `scripts/patches/040-nqptp-bigendian-ntoh64.patch`
+(number 030 was already taken by the pipe-output patch), wired into `build.sh`'s `AIRPLAY2=1`
+path and verified to apply cleanly against the pinned nqptp 1.2.4 source.
+
+Apply Finding 1 as `040-nqptp-bigendian-ntoh64.patch` (self-contained, harmless, removes a latent
 BE bug). Then use probes #1 and #2 to locate the real post-SETUP stall before writing any further
 firmware patch — the evidence points away from cipher/framing and toward either a BE `libplist`
 build or an audio-path failure, neither of which is a shairport/nqptp source endian bug.

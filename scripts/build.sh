@@ -64,6 +64,15 @@ if [ -n "${AIRPLAY2:-}" ]; then
   # Fixed-point AAC decode: select ffmpeg's aac_fixed (integer S32P) instead of the
   # float decoder so AAC-LC decode fits the 400MHz no-FPU core. See docs/DEV-NOTES.md §1.
   cp "$SRC/scripts/patches/020-aac-fixed-decode.patch" "$SPP/" 2>/dev/null || true
+  # nqptp PTP timing (BIG-ENDIAN): fix ntoh64() transposing the 64-bit PTP
+  # correctionField on BE (nqptp's hand-rolled swap is LE-only). Latent on a flat
+  # single-switch subnet (correctionField is 0 there) but a real BE correctness bug
+  # in the AP2 timing path. See docs/BE-AP2-AUDIT.md Finding 1 / docs/DEV-NOTES.md §1.
+  NQP="$OW/feeds/packages/net/nqptp/patches"
+  mkdir -p "$NQP"
+  cp "$SRC/scripts/patches/040-nqptp-bigendian-ntoh64.patch" "$NQP/" 2>/dev/null || true
+  # new patch → force nqptp re-prepare so the patch is actually applied
+  make package/feeds/packages/nqptp/clean >/dev/null 2>&1 || true
   # Force a clean ffmpeg restage so the swresample InstallDev fix actually takes —
   # stale staged libav* from a prior variant can otherwise leave libswresample missing.
   make package/feeds/packages/ffmpeg/dirclean >/dev/null 2>&1 || true
@@ -88,6 +97,8 @@ else
   fi
   # the AP2 crypto patch targets pair_ap (not compiled in a classic build) — keep it out
   rm -f "$SPP/010-airplay2-bigendian-pairing.patch" 2>/dev/null || true
+  # nqptp isn't built in the classic image (dep stripped above) — keep its patch out too
+  rm -f "$OW/feeds/packages/net/nqptp/patches/040-nqptp-bigendian-ntoh64.patch" 2>/dev/null || true
 fi
 # Makefile/source changed → force a clean shairport rebuild so the mode switch takes
 make package/feeds/packages/shairport-sync/clean >/dev/null 2>&1 || true

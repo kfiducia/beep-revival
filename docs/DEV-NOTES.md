@@ -157,7 +157,22 @@ honors `OW=` / `SRC=` / `JOBS=` overrides.
 
 ## 4. Open items
 - [ ] Flash multi-room image to unit #1; verify classic AirPlay-1 (low CPU) + 2-Beep sync.
-- [ ] Locate the AAC decode file in shairport-sync **4.3.2** (not player.c); write the
-      `aac_fixed` 3-edit patch (§1.5); build `AIRPLAY2=1` image; real AirPlay-2 test.
+- [x] Locate the AAC decode file in shairport-sync **4.3.2** — it's in **`rtp.c`** (not
+      `player.c` as master is), the `avcodec_find_decoder(AV_CODEC_ID_AAC)` at ~2269.
+- [x] Write the `aac_fixed` decode patch (§1.5) → `scripts/patches/020-aac-fixed-decode.patch`.
+      Verified: applies clean to real 4.3.2, and `codec->sample_fmts[0]` is valid API in the
+      ffmpeg **6.1.4** OpenWrt 24.10 ships (deprecated in 7.0, not removed until later) and is
+      `S32P` for aac_fixed / `FLTP` for the float fallback, so swr is configured correctly in
+      both cases. `build.sh` builds ffmpeg with `--enable-decoder=aac,aac_fixed --enable-parser=aac`.
+- [x] Fix the BE `ntoh64` PTP correctionField bug (audit Finding 1) →
+      `scripts/patches/040-nqptp-bigendian-ntoh64.patch`, wired into `build.sh` (`AIRPLAY2=1`).
+      Endian-agnostic rewrite (assembles from raw bytes like `nctoh64`); no-op on LE. Verified
+      against pinned nqptp **1.2.4**.
+- [ ] **On-device AP2 test (the ballgame):** build `AIRPLAY2=1`, flash unit #1, run
+      `scripts/ap2-bench.sh` during a live Apple-Music session. PASS = PCM stays RUNNING with
+      idle headroom (fixed-point works); FAIL = still XRUNs → next CPU levers in the script's
+      verdict (force S16 output, verify SCHED_FIFO, throttle LED churn). Blocked on the Proxmox
+      build host key unlock. Keep the sysupgrade image ~10 MB.
 - [ ] Recovery slot (initramfs into freed flash; `beep_recovery` slot).
-- [ ] Consider upstreaming the big-endian pair_ap patch and the `aac_fixed` decode option.
+- [ ] Consider upstreaming the big-endian pair_ap patch, the `aac_fixed` decode option, and the
+      `ntoh64` BE fix (all three are correct on LE too, so upstreamable as-is).

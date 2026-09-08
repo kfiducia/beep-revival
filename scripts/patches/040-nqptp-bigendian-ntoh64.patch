@@ -1,0 +1,57 @@
+Fix ntoh64() double-swapping the PTP correctionField on big-endian (nqptp 1.2.4).
+
+nqptp reads the IEEE-1588 64-bit correctionField out of a packed struct that
+overlays the receive buffer, then passes it through a hand-rolled ntoh64(). That
+function was written for a little-endian host: it byte-swaps each 32-bit half
+with ntohl() (a no-op on big-endian) and then RE-ASSEMBLES them as
+(low<<32)|high. On a big-endian host the whole-uint64 read is already the
+correct value, so a correct ntoh64 must be the identity -- instead it transposes
+the two 32-bit halves and corrupts the field.
+
+Consequence: when the correctionField is non-zero, handle_follow_up() computes
+correctedPreciseOriginTimestamp = preciseOriginTimestamp + correction with a
+garbage correction, so the clock offset is nonsense and PTP never converges.
+On a flat single-switch subnet the grandmaster's correctionField is normally 0
+(and ntoh64(0)==0 either way), so this is latent there -- but it is a real BE
+correctness bug in the AirPlay-2 timing path and is removed here so it cannot
+bite on a network with transparent-clock switches / boundary clocks / a HomePod
+grandmaster reporting residence time.
+
+The rewrite assembles the value from its raw memory bytes in network
+(big-endian) order -- the same idiom nqptp's own nctoh64() already uses -- so it
+is correct on BOTH little- and big-endian hosts. It produces output identical to
+the original on little-endian (no behavior change on upstream's usual targets),
+so it is safe to carry downstream and is upstreamable as-is.
+
+--- a/general-utilities.c
++++ b/general-utilities.c
+@@ -58,16 +58,19 @@
+ }
+ 
+ uint64_t ntoh64(const uint64_t n) {
+-  uint64_t fiddle = n;
+-  uint32_t fiddle_hi = fiddle & 0xFFFFFFFF;
+-  fiddle_hi = ntohl(fiddle_hi);
+-  fiddle = fiddle >> 32;
+-  uint32_t fiddle_lo = fiddle & 0xFFFFFFFF;
+-  fiddle_lo = ntohl(fiddle_lo);
+-  fiddle = fiddle_hi;
+-  fiddle = fiddle << 32;
+-  fiddle = fiddle | fiddle_lo;
+-  return fiddle;
++  /* beep-revival: endian-agnostic. The argument holds the 8 wire bytes as read
++     from a packed struct (i.e. a host-order interpretation of big-endian wire
++     data). Reconstruct the value from its raw bytes in network (big-endian)
++     order so this is correct on both little- and big-endian hosts -- the same
++     idiom as the already-correct nctoh64(). The previous implementation was
++     hard-coded for little-endian and transposed the two 32-bit halves on
++     big-endian, corrupting the PTP correctionField. */
++  uint8_t b[8];
++  memcpy(b, &n, sizeof(b));
++  uint64_t v = 0;
++  for (int i = 0; i < 8; i++)
++    v = (v << 8) | b[i];
++  return v;
+ }
+ 
+ uint64_t timespec_to_ns(struct timespec *tn) {
