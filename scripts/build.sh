@@ -75,6 +75,9 @@ CONFIG_PACKAGE_dnsmasq=y
 # CONFIG_PACKAGE_iwinfo is not set
 # signed OTA: usign verifies the uploaded image against the baked-in pubkey
 CONFIG_PACKAGE_usign=y
+# BUSYBOX_CUSTOM=y is required for the base64 applet override to take effect (GitHub
+# #26) — the recovery cgi also base64-decodes the signature, so recovery needs it too.
+CONFIG_BUSYBOX_CUSTOM=y
 CONFIG_BUSYBOX_CONFIG_BASE64=y
 CONFIG_BUSYBOX_CONFIG_SETSID=y
 # explicitly OMIT everything heavy (audio / multiroom / rpcd / opkg): keeps the
@@ -287,6 +290,14 @@ CONFIG_PACKAGE_uboot-envtools=y
 # devmem2 for live MBOX/stereo register peeking (busybox devmem also present)
 CONFIG_PACKAGE_lrzsz=y
 CONFIG_PACKAGE_devmem2=y
+# CRITICAL: BUSYBOX_CUSTOM=y is the PREREQUISITE for the CONFIG_BUSYBOX_CONFIG_* overrides
+# below to take effect — without it `make defconfig` ignores them and the applet is NOT
+# built. base64 is not a default busybox applet, so before this the signed-OTA cgi's
+# `base64 -d` was missing and every signed upload failed with "bad signature encoding"
+# (GitHub #26). Enabling CUSTOM materializes OpenWrt's curated default applet set
+# (verified: nothing lost) plus our base64. (setsid IS a default applet — it shipped
+# regardless — but keep it explicit now that CUSTOM makes the override real.)
+CONFIG_BUSYBOX_CUSTOM=y
 # busybox base64 applet — the signed-OTA cgi base64-decodes the release signature
 # passed in the query string (uhttpd drops custom headers, so it can't ride in one).
 CONFIG_BUSYBOX_CONFIG_BASE64=y
