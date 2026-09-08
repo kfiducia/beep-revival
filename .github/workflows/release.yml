@@ -1,9 +1,11 @@
 name: Release
 
 # Cut a signed Beep Revival firmware release. Push a tag like `v1.0.0` (or run
-# manually), and this builds the shippable image on a GitHub-hosted runner,
-# signs the sysupgrade with the usign OTA key (repo secret BEEP_OTA_SEC), and
-# publishes a GitHub Release with the signed .bin + raw images + checksums + pubkey.
+# manually), and this builds BOTH shippable images on a GitHub-hosted runner —
+# AP1 (AirPlay-1 + Snapcast, the default) and AP2 (AirPlay-2, no Snapcast) — signs
+# each sysupgrade with the usign OTA key (repo secret BEEP_OTA_SEC), and publishes a
+# GitHub Release with both signed .bins + raw images + a first-flash initramfs +
+# checksums + pubkey.
 #
 # One-time setup: add the private OTA key as a repo secret named BEEP_OTA_SEC
 #   gh secret set BEEP_OTA_SEC < ~/beep-ota-signing/beep-ota.sec
@@ -29,7 +31,7 @@ concurrency:
 jobs:
   build-sign-release:
     runs-on: ubuntu-latest
-    timeout-minutes: 180   # first run builds the toolchain from source (~45-90 min)
+    timeout-minutes: 300   # two full image builds; first run also builds the toolchain (~45-90 min)
     steps:
       - name: Reclaim runner disk (OpenWrt build needs ~25 GB)
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
@@ -97,20 +99,29 @@ jobs:
       - name: Stamp firmware version
         run: echo "Beep Revival ${{ steps.ver.outputs.version }}" > rootfs-overlay/etc/beep-version
 
-      - name: Build shippable image (AirPlay-1 + Snapcast, SSH OFF — no BEEP_DEV)
-        run: |
-          export OW=/build/openwrt SRC="$GITHUB_WORKSPACE"
-          bash "$SRC/scripts/build.sh"
-
-      - name: Collect images
+      - name: Build both images (AP1 default + AP2); collect each before the next overwrites
         id: img
         run: |
+          export OW=/build/openwrt SRC="$GITHUB_WORKSPACE"
           OUT=/build/openwrt/bin/targets/ath79/generic
-          SYS=$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)
-          INI=$(ls "$OUT"/*8dev_carambola2-initramfs-kernel.bin)
-          echo "sysupgrade=$SYS" >> "$GITHUB_OUTPUT"
-          echo "initramfs=$INI"  >> "$GITHUB_OUTPUT"
-          ls -la "$OUT"/*8dev_carambola2*.bin
+          V="${{ steps.ver.outputs.version }}"
+          mkdir -p /tmp/collected
+          # build.sh writes a FRESH .config and restores the shairport/ffmpeg Makefiles
+          # to pristine on every run, so these two builds don't leak into each other.
+          echo "::group::AP1 build (AirPlay-1 + Snapcast, SSH OFF — no BEEP_DEV)"
+          bash "$SRC/scripts/build.sh"
+          echo "::endgroup::"
+          cp "$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)" "/tmp/collected/beep-revival-${V}-ap1-sysupgrade.bin"
+          # ship one initramfs (from the default build) for the first-time UART RAM-boot
+          cp "$(ls "$OUT"/*8dev_carambola2-initramfs-kernel.bin)"    "/tmp/collected/beep-revival-${V}-initramfs-kernel.bin"
+          echo "::group::AP2 build (AirPlay-2, no Snapcast)"
+          AIRPLAY2=1 bash "$SRC/scripts/build.sh"
+          echo "::endgroup::"
+          cp "$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)" "/tmp/collected/beep-revival-${V}-ap2-sysupgrade.bin"
+          echo "ap1=/tmp/collected/beep-revival-${V}-ap1-sysupgrade.bin" >> "$GITHUB_OUTPUT"
+          echo "ap2=/tmp/collected/beep-revival-${V}-ap2-sysupgrade.bin" >> "$GITHUB_OUTPUT"
+          echo "initramfs=/tmp/collected/beep-revival-${V}-initramfs-kernel.bin" >> "$GITHUB_OUTPUT"
+          ls -la /tmp/collected/
 
       - name: Build usign (matches the baked-in key format)
         run: |
@@ -119,21 +130,23 @@ jobs:
           make -C /tmp/usign/build >/dev/null
           /tmp/usign/build/usign -h 2>&1 | head -1 || true
 
-      - name: Sign the sysupgrade image
+      - name: Sign both sysupgrade images
         env:
           BEEP_OTA_SEC: ${{ secrets.BEEP_OTA_SEC }}
         run: |
           [ -n "$BEEP_OTA_SEC" ] || { echo "::error::secret BEEP_OTA_SEC is not set"; exit 1; }
           umask 077; printf '%s\n' "$BEEP_OTA_SEC" > /tmp/beep-ota.sec
           V="${{ steps.ver.outputs.version }}"
-          USIGN=/tmp/usign/build/usign bash scripts/sign-release.sh \
-            "${{ steps.img.outputs.sysupgrade }}" /tmp/beep-ota.sec \
-            "/tmp/beep-revival-${V}-sysupgrade.signed.bin"
-          # verify our own signature against the public key that's baked into the image
-          /tmp/usign/build/usign -V -m "${{ steps.img.outputs.sysupgrade }}" \
-            -p rootfs-overlay/etc/beep-ota.pub \
-            -x <(head -2 "/tmp/beep-revival-${V}-sysupgrade.signed.bin") \
-            && echo "signature verifies against baked-in pubkey"
+          for variant in ap1 ap2; do
+            RAW="/tmp/collected/beep-revival-${V}-${variant}-sysupgrade.bin"
+            SIGNED="/tmp/collected/beep-revival-${V}-${variant}-sysupgrade.signed.bin"
+            USIGN=/tmp/usign/build/usign bash scripts/sign-release.sh "$RAW" /tmp/beep-ota.sec "$SIGNED"
+            # verify our own signature against the public key baked into the image
+            /tmp/usign/build/usign -V -m "$RAW" \
+              -p rootfs-overlay/etc/beep-ota.pub \
+              -x <(head -2 "$SIGNED") \
+              && echo "$variant: signature verifies against baked-in pubkey"
+          done
           shred -u /tmp/beep-ota.sec
 
       - name: Assemble release assets + checksums
@@ -141,9 +154,11 @@ jobs:
         run: |
           V="${{ steps.ver.outputs.version }}"
           mkdir -p release
-          cp "${{ steps.img.outputs.sysupgrade }}" "release/beep-revival-${V}-sysupgrade.bin"
-          cp "${{ steps.img.outputs.initramfs }}"  "release/beep-revival-${V}-initramfs-kernel.bin"
-          cp "/tmp/beep-revival-${V}-sysupgrade.signed.bin" release/
+          cp /tmp/collected/beep-revival-${V}-ap1-sysupgrade.bin        release/
+          cp /tmp/collected/beep-revival-${V}-ap1-sysupgrade.signed.bin release/
+          cp /tmp/collected/beep-revival-${V}-ap2-sysupgrade.bin        release/
+          cp /tmp/collected/beep-revival-${V}-ap2-sysupgrade.signed.bin release/
+          cp /tmp/collected/beep-revival-${V}-initramfs-kernel.bin      release/
           cp rootfs-overlay/etc/beep-ota.pub release/beep-ota.pub
           ( cd release && sha256sum * > SHA256SUMS )
           ls -la release/
@@ -161,15 +176,34 @@ jobs:
 
             Open OpenWrt-based firmware for the orphaned Beep "Dial" speaker (AR9331 / Carambola 2).
 
+            ### Pick your image — AP1 (default) or AP2
+            Two flavors ship each release; both accept an iPhone and both are signed.
+            Switch flavors any time by flashing the other image — no re-provisioning.
+
+            | Feature | `*-ap1-*` (default) | `*-ap2-*` |
+            |---|---|---|
+            | AirPlay from iPhone / iPad / Mac | ✅ | ✅ |
+            | AirPlay protocol | AirPlay-1 (RAOP) | AirPlay-2 (also accepts AirPlay-1 senders) |
+            | Audio codec | ALAC — **lossless** | AAC 256k — lossy |
+            | **Snapcast** synced multi-room | ✅ (our multi-room) | ❌ (dropped for size) |
+            | Native AirPlay-2 multi-room grouping | ❌ | ✅ (CPU-marginal) |
+            | Apple **Home** app (tiles, Siri, automations, stereo-pair) | ❌ | ✅ |
+            | CPU headroom on the AR9331 | comfortable | **thin** — can glitch under load |
+            | Knob / web volume, Wi-Fi setup AP, signed OTA, recovery | ✅ | ✅ |
+            | Recommended for | **most users** | only if you want Home-app integration |
+
+            **Recommendation:** flash **`*-ap1-sysupgrade.signed.bin`** unless you specifically
+            need the Apple Home app — AP1 is lossless, lighter, and keeps Snapcast multi-room.
+
             ### Install (already on Beep Revival)
-            In the device's web admin → **Update firmware**, upload the single
+            In the device's web admin → **Update firmware**, upload your chosen
             **`*-sysupgrade.signed.bin`**. The device verifies the usign signature
             against its baked-in key before flashing. No unsigned bypass without the
             physical triple-tap.
 
             ### First-time flash (still on stock/cloud firmware)
             You need a 3.3 V USB-UART adapter. Follow **[docs/FLASHING-WALKTHROUGH.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/FLASHING-WALKTHROUGH.md)**.
-            Use the raw `*-sysupgrade.bin`.
+            RAM-boot the `*-initramfs-kernel.bin`, then sysupgrade the `*-ap1-sysupgrade.bin` (or ap2).
 
             ### Verify a download
             `usign -V -m <image> -p beep-ota.pub -x <(head -2 *.signed.bin)` — or check `SHA256SUMS`.
