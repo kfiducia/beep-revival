@@ -146,28 +146,12 @@ into ~hours of failures. Every failure below was self-inflicted and is now preve
 7. macOS Docker Desktop's VM filesystem also contributes non-determinism under heavy
    parallel build I/O — another reason to prefer a **native-Linux** build host.
 
-### 3.2 The durable build host (use this going forward)
-Build on a **native-Linux host** — an unprivileged **Ubuntu 22.04 LXC/VM** works well
-(≈6 cores / 24 GB RAM / 60 GB disk, nesting on if it's a container).
-- Use a **non-root build user** (so `FORCE_UNSAFE_CONFIGURE` isn't even needed).
-- Keep an OpenWrt v24.10.0 clone and this repo checked out beside it; point `build.sh`
-  at them with its `OW=` / `SRC=` overrides (or symlink `/build` and `/src` to match the
-  defaults).
-- Run builds as a **systemd transient unit** so they survive ssh disconnects:
-  `systemd-run --unit=beep-img --uid=build --gid=build --setenv=HOME=<build-home> \`
-  `  --setenv=BEEP_DEV=1 --working-directory=<openwrt-dir> /bin/bash /src/scripts/build.sh`
-  (logs: `journalctl -u beep-img`).
-- Native x86_64 Linux with a consistent glibc avoids all of the macOS/Docker issues above.
-  It built the whole toolchain (gcc/final at `-j6`, zero races) + the multi-room image
-  cleanly. **Preferred host for all future builds.** k3s was considered and rejected —
-  buildroot is one long single job wanting a full FS + lots of disk, an LXC/VM workload,
-  not a k8s pod.
-
-### 3.3 Result
-Multi-room image built clean on the CT: **10.3 MB** sysupgrade
-(`openwrt-ath79-generic-8dev_carambola2-squashfs-sysupgrade.bin`,
-md5 `f98875c72634a2af094ae6ada80b7e1d`), staged for flashing unit #1. Only failure in the
-whole image was snapcast's one-line `<cstdint>` (§2), now fixed.
+### 3.2 Result
+A clean multi-room image builds at ~**10.3 MB** sysupgrade
+(`openwrt-ath79-generic-8dev_carambola2-squashfs-sysupgrade.bin`) — well within the flash
+budget. The only image-level failure was snapcast's one-line `<cstdint>` (§2), now fixed.
+Build on any native-Linux host (Ubuntu 22.04 builds 24.10 cleanly, per rule 6); `build.sh`
+honors `OW=` / `SRC=` / `JOBS=` overrides.
 
 ---
 
