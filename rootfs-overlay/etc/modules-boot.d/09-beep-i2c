@@ -1,0 +1,12 @@
+# EXPERIMENTAL (spike): load the i2c stack during PREINIT, not the usual init stage,
+# so the STM8 ring can be driven at the earliest boot states (the `preinit`/config-
+# restore window where the 2026-09-08 brick hung). Without this, /dev/i2c-0 does not
+# exist until procd loads modules from /etc/modules.d, which is AFTER preinit — so
+# led-stage would no-op through the exact stage we most want to see.
+#
+# ⚠️ Needs bench confirmation: driving a bit-banged i2c bus this early must not
+# destabilize early boot. If it does, delete this file — the rest of the feature
+# (upgrade indication, post-init milestones) still works with modules at their
+# normal stage.
+i2c-gpio
+i2c-dev

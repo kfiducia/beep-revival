@@ -1,0 +1,67 @@
+#!/bin/sh
+# led-stage <stage> — paint one static boot-progress frame on the STM8 ring.
+#
+# Why this exists: the light ring is driven by the STM8L151 MCU (i2c addr 0x23 on
+# the bit-banged i2c-gpio bus, /dev/i2c-0), and our firmware only takes the ring
+# over once `beepd` starts (init START=95 — effectively "boot done"). So today a
+# hang anywhere before that (e.g. the 2026-09-08 first-boot config-restore brick)
+# is invisible: the ring just holds the STM8's own power-on "smiley". This helper
+# lets the earlier boot stages paint a coarse progress arc so a stall is VISIBLE —
+# a partly-filled ring that never advances tells you which stage hung.
+#
+# It writes the same 25-byte frame beepd does: reg 0x80 <- [led_1..led_24, ack].
+# ack=0x00 (we are NOT requesting an input frame; beepd owns polling once it runs).
+# Single color, linear brightness (the STM8 applies no gamma — matches beepd).
+#
+# SAFE BY DESIGN: a no-op unless the bus is actually up. Very early in preinit the
+# i2c-gpio / i2c-dev modules may not be loaded yet, so /dev/i2c-0 won't exist — we
+# just exit 0. Never blocks or fails boot. Only drive the ring at stages where
+# beepd is NOT running (early boot, and during `upgrade` when services are down),
+# so we never fight beepd for the bus.
+BUS=0
+DEV="/dev/i2c-${BUS}"
+ADDR=0x23
+REG=0x80
+NLED=24
+ROT=11          # physical->wire rotation: wire[i] = phys[(i+11) % 24] (from beepd.c)
+
+command -v i2ctransfer >/dev/null 2>&1 || exit 0
+[ -e "$DEV" ] || exit 0
+
+warn=""
+case "$1" in
+	early)    n=4;  v=40 ;;   # kernel + modules alive (earliest reachable)
+	config)   n=8;  v=40 ;;   # rootfs mounted / config restore in progress
+	network)  n=16; v=60 ;;   # network is up
+	ready)    n=24; v=60 ;;   # services healthy — brief; beepd takes over
+	upgrade)  n=24; v=90 ;;   # FLASHING — do not power off
+	failsafe) n=0;  v=30; warn=1 ;;   # alternating warning ring
+	off)      n=0;  v=0  ;;
+	*)        exit 0 ;;
+esac
+
+# Build the physical LED array (space-separated decimals), then rotate to wire order.
+i=0; phys=""
+while [ "$i" -lt "$NLED" ]; do
+	if [ -n "$warn" ]; then
+		[ $((i % 2)) -eq 0 ] && phys="$phys $v" || phys="$phys 0"
+	else
+		[ "$i" -lt "$n" ] && phys="$phys $v" || phys="$phys 0"
+	fi
+	i=$((i + 1))
+done
+# shellcheck disable=SC2086
+set -- $phys
+
+wire=""; i=0
+while [ "$i" -lt "$NLED" ]; do
+	idx=$(( (i + ROT) % NLED + 1 ))
+	eval "b=\${$idx}"
+	wire="$wire $(printf '0x%02x' "$b")"
+	i=$((i + 1))
+done
+
+# reg + 24 LEDs + 1 ack = 26 bytes in one write.
+# shellcheck disable=SC2086
+i2ctransfer -y "$BUS" "w$((NLED + 2))@${ADDR}" "$REG" $wire 0x00 >/dev/null 2>&1 || true
+exit 0
