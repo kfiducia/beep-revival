@@ -190,8 +190,13 @@ set_lms() {
 	uci -q set squeezelite.options.enabled="$en"
 	uci -q set squeezelite.options.server_addr="$srv"
 	uci -q commit squeezelite
-	/etc/init.d/squeezelite enable  2>/dev/null
-	/etc/init.d/squeezelite restart >/dev/null 2>&1
+	if [ "$en" = 1 ]; then
+		/etc/init.d/squeezelite enable  2>/dev/null
+		/etc/init.d/squeezelite restart >/dev/null 2>&1
+	else
+		/etc/init.d/squeezelite stop    2>/dev/null   # actually stop the player…
+		/etc/init.d/squeezelite disable 2>/dev/null   # …and don't respawn it on reboot
+	fi
 	echo "{\"ok\":true,\"enabled\":$en}"
 }
 
