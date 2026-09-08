@@ -37,7 +37,10 @@ set_net connecting   # we come up trying to associate
 # On boot with a configured STA, give the first (cold) association the same
 # protected window the portal switch gets — a cold associate + DHCP on this SoC
 # can outlast the base grace, and there's no set_wifi involved to drop the marker.
-[ -n "$(uci -q get wireless.@wifi-iface[0].ssid)" ] && {
+# Gate on mode=sta (a real provisioned client): OpenWrt's auto-generated default is
+# mode=ap ssid='OpenWrt', so keying off a non-empty ssid falsely armed this for a
+# fresh, unconfigured unit.
+[ "$(uci -q get wireless.@wifi-iface[0].mode)" = sta ] && {
 	mkdir -p /var/run/beep 2>/dev/null
 	echo "$(( $(cut -d. -f1 /proc/uptime) + 90 ))" > /var/run/beep/joining; }
 sleep 25       # let wifi + DHCP settle after boot before judging
@@ -51,9 +54,14 @@ while :; do
 			uci -q set beep.main.ssh_mode=off; uci -q delete beep.main.ssh_expires; uci -q commit beep
 			logger -t beep "ssh: temporary window expired -> disabled"; };; esac
 	fi
-	ssid="$(uci -q get wireless.@wifi-iface[0].ssid)"
-	if [ -z "$ssid" ]; then
-		ap_up || /usr/libexec/beep/wifi-setup-enable    # never configured -> setup
+	# "Provisioned" == a real client STA. set_wifi (the portal join) sets iface[0]
+	# mode=sta/network=wwan; a fresh/factory-reset unit instead carries OpenWrt's
+	# auto-generated placeholder (mode=ap, ssid='OpenWrt'). The old `[ -z ssid ]`
+	# test saw that non-empty 'OpenWrt' and NEVER took the setup branch, so a sealed
+	# fresh unit never raised its reconfig AP. Key off mode=sta instead.
+	mode="$(uci -q get wireless.@wifi-iface[0].mode)"
+	if [ "$mode" != sta ]; then
+		ap_up || /usr/libexec/beep/wifi-setup-enable    # no client STA -> (fresh/reset) setup AP
 		sleep 15; continue
 	fi
 	if sta_ok; then
