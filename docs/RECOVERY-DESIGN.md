@@ -161,8 +161,13 @@ verified `/etc/fw_env.config`, treat a lost env as a brick risk) is binding.
    `touch /etc/beep-fwenv-verified`. Honest scope: this is defense-in-depth for a
    *good* primary that reboots a lot — it does **not** fix a deterministic early hang
    (that never reaches rc.local); the valid recovery slot + OTA hardening cover that.
-2. **OTA keep-config hardening** (`-n`, or robust/timeout-guarded first-boot restore;
-   stop fire-and-forget backgrounding). Likely a separate issue.
+2. **OTA keep-config hardening.** *Partly done:* `beep-ota` now `setsid`-detaches the
+   flash so a uhttpd CGI teardown can't kill `sysupgrade` mid-write, and logs the
+   attempt. *Deferred (the real fix):* stop relying on stock keep-config — preserve
+   only our identity set (beep-code, cert/key, wireless + system config) ourselves and
+   flash `-n`, so a variant-mismatch can't hang the restore. Blocked on the setup-AP
+   DHCP fix (PR #18): `-n` drops the wifi client config → the unit lands on the setup
+   AP, which must be reachable first. Likely its own issue.
 3. **Recovery slot**: build the ~5.57 MB minimal initramfs (bake `/etc/beep-ota.pub`
    + the `99-beep` MAC→code derivation + a tap detector; strip audio/wifi-full/opkg),
    repartition to the geometry above, `setenv beep_recovery 0x9fa30000; saveenv`,
