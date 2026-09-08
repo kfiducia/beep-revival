@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 180   # first run builds the toolchain from source (~45-90 min)
     steps:
       - name: Reclaim runner disk (OpenWrt build needs ~25 GB)
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
           tool-cache: true
           android: true
@@ -149,7 +149,7 @@ jobs:
           ls -la release/
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: Beep Revival ${{ steps.ver.outputs.version }}
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.ver.outputs.version) }}

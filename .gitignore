@@ -5,23 +5,10 @@ prebuilt/
 *.wav
 *.bin
 
-# Personal build-host wrappers (hardcode a private hostname + 1Password socket).
-# The device-side fast-loop helper (scripts/serial-send.sh) IS included; these
-# two are just "how I reach my own Docker build host" — regenerate for yours.
-scripts/local-ssh.sh
-scripts/rebuild-ko.sh
-# beep-ssh.sh hardcodes a personal LAN IP + 1Password agent socket path — keep local.
-scripts/beep-ssh.sh
-# build-status.sh polls the personal iMac build container — useless off that host.
-scripts/build-status.sh
-
 # macOS / editor cruft
 .DS_Store
 
-# OTA signing — private key never in-repo (staged on build host, then 1Password)
+# OTA signing — the private key is never committed (kept off-repo).
 *.sec
 beep-ota-signing/
 .secrets/
-
-# personal device-access wrapper (hardcodes a private IP + 1Password socket)
-scripts/beep-ssh.sh
