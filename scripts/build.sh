@@ -38,7 +38,6 @@ for p in $(ls -1 "$SRC/feed" 2>/dev/null); do
 	[ -e "package/feeds/beepfeed/$p" ] || { echo "!! FEED: '$p' not linked (no package/feeds/beepfeed/$p) — feeds rejected feed/$p/Makefile metadata? see feeds output above"; exit 5; }
 done
 echo "   feed OK: all beepfeed packages linked ($(ls -1 "$SRC/feed" | tr '\n' ' '))"
-echo "   feed OK: all beepfeed packages linked ($(ls -1 "$SRC/feed" | tr '\n' ' '))"
 
 # ============================================================================
 # RECOVERY=1 — build the minimal signed-reflash initramfs for the recovery slot.
@@ -572,6 +571,13 @@ sz="$(wc -c < "$IMG" 2>/dev/null || echo 0)"; lim=16384000
 
 [ "$VFAIL" -eq 0 ] || { echo "!! VALIDATE[$VARIANT]: image failed one or more output checks — REFUSING to ship"; exit 6; }
 echo "   VALIDATE[$VARIANT] OK: required pkgs [$req] present; overlay staged; beepd+kmod present; metadata present; image ${sz}B fits ${lim}B"
+# Preserve the VALIDATED sysupgrade image. The UCM trim below re-runs
+# `make target/linux/install`, which rebuilds ALL images incl. this sysupgrade — and on
+# a reused build tree that rebuild has regenerated a STALE/wrong sysupgrade (it shipped
+# an LMS image as "replaynet" once, absent /usr/sbin/replaynet). We restore this
+# validated copy after the trim so what ships is EXACTLY what passed validation.
+VALIDATED_SYSUP="$OW/beep-validated-$VARIANT-sysupgrade.bin"
+cp -a "$IMG" "$VALIDATED_SYSUP"
 
 # GUARD: an AIRPLAY2 build MUST actually contain AirPlay 2. This silently regressed
 # once when a prior default build's --with-airplay-2 strip leaked into the Makefile,
@@ -612,6 +618,14 @@ for R in "$OW"/build_dir/target-*/root-*; do
   TRIM_RAN=1
 done
 [ "$TRIM_RAN" = 1 ] && { echo "   trimmed UCM$( [ -n "${LEAN:-}" ] && echo '+opkg' ) → rebuilding image"; make target/linux/install >>/build/image-build.log 2>&1 || echo "!! image re-link failed"; }
+# Restore the guard-validated sysupgrade over whatever the trim rebuild produced (that
+# rebuild can be stale on a reused tree — see the preserve step above). The trim still
+# gave us the small initramfs it exists for; the FLASHED sysupgrade must be the validated
+# one.
+if [ "$TRIM_RAN" = 1 ] && [ -n "${VALIDATED_SYSUP:-}" ] && [ -f "${VALIDATED_SYSUP:-}" ] && [ -n "${IMG:-}" ]; then
+  cp -a "$VALIDATED_SYSUP" "$IMG"
+  echo "   restored guard-validated sysupgrade over the post-trim rebuild ($(wc -c < "$IMG") B)"
+fi
 echo "== images =="
 ls -la "$OW"/bin/targets/ath79/generic/*8dev_carambola2*.bin 2>/dev/null || \
   echo "(no image yet — check /build/image-build.log; some kmod/pkg names may need a menuconfig pass)"
