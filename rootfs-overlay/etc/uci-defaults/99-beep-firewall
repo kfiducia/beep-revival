@@ -1,0 +1,29 @@
+#!/bin/sh
+# Guarantee the Wi-Fi interfaces are REACHABLE out of the box.
+#
+# The image ships the stock OpenWrt firewall: default input policy REJECT, and only
+# 'lan' and 'wan'/'wan6' are zoned. Our two Wi-Fi interfaces — the client STA `wwan`
+# and the Setup-AP `beepap` — are in NO zone there, so an unzoned iface falls through
+# to the default REJECT and the device is UNREACHABLE on it (no SSH, no web UI, no
+# AirPlay/RTSP, and mDNS query replies dropped), even while it is associated.
+#
+# Until now `wwan`/`beepap` were only added to the `lan` zone at RUNTIME by set_wifi
+# (portal provisioning) and wifi-setup-enable (raising the Setup AP). So a freshly
+# flashed, factory-reset, clean-flashed, or OTA-reset unit — whose /etc/config/firewall
+# is the stock default — boots firewalled off until one of those scripts happens to run
+# again. That is the "flashed the update and nothing worked, not even the web interface"
+# failure (confirmed on hardware 2026-09-09).
+#
+# Bake the zone membership into first boot so reachability never depends on a runtime
+# script having already run. Idempotent; resolves the lan zone BY NAME (robust to a
+# customized firewall), matching set_wifi / wifi-setup-enable. Adding a not-yet-existing
+# interface to a zone's network list is harmless — it takes effect when the iface appears.
+lz="$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='lan'.*/\1/p" | head -1)"
+[ -n "$lz" ] || lz="@zone[0]"
+changed=0
+for net in wwan beepap; do
+	uci -q get "firewall.${lz}.network" | grep -qw "$net" || {
+		uci -q add_list "firewall.${lz}.network=$net"; changed=1; }
+done
+[ "$changed" = 1 ] && uci -q commit firewall
+exit 0
