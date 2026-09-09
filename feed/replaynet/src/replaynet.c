@@ -529,12 +529,14 @@ static int write_full(int fd, const void *buf, size_t n)
 
 /* ------------------------------------------------------------- source */
 
-/* Big socket buffers so a transiently-slow sink (wifi retransmit burst) absorbs into the
+/* Socket buffers sized to absorb a transiently-slow sink (wifi retransmit burst) into the
  * kernel buffer instead of back-pressuring the single-threaded fan-out and stalling the
- * OTHER sinks. ~1 MB ≈ 6 s of PCM headroom. */
+ * OTHER sinks. 256 KB ≈ 1.4 s of PCM headroom at S16/44.1k stereo (~176 KB/s) — ample.
+ * NOT 1 MB: the kernel roughly doubles the accounting, and the fan-out source opens one
+ * socket per group member, so 1 MB×2×N is a real OOM risk on the 64 MB AR9331. */
 static void set_big_bufs(int fd)
 {
-	int sz = 1 << 20;
+	int sz = 256 * 1024;
 	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
 	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
 }
