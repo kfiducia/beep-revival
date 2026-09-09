@@ -497,35 +497,41 @@ IMG="$(ls "$OW"/bin/targets/ath79/generic/*8dev_carambola2-squashfs-sysupgrade.b
 [ -n "$IMG" ]      || { echo "!! VALIDATE: no sysupgrade image produced"; exit 6; }
 VFAIL=0
 
-# (1) EVERY requested package (.config CONFIG_PACKAGE_x=y) must appear in the image
-# manifest. This catches ANY silently-dropped package automatically — no hardcoded
-# list to fall out of date (the exact class of bug that dropped beepd, then replaynet).
-pmiss=""
-for pkg in $(sed -n 's/^CONFIG_PACKAGE_\([A-Za-z0-9._+-]*\)=y$/\1/p' .config | sort -u); do
-	grep -q "^$pkg " "$MANIFEST" || pmiss="$pmiss $pkg"
-done
-[ -z "$pmiss" ] || { echo "!! VALIDATE: requested package(s) NOT in image manifest:$pmiss"; VFAIL=1; }
-
-# (2) EVERY file we stage into the image (files/) must be present in the image rootfs —
-# catches a dropped overlay script/config/service/pubkey. Uses the staged files/ dir
-# (already adjusted per variant), so it's variant-correct. Temp file carries the count
-# out of the pipe subshell.
-_om=/tmp/beep-ov-missing; : > "$_om"
-find "$OW"/files -type f 2>/dev/null | while IFS= read -r f; do
-	rel="${f#"$OW"/files/}"
-	[ -e "$BROOT/$rel" ] || echo "/$rel" >> "$_om"
-done
-if [ -s "$_om" ]; then echo "!! VALIDATE: staged overlay file(s) missing from image:"; sed 's/^/     /' "$_om"; VFAIL=1; fi
-
-# (3) Functional essentials, named explicitly for a human-readable failure.
-[ -x "$BROOT/usr/sbin/beepd" ]                 || { echo "!! VALIDATE: /usr/sbin/beepd missing — no ring/knob/volume"; VFAIL=1; }
-ls "$BROOT"/lib/modules/*/*beep*i2s* >/dev/null 2>&1 || { echo "!! VALIDATE: kmod-beep-i2s missing — I2S audio dead"; VFAIL=1; }
-[ -f "$BROOT/etc/beep-ota.pub" ]               || { echo "!! VALIDATE: /etc/beep-ota.pub missing — signed OTA broken"; VFAIL=1; }
-if [ "${MULTIROOM:-}" = replaynet ]; then
-	grep -q '^replaynet ' "$MANIFEST" || { echo "!! VALIDATE: replaynet engine missing (MULTIROOM=replaynet)"; VFAIL=1; }
-else
-	grep -q '^snapserver ' "$MANIFEST" || { echo "!! VALIDATE: snapserver missing (default multi-room)"; VFAIL=1; }
+# Variant is detected from the SAME env the workflow passes (release.yml):
+#   AIRPLAY2=1 -> ap2 (AirPlay-2, no Snapcast — native multi-room)
+#   MULTIROOM=replaynet -> replaynet engine (no Snapcast)
+#   neither -> ap1 (AirPlay-1 + Snapcast)
+if [ "${MULTIROOM:-}" = replaynet ]; then VARIANT=replaynet
+elif [ -n "${AIRPLAY2:-}" ];        then VARIANT=ap2
+else                                     VARIANT=ap1
 fi
+
+# (1) REQUIRED packages present in the image manifest (variant-aware). A curated set of
+# functional essentials — a missing one means a broken device. We do NOT diff the whole
+# .config: it also carries build config-options (ATH_DFS, MAC80211_*, …) and auto-pulled
+# libs that are not 1:1 manifest package names, which would false-fail.
+req="beepd kmod-beep-i2s kmod-sound-soc-wm8524 shairport-sync-mbedtls"
+case "$VARIANT" in
+	replaynet) req="$req replaynet" ;;              # replaynet multi-room engine
+	ap1)       req="$req snapserver snapclient" ;;  # Snapcast multi-room
+	ap2)       : ;;                                 # ap2 ships NO Snapcast (native AirPlay-2 grouping)
+esac
+for pkg in $req; do
+	grep -q "^$pkg " "$MANIFEST" || { echo "!! VALIDATE[$VARIANT]: required package '$pkg' NOT in image manifest — do NOT ship"; VFAIL=1; }
+done
+
+# (2) Critical rootfs-overlay files must be STAGED into the image overlay (files/). The
+# overlay is baked at image-ASSEMBLY, so it is NOT in the package-staging root above —
+# check the staged files/ dir, which OpenWrt copies into the image verbatim. (Sentinels
+# cover the recovery/OTA/identity + self-heal paths that are present in every full build.)
+for f in etc/beep-ota.pub etc/fw_env.config www/cgi-bin/beep-ota \
+         usr/libexec/beep/netcheck-loop usr/libexec/rpcd/beep etc/init.d/beep-netcheck; do
+	[ -e "$OW/files/$f" ] || { echo "!! VALIDATE[$VARIANT]: overlay file '/$f' not staged into the image — do NOT ship"; VFAIL=1; }
+done
+
+# (3) Functional binaries physically present in the package-staging rootfs.
+[ -x "$BROOT/usr/sbin/beepd" ]                       || { echo "!! VALIDATE[$VARIANT]: /usr/sbin/beepd missing — no ring/knob/volume"; VFAIL=1; }
+ls "$BROOT"/lib/modules/*/*beep*i2s* >/dev/null 2>&1  || { echo "!! VALIDATE[$VARIANT]: kmod-beep-i2s missing — I2S audio dead"; VFAIL=1; }
 
 # (4) sysupgrade METADATA must be present, or the device rejects the flash. fwtool
 # extract: non-zero rc + empty extract = definitively absent -> fail; missing tool /
@@ -543,8 +549,8 @@ else echo "   WARN: fwtool not found ($FWTOOL) — skipping metadata check"; fi
 sz="$(wc -c < "$IMG" 2>/dev/null || echo 0)"; lim=16384000
 [ "$sz" -le "$lim" ] || { echo "!! VALIDATE: image $sz B exceeds firmware partition ($lim B)"; VFAIL=1; }
 
-[ "$VFAIL" -eq 0 ] || { echo "!! VALIDATE: image failed one or more output checks — REFUSING to ship"; exit 6; }
-echo "   VALIDATE OK: all $(grep -c '' "$MANIFEST") manifest pkgs incl. requested set present; overlay files present; metadata present; image ${sz}B fits ${lim}B"
+[ "$VFAIL" -eq 0 ] || { echo "!! VALIDATE[$VARIANT]: image failed one or more output checks — REFUSING to ship"; exit 6; }
+echo "   VALIDATE[$VARIANT] OK: required pkgs [$req] present; overlay staged; beepd+kmod present; metadata present; image ${sz}B fits ${lim}B"
 
 # GUARD: an AIRPLAY2 build MUST actually contain AirPlay 2. This silently regressed
 # once when a prior default build's --with-airplay-2 strip leaked into the Makefile,
