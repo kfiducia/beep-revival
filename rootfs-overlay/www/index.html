@@ -157,10 +157,13 @@ summary::-webkit-details-marker{display:none}
 
     <!-- system -->
     <div class="card">
-      <h2>🔊 Multi-room</h2>
+      <h2>🔊 Multi-room <span class="mut" style="font-size:.7em;font-weight:400">experimental</span></h2>
       <p class="mut">Play the same audio in sync across your Beeps. Make one the
         <b>Group primary</b> (AirPlay to that one) and the others <b>Members</b>.
         <b>Solo</b> is a standalone speaker.</p>
+      <p class="mut" style="margin-top:6px"><b>Heads up:</b> multi-room is still being
+        tuned — expect occasional dropouts and rooms that aren&rsquo;t perfectly in sync.
+        Single-room (Solo) is the solid path for now.</p>
       <div class="seg" role="group" aria-label="Multi-room role" style="margin-top:10px">
         <button id="grp-solo"    aria-pressed="true"  onclick="setGroup('solo')">Solo</button>
         <button id="grp-primary" aria-pressed="false" onclick="setGroup('primary')">Group primary</button>
