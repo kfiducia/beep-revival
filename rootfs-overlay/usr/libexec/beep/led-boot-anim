@@ -57,9 +57,10 @@ while [ ! -e "$STOP" ]; do
 	el=$((now - start)); [ "$el" -lt 0 ] && el=0
 	[ "$el" -ge "$cap" ] && break
 	if [ "$SHAPE" = wings ]; then
-		# k = round(12 * elapsed / TOTAL): 0..12 levels of wing rising from the bottom.
-		n=$(( (el * 12 + TOTAL / 2) / TOTAL ))
-		[ "$n" -gt 12 ] && n=12
+		# k = round(11 * elapsed / TOTAL): 0..11 levels rising from the bottom PAIR
+		# {11,12} up both sides to the top pair {23,0} (k=11 = full ring).
+		n=$(( (el * 11 + TOTAL / 2) / TOTAL ))
+		[ "$n" -gt 11 ] && n=11
 		[ "$n" -ne "$last" ] && { "$LEDSTAGE" wings "$n" "$V" 2>/dev/null; last="$n"; }
 	else
 		# n = round(NLED * elapsed / TOTAL): one arc from 12 o'clock, clamped to full.

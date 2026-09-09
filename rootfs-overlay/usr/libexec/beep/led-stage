@@ -47,12 +47,15 @@ case "$mode" in
 	smiley)   v=255 ;;                 # boot-OK happy face (two eyes + a bottom smile arc)
 	failsafe) v=30 ;;                  # alternating warning ring
 	off)      v=0 ;;
-	# wings <k> <v> — symmetric bottom-to-top fill: light every LED within k ring-steps
-	# of 6 o'clock (k=0 lights just the bottom; k=12 lights the whole ring). The frame
-	# the boot animator steps through so the "wings" rise from the bottom to the top.
+	# wings <k> <v> — symmetric bottom-to-top fill about the VERTICAL AXIS, which runs
+	# between LEDs 11 and 12 (the pair straddling 6 o'clock — the same pair the idle
+	# breathe/sleep dots use). k=0 lights that bottom pair {11,12}; each level adds one
+	# LED per side (mirror pairs i / 23-i); k=11 lights the whole ring. Starting on the
+	# 11/12 pair (not a single LED at 12) keeps the fan centred and un-crooked, and makes
+	# the wings begin looking exactly like the resting dots.
 	wings)    k="$2"; v="${3:-50}"
 	          case "$k" in ''|*[!0-9]*) exit 0 ;; esac
-	          [ "$k" -gt 12 ] && k=12 ;;
+	          [ "$k" -gt 11 ] && k=11 ;;
 	# fill <n> <v> — light the first n (0..24) LEDs as one arc growing CLOCKWISE from
 	# 12 o'clock. The frame the OTA animator steps through so the dial fills from the top.
 	fill)     n="$2"; v="${3:-50}"
@@ -69,7 +72,8 @@ while [ "$i" -lt "$NLED" ]; do
 		smiley)   if [ "$i" -eq "$EYE_L" ] || [ "$i" -eq "$EYE_R" ] || \
 		             { [ "$i" -ge "$SMILE_LO" ] && [ "$i" -le "$SMILE_HI" ]; }; then lit=1; fi ;;
 		failsafe) [ $((i % 2)) -eq 0 ] && lit=1 ;;
-		wings)    d=$((i - LED_BOT)); [ "$d" -lt 0 ] && d=$((-d)); [ "$d" -le "$k" ] && lit=1 ;;
+		wings)    if [ "$i" -ge "$LED_BOT" ]; then d=$((i - LED_BOT)); else d=$((LED_BOT - 1 - i)); fi
+		          [ "$d" -le "$k" ] && lit=1 ;;
 		fill)     [ "$i" -lt "$n" ] && lit=1 ;;
 		off)      lit=0 ;;
 	esac
