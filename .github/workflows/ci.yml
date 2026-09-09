@@ -33,8 +33,16 @@ jobs:
     continue-on-error: true          # REPORT-ONLY (see header) — remove to make blocking
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install shellcheck (pinned)
+        # Pin the version so CI and local runs agree exactly. The distro's `apt` shellcheck
+        # drifts across runner images and emits a different finding set (e.g. it flags
+        # SC2002, which shellcheck disables by default from 0.10+), which makes a locally
+        # clean tree fail in CI. Install the official static binary instead.
+        run: |
+          VER=0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v${VER}/shellcheck-v${VER}.linux.x86_64.tar.xz" | tar -xJ
+          sudo install -m755 "shellcheck-v${VER}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
       - name: Lint every shell script (by extension AND shebang)
         run: |
           set -u
