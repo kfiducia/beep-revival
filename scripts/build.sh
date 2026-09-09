@@ -15,20 +15,29 @@ SRC="${SRC:-/src}"
 cd "$OW"
 
 echo "== 1. local package feed =="
-grep -q 'src-link beepfeed' feeds.conf.default || echo "src-link beepfeed $SRC/feed" >> feeds.conf.default
-./scripts/feeds update beepfeed >/dev/null
-# -f FORCES (re)installation of every beepfeed package. Without it, `feeds install`
-# skips packages it thinks are already installed — so on the PERSISTENT runner a
-# package added to feed/ AFTER the tree was first populated (this bit `replaynet`)
-# never gets its package/feeds/beepfeed/<pkg> symlink, so `make` never builds it and it
-# is silently absent from the image. -f re-links them all every build.
-./scripts/feeds install -f -a -p beepfeed >/dev/null
+# Always (re)point the src-link at the CURRENT checkout. The old `grep || echo` left a
+# stale src-link from a prior run in place on the PERSISTENT runner.
+sed -i '/^src-link beepfeed /d' feeds.conf.default 2>/dev/null || true
+echo "src-link beepfeed $SRC/feed" >> feeds.conf.default
+# Nuke stale feed + package-metadata caches. OpenWrt caches parsed package metadata in
+# tmp/.packageinfo and the feed index in feeds/beepfeed*; on a reused tree a package
+# added to feed/ AFTER the first build (this bit `replaynet`) is NOT re-scanned, so it
+# never enters the index -> feeds install can't link it -> make never builds it ->
+# silently absent from the image. Clearing these forces a full re-scan every build.
+rm -rf feeds/beepfeed feeds/beepfeed.index feeds/beepfeed.tmp \
+       tmp/.packageinfo tmp/.packagedeps tmp/.packagesubdirs 2>/dev/null || true
+./scripts/feeds update beepfeed 2>&1 | tail -3
+# -f re-links every beepfeed package even if a stale symlink exists.
+./scripts/feeds install -f -a -p beepfeed 2>&1 | tail -20
+# Diagnostic: what does feeds actually know about our packages now?
+echo "   feeds sees: $(./scripts/feeds list -r beepfeed 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
 # Fail EARLY (clear message) if any feed/ package didn't get linked, rather than
-# discovering it only at the output-validation guard after a full compile.
+# discovering it only at the post-compile output-validation guard.
 for p in $(ls -1 "$SRC/feed" 2>/dev/null); do
 	[ -f "$SRC/feed/$p/Makefile" ] || continue
-	[ -e "package/feeds/beepfeed/$p" ] || { echo "!! FEED: '$p' not installed (no package/feeds/beepfeed/$p) — check feed/$p/Makefile"; exit 5; }
+	[ -e "package/feeds/beepfeed/$p" ] || { echo "!! FEED: '$p' not linked (no package/feeds/beepfeed/$p) — feeds rejected feed/$p/Makefile metadata? see feeds output above"; exit 5; }
 done
+echo "   feed OK: all beepfeed packages linked ($(ls -1 "$SRC/feed" | tr '\n' ' '))"
 echo "   feed OK: all beepfeed packages linked ($(ls -1 "$SRC/feed" | tr '\n' ' '))"
 
 # ============================================================================
