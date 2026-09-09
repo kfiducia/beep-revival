@@ -16,9 +16,12 @@
 # gated OFF) you should see it climb 0->1->2->3 across reboots and NOT reset — which
 # is exactly the danger. After the beep_recovery repoint, reaching 3 is harmless.
 
-MTD=/dev/mtd1
-START=32768        # 0x8000
-LEN=32768          # 0x8000  (scan the whole counter region)
+# (testability) MTD/START/LEN are overridable from the environment so the decode can be
+# exercised off-device against a synthetic counter image; on a unit these are all unset,
+# so the defaults below are byte-identical to the original hard-coded values.
+MTD="${MTD:-/dev/mtd1}"
+START="${START:-32768}"        # 0x8000
+LEN="${LEN:-32768}"            # 0x8000  (scan the whole counter region)
 
 [ -e "$MTD" ] || { echo "no $MTD (is this the stock mtd layout? check /proc/mtd)"; exit 1; }
 

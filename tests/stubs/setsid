@@ -1,0 +1,3 @@
+#!/bin/sh
+# fake setsid: swallow the detached flash so no sysupgrade/sleep runs during tests.
+exit 0

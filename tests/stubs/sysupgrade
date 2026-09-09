@@ -1,0 +1,5 @@
+#!/bin/sh
+# fake sysupgrade: `-T` (image test) verdict from $SYSUPGRADE_T_RESULT (default 0).
+# A real flash is never exercised in tests.
+case " $* " in *" -T "*) exit "${SYSUPGRADE_T_RESULT:-0}";; esac
+exit 0

@@ -1,0 +1,10 @@
+#!/bin/sh
+# fake amixer: `get Master` prints a line carrying [<AMIXER_PCT>%] for the script's
+# sed to parse; `set ...` is a silent success. Level comes from $AMIXER_PCT (default 0).
+_mode=
+for a in "$@"; do case "$a" in get) _mode=get;; set) _mode=set;; esac; done
+if [ "$_mode" = get ]; then
+	printf "Simple mixer control 'Master',0\n  Mono: Playback %d [%d%%] [on]\n" \
+		"${AMIXER_PCT:-0}" "${AMIXER_PCT:-0}"
+fi
+exit 0
