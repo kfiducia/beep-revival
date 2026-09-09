@@ -1,25 +1,23 @@
 #!/bin/sh
-# Good-boot bootcount reset (guarded, ARMED by default via /etc/beep-fwenv-verified).
+# Good-boot bootcount reset — DISABLED. This fw_setenv-based approach is the WRONG
+# mechanism for this hardware and is retained only for reference until replaced by a
+# vendor-faithful reimplementation.
 #
-# What it does: clears U-Boot's wear-leveled bootcount by rewriting the env sector, so
-# a run of transient reboots (power blips, etc.) can't slowly walk a HEALTHY primary
-# toward "Bootcount exceeded -> recovery". Without it NOTHING resets the 3-strikes
-# counter (stock beepupdate is gone), so it only ever climbs and the unit drops to the
-# recovery slot after ~3 ordinary reboots FOR NO REASON — this reset is what stops that.
-# It is also DEFENSE-IN-DEPTH but NOT the fix for the 2026-09-08 brick: a deterministic
-# early-boot hang never reaches here, so it never resets a hung boot (correct). The valid
-# recovery slot + OTA hardening cover the hang case. See docs/RECOVERY-DESIGN.md.
+# WHY DISABLED (proven on hardware 2026-09-09): the U-Boot env is REDUNDANT — env0 @ 0x0
+# and env1 @ 0x8000 in mtd1 — and the wear-leveled 3-strikes bootcount byte lives at
+# flash 0x8000, i.e. it OVERLAPS libubootenv's env1 slot. A redundant fw_setenv writes
+# the obsolete copy = env1 @ 0x8000, which erases + overwrites the bootcount region with
+# env bytes: it does NOT reset the count, it corrupts it. So fw_setenv can never be the
+# reset mechanism here. (Separately, the drop to recovery is already harmless: on this
+# fleet beep_recovery == beep_primary == 0x9f050000, so strike 3 just re-boots the good
+# primary.) See rootfs-overlay/etc/fw_env.config and docs/RECOVERY-DESIGN.md.
 #
-# Why it is dangerous without proof: the reset uses fw_setenv, and a wrong
-# /etc/fw_env.config can make libubootenv reinit the env to U-Boot's stock defaults
-# (beep_primary=0x9f550000) which is a BRICK on our layout. Hence two gates — both must
-# pass or this is a silent no-op:
-#   1. /etc/beep-fwenv-verified exists. It now SHIPS in the image (armed by default),
-#      because gate 2 is a genuine per-boot verification, not a promise — see that file.
-#   2. fw_printenv reads back beep_primary=0x9f050000 through fw_env.config (proves the
-#      config offset/size/CRC are correct for THIS unit). Any mismatch or Bad CRC ->
-#      abort, no write. This is the real safety interlock: a correct read proves the
-#      geometry is correct for the write too, and a wrong layout just fails closed.
+# The correct reset replicates the vendor `beepupdate`: a direct single-nibble bit-clear
+# at 0x8000 on /dev/mtd1 (no fw_setenv, no full erase) — notes/bootcount-reset-v2-spec.md.
+logger -t beep-goodboot "bootcount-reset: DISABLED (fw_setenv corrupts the env1-overlapped bootcount; see script header)"
+exit 0
+
+# --- retained-for-reference below; never reached ---
 LOGT=beep-goodboot
 MARK=/etc/beep-fwenv-verified
 
