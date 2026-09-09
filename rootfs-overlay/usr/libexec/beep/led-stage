@@ -87,6 +87,7 @@ wire=""; i=0
 while [ "$i" -lt "$NLED" ]; do
 	idx=$(( (i + ROT) % NLED + 1 ))
 	eval "b=\${$idx}"
+	# shellcheck disable=SC2154  # b is assigned by the eval on the previous line
 	wire="$wire $(printf '0x%02x' "$b")"
 	i=$((i + 1))
 done

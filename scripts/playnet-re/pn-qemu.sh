@@ -3,6 +3,7 @@
 S=/tmp/pnsys
 rm -rf "$S" && mkdir -p "$S" && tar -xzf /tmp/pn-sys.tgz -C "$S"
 echo "=== playnet ELF interp/needed ==="
+# shellcheck disable=SC2211  # intentional glob resolves the versioned toolchain dir
 /build/openwrt/staging_dir/toolchain-mips_24kc_*/bin/mips-openwrt-linux-objdump -p "$S/beep/platform/playnet" 2>/dev/null | grep -E 'INTERP|NEEDED' | head
 echo "=== RUN under qemu-mips -strace (bounded 12s) ==="
 timeout 12 qemu-mips -strace -L "$S" \

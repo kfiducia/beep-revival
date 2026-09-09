@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2086,SC2046,SC2015  # dev benchmark: `set -- $(cpu_fields)` splits fields into positional params, /proc/$PID paths are numeric, `&& echo ||` is safe (echo never fails)
 # ap2-bench.sh — on-device AirPlay-2 CPU/XRUN verification for the Beep (AR9331).
 #
 # WHY: AirPlay-2 buffered audio is AAC-LC, and ffmpeg's default AAC decoder is

@@ -135,6 +135,7 @@ else
 	         etc/config/wireless etc/config/network etc/config/system; do
 		[ -e "/$f" ] && KEEP_FILES="$KEEP_FILES $f"
 	done
+	# shellcheck disable=SC2086  # $KEEP_FILES deliberately word-splits into separate tar paths
 	( cd / && tar czf "$KEEP" $KEEP_FILES ) 2>/dev/null
 	# NEVER flash into an identity wipe: the tar must exist and carry the device code.
 	# If staging failed, abort BEFORE flashing rather than reset the owner's password
@@ -156,6 +157,7 @@ logger -t beep "OTA: starting sysupgrade ($([ "$want_unsigned" = 1 ] && echo uns
 if command -v setsid >/dev/null 2>&1; then
 	setsid sh -c "sleep 1; sysupgrade $FLASH_ARGS /tmp/ota.bin" </dev/null >/dev/null 2>&1 &
 else
+	# shellcheck disable=SC2086  # $FLASH_ARGS deliberately word-splits into sysupgrade flags
 	( sleep 1; sysupgrade $FLASH_ARGS /tmp/ota.bin ) </dev/null >/dev/null 2>&1 &
 fi
 exit 0

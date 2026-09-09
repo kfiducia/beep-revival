@@ -96,6 +96,7 @@ start_service() {
 
 	procd_open_instance
 	logger -t 'squeezelite' "$cmdline"
+	# shellcheck disable=SC2086  # $cmdline word-splits into separate procd command args
 	procd_set_param command "$PROG" $cmdline
 	# Scheduling edge for the audio thread on the single-core AR9331 (see header).
 	procd_set_param nice -12
