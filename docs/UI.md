@@ -79,7 +79,18 @@ image is rejected unless you physically triple-tap to override.
 
 ## Multi-room (experimental)
 
-Snapcast-based sync exists (one Beep = *primary*/server, others = *member*), but the
-400 MHz AR9331 is CPU-tight when the primary also receives AirPlay and serves the
-group during playback, so it's **experimental** for now. Single-room AirPlay is the
-solid, default path.
+Multi-room sync exists (one Beep = *primary*/source, others = *member*/sink) via two
+engines: the default **Snapcast** path, and the custom **replaynet** engine
+(`MULTIROOM=replaynet` builds; see `docs/REPLAYNET.md`). Both are **experimental** for
+now on the 400 MHz AR9331:
+
+- **Snapcast** is CPU-tight when the primary also receives AirPlay and serves the group
+  during playback.
+- **replaynet** plays across rooms, but on the wifi (member) path still has **audible
+  dropouts and imperfect room-to-room sync** — the residual is heavy-tailed timing
+  spikes on the loaded SoC (`~11 snap events / 25 s` on the tuned two-Beep tone harness;
+  worse on real music). Root cause and the planned fix (a robust/median error filter,
+  not PI / wider-clamp / debounce — all tried and rejected by ear) are tracked in
+  `docs/REPLAYNET-WIFI-TUNING.md`.
+
+Single-room AirPlay (**Solo**) is the solid, default path.
