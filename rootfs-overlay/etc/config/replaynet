@@ -1,0 +1,20 @@
+config node 'node'
+	# Node/device id for grouping + gossip (must contain NO '.'). Empty -> the init
+	# falls back to the device hostname (see /etc/init.d/replaynet).
+	option id ''
+	# Group to join at boot. Empty -> the node's own solo group (its id). '1' = the
+	# default shared group (matches the stock group_id default), so Beeps left at
+	# defaults auto-form one group and elect a source.
+	option group ''
+	# ALSA device: the softvol "default" plug (see /etc/asound.conf) so the shared
+	# "Master" control attenuates playback — knob / web / LED arc all track it.
+	option device 'default'
+	# Election metric: higher wins a leaderless group; 0 = tie-break by id. A hook could
+	# set this from wifi RSSI so the best-connected Beep tends to source.
+	option signal '0'
+	# Opt-in. OFF by default so the current snapcast pipeline is unaffected until the
+	# multi-room engine is switched to replaynet (build flag / UCI). To turn on:
+	#   uci set replaynet.node.enabled=1; uci commit replaynet
+	#   /etc/init.d/replaynet restart
+	# (and point shairport-sync at the /tmp/beep-pcm pipe — see beep-group.)
+	option enabled '0'

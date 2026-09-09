@@ -47,10 +47,16 @@ snapcast_set() {  # boolean wrapper over the role model (see beep-group for prim
 
 status() {
 	ap=$(uci -q get beep.sources.airplay 2>/dev/null || echo 1)
+	engine=$(uci -q get beep.main.group_engine 2>/dev/null || echo snapcast)
 	role=$(uci -q get beep.main.group_role 2>/dev/null || echo solo)
 	lms=$(uci -q get squeezelite.options.enabled 2>/dev/null || echo 0)
 	printf 'airplay   enabled=%s  running=%s\n' "$ap"  "$(running shairport-sync)"
-	printf 'snapcast  role=%s  server=%s  client=%s\n' "$role" "$(running snapserver)" "$(running snapclient)"
+	if [ "$engine" = replaynet ]; then
+		printf 'multiroom engine=replaynet  role=%s  node=%s\n' "$role" "$(running replaynet)"
+	else
+		printf 'multiroom engine=snapcast   role=%s  server=%s  client=%s\n' \
+			"$role" "$(running snapserver)" "$(running snapclient)"
+	fi
 	printf 'lms       enabled=%s  running=%s\n' "$lms" "$(running squeezelite)"
 }
 

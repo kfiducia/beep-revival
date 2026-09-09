@@ -53,7 +53,10 @@ if [ -n "${RECOVERY:-}" ]; then
         "$OW"/files/etc/uci-defaults/99-beep-netcheck \
         "$OW"/files/etc/init.d/beep-audio \
         "$OW"/files/etc/init.d/beep-netcheck \
+        "$OW"/files/etc/init.d/replaynet \
+        "$OW"/files/etc/uci-defaults/99-beep-replaynet \
         "$OW"/files/etc/config/beep \
+        "$OW"/files/etc/config/replaynet \
         "$OW"/files/etc/asound.conf \
         "$OW"/files/etc/shairport-sync.conf \
         "$OW"/files/etc/snapserver.conf 2>/dev/null || true
@@ -281,6 +284,11 @@ CONFIG_CCACHE=y
 CONFIG_CCACHE_DIR="/build/ccache"
 # our packages
 CONFIG_PACKAGE_beepd=y
+# replaynet: fresh multi-room sync engine (reimplements stock playnet, docs/REPLAYNET.md).
+# Always built in; its init.d (rootfs-overlay/etc/init.d/replaynet) is registered but
+# DORMANT under the default snapcast engine. MULTIROOM=replaynet (below) drops snapcast
+# and makes replaynet the active engine.
+CONFIG_PACKAGE_replaynet=y
 CONFIG_PACKAGE_kmod-beep-i2s=y
 # audio: codec + machine glue + ALSA
 CONFIG_PACKAGE_kmod-sound-core=y
@@ -406,6 +414,36 @@ cat >> .config <<CFG
 CFG
   echo "   [LEAN] minimal RAM-boot test image: audio only, no wifi/opkg/ucm (fit 64MB tmpfs)"
 fi
+
+# MULTIROOM engine selector (default: snapcast). MULTIROOM=replaynet builds a
+# snapcast-free image and makes the fresh `replaynet` --node daemon the multi-room
+# engine (docs/REPLAYNET.md): the AirPlay-1 shairport pipe feeds replaynet directly and
+# it does decode-fed fan-out + consensus itself, replacing snapserver+snapclient (and
+# their boost/libatomic/~5 MB). replaynet is already selected above (CONFIG_PACKAGE_
+# replaynet=y); here we just drop snapcast and flip the runtime engine on first boot.
+if [ "${MULTIROOM:-snapcast}" = replaynet ]; then
+  echo "== [MULTIROOM=replaynet] snapcast omitted; replaynet is the multi-room engine =="
+  sed -i '/^CONFIG_PACKAGE_snapserver=y/d; /^CONFIG_PACKAGE_snapclient=y/d; /^CONFIG_PACKAGE_libatomic=y/d' .config
+  mkdir -p "$OW/files/etc/uci-defaults"
+  cat > "$OW/files/etc/uci-defaults/98-beep-multiroom-replaynet" <<'RNDEF'
+#!/bin/sh
+# Make replaynet the active multi-room engine (image built with MULTIROOM=replaynet):
+# select it in beep-group, enable the node, and default it to the shared group so Beeps
+# left at defaults auto-form one synced group. shairport is repointed to the replaynet
+# pipe by `beep-group apply` (the group_engine=replaynet branch).
+uci -q batch <<UCI
+set beep.main.group_engine=replaynet
+set replaynet.node.enabled=1
+set replaynet.node.group=1
+commit beep
+commit replaynet
+UCI
+[ -x /usr/libexec/beep/beep-group ] && /usr/libexec/beep/beep-group apply >/dev/null 2>&1
+exit 0
+RNDEF
+  chmod +x "$OW/files/etc/uci-defaults/98-beep-multiroom-replaynet"
+fi
+
 make defconfig >/dev/null
 
 echo "== 5. build (this is the long one) =="
