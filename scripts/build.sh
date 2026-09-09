@@ -62,7 +62,7 @@ if [ -n "${RECOVERY:-}" ]; then
         "$OW"/files/etc/snapserver.conf 2>/dev/null || true
   cp -a "$SRC/recovery-overlay/." "$OW/files/"
 
-  cat > .config <<CFG
+  cat > .config <<'CFG'
 CONFIG_TARGET_ath79=y
 CONFIG_TARGET_ath79_generic=y
 CONFIG_TARGET_ath79_generic_DEVICE_8dev_carambola2=y
@@ -268,7 +268,7 @@ echo "== 4. package selection =="
 # selections across builds (e.g. libffmpeg-full pulled in by a since-removed
 # shairport), and `make defconfig` preserves already-set package symbols, so a
 # 'lean' rebuild kept shipping ~12MB of ffmpeg. Starting clean avoids that.
-cat > .config <<CFG
+cat > .config <<'CFG'
 CONFIG_TARGET_ath79=y
 CONFIG_TARGET_ath79_generic=y
 CONFIG_TARGET_ath79_generic_DEVICE_8dev_carambola2=y
@@ -333,7 +333,7 @@ CFG
 # compressed source (LZMA ERROR 1). The full image still boots fine from FLASH;
 # the lean image is purely for zero-risk RAM-boot driver testing.
 if [ -z "${LEAN:-}" ]; then
-cat >> .config <<CFG
+cat >> .config <<'CFG'
 # shairport-sync mbedtls variant links avahi so it ADVERTISES over mDNS (the mini
 # variant's tinysvcmdns cannot). In DEFAULT mode 1b strips --with-airplay-2 from
 # this same package → it becomes a light classic AirPlay-1 receiver.
@@ -350,7 +350,7 @@ CONFIG_PACKAGE_iwinfo=y
 CONFIG_PACKAGE_usign=y
 CFG
 if [ -n "${AIRPLAY2:-}" ]; then
-cat >> .config <<CFG
+cat >> .config <<'CFG'
 # AIRPLAY2 image: buffered AAC needs a float-capable ffmpeg decoder (trimmed to
 # audio-dec in 1b). No Snapcast here — this image is for AP2 CPU-reduction work.
 CONFIG_PACKAGE_libffmpeg-audio-dec=y
@@ -359,7 +359,7 @@ CONFIG_PACKAGE_libffmpeg-audio-dec=y
 # CONFIG_PACKAGE_snapclient is not set
 CFG
 else
-cat >> .config <<CFG
+cat >> .config <<'CFG'
 # DEFAULT image: Snapcast multi-room. The AirPlay-receiving Beep runs snapserver
 # (fed by the classic AirPlay-1 shairport pipe); every Beep runs snapclient and
 # plays to the shared server timeline → sample-accurate sync. Classic AirPlay-1
@@ -393,7 +393,7 @@ fi
 else
 # Explicitly DISABLE (not just omit) — build.sh appends to .config, so a prior
 # full build's =y lines are still present; last-wins in kconfig must turn them off.
-cat >> .config <<CFG
+cat >> .config <<'CFG'
 # CONFIG_PACKAGE_shairport-sync-mini is not set
 # CONFIG_PACKAGE_uhttpd is not set
 # CONFIG_PACKAGE_uhttpd-mod-ubus is not set
