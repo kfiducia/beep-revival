@@ -325,6 +325,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The self-hosted runner is PERSISTENT (unlike ubuntu-latest), so /tmp scratch
+      # survives between runs: a leftover /tmp/usign makes the next `git clone` abort
+      # ("destination path already exists"), and a stale /tmp/collected could mix in a
+      # previous version's images. Wipe both before we use them. (release/ lives in the
+      # workspace, which actions/checkout already cleans.)
+      - name: Clean persistent-runner /tmp scratch
+        run: rm -rf /tmp/usign /tmp/collected
+
       # Pull both variants' artifacts back into /tmp/collected with their original
       # filenames (merge-multiple flattens images-ap1 + images-ap2 into one dir).
       - name: Download image artifacts
