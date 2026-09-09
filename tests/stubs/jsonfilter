@@ -1,0 +1,3 @@
+#!/bin/sh
+# fake jsonfilter: extract the boolean after "access": from stdin (what beep-ota asks for).
+sed -n 's/.*"access":[[:space:]]*\([a-z]*\).*/\1/p'

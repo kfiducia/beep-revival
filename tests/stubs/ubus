@@ -1,0 +1,4 @@
+#!/bin/sh
+# fake ubus: emit {"access":<UBUS_ACCESS>} (default false) for the session-access call.
+printf '{"access":%s}\n' "${UBUS_ACCESS:-false}"
+exit 0

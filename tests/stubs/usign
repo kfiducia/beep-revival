@@ -1,0 +1,3 @@
+#!/bin/sh
+# fake usign: signature verdict comes from $USIGN_RESULT (0 = valid, default 0).
+exit "${USIGN_RESULT:-0}"

@@ -18,6 +18,9 @@
 GESTURE="$1"; ARG="$2"
 NLEDS=24              # LED ring resolution == number of volume levels (1 LED per detent)
 LOGT="beep-action"
+# (testability) state dir is overridable so the gesture logic can be exercised off-device
+# against a temp dir; unset on a unit, so this is byte-identical to the original /var/run/beep.
+BEEP_RUN="${BEEP_RUN_DIR:-/var/run/beep}"
 
 log() { logger -t "$LOGT" "$*"; }
 
@@ -39,14 +42,14 @@ case "$GESTURE" in
 		# Read our last-known level from the state file — NOT `amixer get`. Per-detent
 		# turns fire up to ~12x/s; forking amixer-get + logger each time spiked the CPU
 		# and made audio choppy on the AR9331. One `amixer set` is the only fork here.
-		cur="$(cat /var/run/beep/volume 2>/dev/null)"
+		cur="$(cat "$BEEP_RUN/volume" 2>/dev/null)"
 		case "$cur" in ''|*[!0-9]*) cur="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)";; esac
 		case "$cur" in ''|*[!0-9]*) cur=0;; esac
 		lvl=$(( (cur * NLEDS + 50) / 100 + step ))   # current LED level +/- one step
 		[ "$lvl" -lt 0 ] && lvl=0; [ "$lvl" -gt "$NLEDS" ] && lvl="$NLEDS"
 		pct=$(( (lvl * 100 + NLEDS / 2) / NLEDS ))   # snap back to % for the DAC
 		amixer -M -q set Master "${pct}%" 2>/dev/null
-		echo "$pct" > /var/run/beep/volume           # beepd arc reads this (no per-detent logger)
+		echo "$pct" > "$BEEP_RUN/volume"           # beepd arc reads this (no per-detent logger)
 		;;
 	tap)
 		# Soft mute/unmute. The softvol "Master" has a volume capability but NO mute
@@ -56,19 +59,19 @@ case "$GESTURE" in
 		# 0; the next tap restores it.
 		cur="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)"
 		case "$cur" in ''|*[!0-9]*) cur=0;; esac
-		mkdir -p /var/run/beep
+		mkdir -p "$BEEP_RUN"
 		if [ "$cur" -gt 0 ]; then
-			echo "$cur" > /var/run/beep/premute-vol
+			echo "$cur" > "$BEEP_RUN/premute-vol"
 			amixer -M -q set Master 0% 2>/dev/null
-			echo 0 > /var/run/beep/volume
-			: > /var/run/beep/muted            # flag: beepd shows the muted indicator
+			echo 0 > "$BEEP_RUN/volume"
+			: > "$BEEP_RUN/muted"            # flag: beepd shows the muted indicator
 			log "tap: muted (was ${cur}%)"
 		else
-			prev="$(cat /var/run/beep/premute-vol 2>/dev/null)"
+			prev="$(cat "$BEEP_RUN/premute-vol" 2>/dev/null)"
 			case "$prev" in ''|*[!0-9]*|0) prev=30;; esac
 			amixer -M -q set Master "${prev}%" 2>/dev/null
-			echo "$prev" > /var/run/beep/volume
-			rm -f /var/run/beep/muted
+			echo "$prev" > "$BEEP_RUN/volume"
+			rm -f "$BEEP_RUN/muted"
 			log "tap: unmuted -> ${prev}%"
 		fi
 		;;
@@ -101,9 +104,9 @@ case "$GESTURE" in
 		# an unsigned image only while this fresh, short-lived flag exists, so a
 		# remote attacker (even with a stolen admin session) cannot flash unsigned.
 		log "triple-tap: opened 60s physical-presence window for unsigned upload"
-		mkdir -p /var/run/beep
-		echo $(( $(date +%s) + 60 )) > /var/run/beep/phys-confirm
-		( sleep 60; rm -f /var/run/beep/phys-confirm ) >/dev/null 2>&1 &
+		mkdir -p "$BEEP_RUN"
+		echo $(( $(date +%s) + 60 )) > "$BEEP_RUN/phys-confirm"
+		( sleep 60; rm -f "$BEEP_RUN/phys-confirm" ) >/dev/null 2>&1 &
 		;;
 	*)
 		log "unknown gesture: $GESTURE"

@@ -14,10 +14,13 @@
 # a physical confirmation is live.
 say() { printf 'Status: %s\r\nContent-Type: application/json\r\n\r\n%s\n' "$1" "$2"; }
 fail() { rm -f /tmp/ota.bin /tmp/ota.sig; say "$1" "$2"; exit 0; }
+# (testability) phys-confirm path is overridable so the unsigned-upload gate can be
+# exercised off-device; unset on a unit, so this matches the original hard-coded path.
+: "${PHYS_CONFIRM:=/var/run/beep/phys-confirm}"
 
 phys_valid() {
-	[ -f /var/run/beep/phys-confirm ] || return 1
-	local exp now; exp="$(cat /var/run/beep/phys-confirm 2>/dev/null)"
+	[ -f "$PHYS_CONFIRM" ] || return 1
+	local exp now; exp="$(cat "$PHYS_CONFIRM" 2>/dev/null)"
 	now="$(date +%s)"
 	case "$exp" in ''|*[!0-9]*) return 1;; esac
 	[ "$now" -lt "$exp" ]

@@ -1,0 +1,75 @@
+name: CI (lint + unit tests)
+
+# Fast, free checks for the parts of the firmware that can be exercised OFF-device:
+#   * shell-lint   — shellcheck every shell script (glue + logic)
+#   * shell-tests  — POSIX-sh unit tests for the dangerous pure logic (bootcount decode,
+#                    volume math, OTA authorization gate) via hardware stubs
+#   * c-build      — compile the userspace daemon (beepd) with warnings on
+#
+# On-device behavior (AirPlay, real flashing, audio, the knob, the STM8 LED ring) needs
+# the AR9331 and is NOT covered here — see the release.yml image build and the on-device
+# smoke checklist in tests/README.md.
+#
+# ┌───────────────────────────────────────────────────────────────────────────────────┐
+# │ REPORT-ONLY: every job has `continue-on-error: true`, so a failure is VISIBLE (red  │
+# │ on the job) but the overall run stays green and never blocks a merge. To make a     │
+# │ check gate merges instead: remove its `continue-on-error` line AND add the job as a │
+# │ required status check in the branch-protection settings for `main`.                 │
+# └───────────────────────────────────────────────────────────────────────────────────┘
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    continue-on-error: true          # REPORT-ONLY (see header) — remove to make blocking
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint every shell script (by extension AND shebang)
+        run: |
+          set -u
+          # Collect *.sh plus any tracked file whose first line is a sh/bash/ash shebang
+          # (the overlay scripts are extensionless), de-duplicated.
+          files="$(
+            { git ls-files '*.sh'
+              git ls-files | while IFS= read -r f; do
+                head -n1 "$f" 2>/dev/null | grep -qE '^#!.*/(sh|bash|ash|dash)' && printf '%s\n' "$f"
+              done
+            } | sort -u
+          )"
+          echo "Linting:"; printf '  %s\n' $files
+          # No -s override: shellcheck reads each shebang/directive to pick the dialect.
+          shellcheck $files
+
+  shell-tests:
+    name: shell unit tests
+    runs-on: ubuntu-latest
+    continue-on-error: true          # REPORT-ONLY (see header) — remove to make blocking
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the shell test suite
+        run: sh tests/run.sh
+
+  c-build:
+    name: compile beepd (-Wall -Wextra)
+    runs-on: ubuntu-latest
+    continue-on-error: true          # REPORT-ONLY (see header) — remove to make blocking
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain + headers
+        run: sudo apt-get update && sudo apt-get install -y build-essential libasound2-dev libi2c-dev
+      - name: Compile the userspace daemon with warnings on
+        # -c only (no link): proves beepd.c compiles cleanly against ALSA/i2c headers.
+        # The i2s kernel module (feed/beep-i2s) needs a target kernel tree and is not built
+        # here. Warnings are surfaced but do not fail the job (report-only; no -Werror).
+        run: gcc -std=gnu11 -Wall -Wextra -c feed/beepd/src/beepd.c -o /tmp/beepd.o
