@@ -1,20 +1,25 @@
 #!/bin/sh
-# Good-boot bootcount reset (guarded, OFF by default).
+# Good-boot bootcount reset (guarded, ARMED by default via /etc/beep-fwenv-verified).
 #
 # What it does: clears U-Boot's wear-leveled bootcount by rewriting the env sector, so
 # a run of transient reboots (power blips, etc.) can't slowly walk a HEALTHY primary
-# toward "Bootcount exceeded -> recovery". It is DEFENSE-IN-DEPTH, not the fix for the
-# 2026-09-08 brick: a deterministic early-boot hang never reaches here, so it never
-# resets a hung boot (correct). The valid recovery slot + OTA hardening are what cover
-# the hang case. See docs/RECOVERY-DESIGN.md.
+# toward "Bootcount exceeded -> recovery". Without it NOTHING resets the 3-strikes
+# counter (stock beepupdate is gone), so it only ever climbs and the unit drops to the
+# recovery slot after ~3 ordinary reboots FOR NO REASON — this reset is what stops that.
+# It is also DEFENSE-IN-DEPTH but NOT the fix for the 2026-09-08 brick: a deterministic
+# early-boot hang never reaches here, so it never resets a hung boot (correct). The valid
+# recovery slot + OTA hardening cover the hang case. See docs/RECOVERY-DESIGN.md.
 #
 # Why it is dangerous without proof: the reset uses fw_setenv, and a wrong
 # /etc/fw_env.config can make libubootenv reinit the env to U-Boot's stock defaults
-# (beep_primary=0x9f550000) which is a BRICK on our layout. Hence two HARD gates —
-# both must pass or this is a silent no-op:
-#   1. /etc/beep-fwenv-verified exists (created BY HAND only after a bench round-trip).
+# (beep_primary=0x9f550000) which is a BRICK on our layout. Hence two gates — both must
+# pass or this is a silent no-op:
+#   1. /etc/beep-fwenv-verified exists. It now SHIPS in the image (armed by default),
+#      because gate 2 is a genuine per-boot verification, not a promise — see that file.
 #   2. fw_printenv reads back beep_primary=0x9f050000 through fw_env.config (proves the
-#      config offset/size/CRC are correct). Any mismatch or Bad CRC -> abort, no write.
+#      config offset/size/CRC are correct for THIS unit). Any mismatch or Bad CRC ->
+#      abort, no write. This is the real safety interlock: a correct read proves the
+#      geometry is correct for the write too, and a wrong layout just fails closed.
 LOGT=beep-goodboot
 MARK=/etc/beep-fwenv-verified
 
