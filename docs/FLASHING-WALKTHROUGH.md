@@ -216,18 +216,28 @@ writes and reboots.
 
 ## Step 9 — Repoint the bootloader
 
-**What:** on reboot you'll get `Bad Magic Number` → `ar7240>` (expected — see Why). Then:
+**What:** on reboot you'll get `Bad Magic Number` → `ar7240>` (expected — see Why). Then
+set **both** pointers:
 ```
-ar7240> setenv beep_primary 0x9f050000
+ar7240> setenv beep_primary   0x9f050000
+ar7240> setenv beep_recovery  0x9f050000
 ar7240> saveenv
 ar7240> boot
 ```
-**Why:** stock `bootb` boots from `0x9f550000`, but our kernel lands at flash `0x50000`
-(`0x9f050000`). Repointing the primary slot makes `bootb` boot our kernel **while keeping
-its boot-count/recovery failsafe intact** — we only move the pointer, we don't bypass it.
-The `Bad Magic` on the very first boot is normal, not a brick.
+**Why:** stock `bootb` boots `beep_primary` from `0x9f550000`, but our kernel lands at flash
+`0x50000` (`0x9f050000`). Repointing primary makes `bootb` boot our kernel. The `Bad Magic`
+on the very first boot is normal, not a brick.
 
-**✓ Check:** our firmware boots to a login / the light ring animates.
+> ⚠️ **You MUST also set `beep_recovery` (this is not optional).** `bootb` is a
+> **3-strikes** failsafe: after 3 consecutive boots that don't get reset, the 4th boots
+> `beep_recovery`. On a stock unit `beep_recovery` still points at `0x9f550000` — which,
+> once primary is our kernel, is **garbage (mid-rootfs) → a UART-only brick.** There is no
+> real recovery slot yet, so we point `beep_recovery` at the **primary** too: a 3-strikes
+> trip then simply re-boots the primary (harmless) instead of bricking. (When a real
+> recovery slot exists, this becomes its address instead — see `docs/RECOVERY-DESIGN.md`.)
+
+**✓ Check:** our firmware boots to a login / the light ring animates, **and**
+`fw_printenv beep_recovery` (or `printenv` at `ar7240>`) reads back `0x9f050000`.
 
 ---
 
@@ -245,8 +255,33 @@ iw dev  ||  ip link show phy0-sta0
 address.
 
 **✓ Check:** it joins your network / serves `http://<its-ip>/`, and the wifi MAC matches
-your unit's `art` MAC. From here it's a normal AirPlay speaker; updates are signed
-uploads in the web UI (SSH stays off by default).
+your unit's `art` MAC.
+
+---
+
+## Step 11 — UART-exit checklist (do NOT unclip UART until all pass)
+
+Disconnecting UART and calling the unit "safe to network-update" is a real commitment:
+without a working recovery slot, UART is still the only backstop for a bad boot. **Do not
+remove it until every box is checked** — these are the things that turn a recoverable
+event into a UART-only brick if skipped.
+
+- [ ] **`beep_recovery` is repointed** — `fw_printenv beep_recovery` → `0x9f050000` (Step 9).
+      *Without this, a 3-strikes trip boots garbage = brick.*
+- [ ] **`fw_env.config` round-trips** — `fw_printenv beep_primary` → `0x9f050000`, and
+      `fw_setenv beep_probe 1 && fw_printenv beep_probe` returns `1`. Proves userspace can
+      read/write the env safely (needed before any good-boot bootcount reset is enabled).
+- [ ] **Bootcount data captured** — reboot 3–4× and record the serial
+      `Set bootcount 0x%02x offset 0x%08x` line each time; confirm it climbs and that the
+      unit does **not** unexpectedly drop to recovery. (Feeds the bootcount graduation
+      criteria in `docs/RECOVERY-DESIGN.md`.)
+- [ ] **Signed web-OTA proven** — do one signed update through the web UI and confirm it
+      reboots, rejoins Wi-Fi, and keeps its admin password + name (the curated-preserve
+      flash path). Ideally across a variant change (AP1↔AP2).
+- [ ] **Full backup exists** (Step 5) — you can restore `firmware` over the network.
+
+Only when all of the above hold is the unit genuinely "network-update safe." Then it's a
+normal AirPlay speaker; updates are signed uploads in the web UI (SSH stays off by default).
 
 ---
 
