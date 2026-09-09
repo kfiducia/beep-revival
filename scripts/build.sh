@@ -17,7 +17,19 @@ cd "$OW"
 echo "== 1. local package feed =="
 grep -q 'src-link beepfeed' feeds.conf.default || echo "src-link beepfeed $SRC/feed" >> feeds.conf.default
 ./scripts/feeds update beepfeed >/dev/null
-./scripts/feeds install -a -p beepfeed >/dev/null
+# -f FORCES (re)installation of every beepfeed package. Without it, `feeds install`
+# skips packages it thinks are already installed — so on the PERSISTENT runner a
+# package added to feed/ AFTER the tree was first populated (this bit `replaynet`)
+# never gets its package/feeds/beepfeed/<pkg> symlink, so `make` never builds it and it
+# is silently absent from the image. -f re-links them all every build.
+./scripts/feeds install -f -a -p beepfeed >/dev/null
+# Fail EARLY (clear message) if any feed/ package didn't get linked, rather than
+# discovering it only at the output-validation guard after a full compile.
+for p in $(ls -1 "$SRC/feed" 2>/dev/null); do
+	[ -f "$SRC/feed/$p/Makefile" ] || continue
+	[ -e "package/feeds/beepfeed/$p" ] || { echo "!! FEED: '$p' not installed (no package/feeds/beepfeed/$p) — check feed/$p/Makefile"; exit 5; }
+done
+echo "   feed OK: all beepfeed packages linked ($(ls -1 "$SRC/feed" | tr '\n' ' '))"
 
 # ============================================================================
 # RECOVERY=1 — build the minimal signed-reflash initramfs for the recovery slot.
