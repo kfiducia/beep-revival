@@ -1,10 +1,11 @@
 name: Release
 
 # Cut a signed Beep Revival firmware release. Push a tag like `v1.0.0` (or run
-# manually), and this builds BOTH shippable images on a GitHub-hosted runner —
-# AP1 (AirPlay-1 + Snapcast, the default) and AP2 (AirPlay-2, no Snapcast) — signs
+# manually), and this builds the shippable images on a GitHub-hosted runner —
+# AP1 (AirPlay-1 + Snapcast, the default), AP2 (AirPlay-2, no Snapcast), and
+# replaynet (AirPlay-1 + the fresh replaynet multi-room engine, no Snapcast) — signs
 # each sysupgrade with the usign OTA key (repo secret BEEP_OTA_SEC), and publishes a
-# GitHub Release with both signed .bins + raw images + a first-flash initramfs +
+# GitHub Release with the signed .bins + raw images + a first-flash initramfs +
 # checksums + pubkey.
 #
 # One-time setup: add the private OTA key as a repo secret named BEEP_OTA_SEC
@@ -14,17 +15,18 @@ name: Release
 #
 # ---------------------------------------------------------------------------
 # Job graph (fan-out / fan-in) — built for speed:
-#   prepare ─┬─▶ build (ap1) ─┐
-#            └─▶ build (ap2) ─┴─▶ release
+#   prepare ─┬─▶ build (ap1) ──────┐
+#            ├─▶ build (ap2) ──────┤
+#            └─▶ build (replaynet) ┴─▶ release
 #
 #   * prepare  — builds the OpenWrt cross-toolchain ONCE (cold) and saves the
 #                toolchain/staging + downloads cache + a seed ccache, so neither
 #                build job cold-builds the toolchain. Exposes the version string.
-#   * build    — a matrix over {ap1, ap2}; the two images compile IN PARALLEL,
+#   * build    — a matrix over {ap1, ap2, replaynet}; the images compile IN PARALLEL,
 #                each restoring the warm caches. ccache (below) makes the packages
 #                that build.sh force-`clean`s (ffmpeg/shairport/snapcast/…) recompile
 #                from cached objects instead of from scratch.
-#   * release  — fans back in: signs BOTH sysupgrades, assembles + publishes.
+#   * release  — fans back in: signs every sysupgrade, assembles + publishes.
 #
 # ccache: OpenWrt's compiler cache (CONFIG_CCACHE=y, needs CONFIG_DEVEL=y for the
 # symbol's prompt to survive `make defconfig`). It caches at the compiler-object
@@ -181,7 +183,7 @@ jobs:
     strategy:
       fail-fast: false     # a flake in one variant shouldn't cancel the other's build
       matrix:
-        variant: [ap1, ap2]
+        variant: [ap1, ap2, replaynet]
     env:
       CCACHE_DIR: /build/ccache   # pinned outside staging_dir; matches CONFIG_CCACHE_DIR
     steps:
@@ -292,6 +294,10 @@ jobs:
             echo "::group::AP2 build (AirPlay-2, no Snapcast)"
             AIRPLAY2=1 bash "$SRC/scripts/build.sh"
             echo "::endgroup::"
+          elif [ "${{ matrix.variant }}" = "replaynet" ]; then
+            echo "::group::replaynet build (AirPlay-1 + replaynet multi-room, no Snapcast)"
+            MULTIROOM=replaynet bash "$SRC/scripts/build.sh"
+            echo "::endgroup::"
           else
             echo "::group::AP1 build (AirPlay-1 + Snapcast, SSH OFF — no BEEP_DEV)"
             bash "$SRC/scripts/build.sh"
@@ -352,14 +358,14 @@ jobs:
           make -C /tmp/usign/build >/dev/null
           /tmp/usign/build/usign -h 2>&1 | head -1 || true
 
-      - name: Sign both sysupgrade images
+      - name: Sign all sysupgrade images
         env:
           BEEP_OTA_SEC: ${{ secrets.BEEP_OTA_SEC }}
         run: |
           [ -n "$BEEP_OTA_SEC" ] || { echo "::error::secret BEEP_OTA_SEC is not set"; exit 1; }
           umask 077; printf '%s\n' "$BEEP_OTA_SEC" > /tmp/beep-ota.sec
           V="${{ needs.prepare.outputs.version }}"
-          for variant in ap1 ap2; do
+          for variant in ap1 ap2 replaynet; do
             RAW="/tmp/collected/beep-revival-${V}-${variant}-sysupgrade.bin"
             SIGNED="/tmp/collected/beep-revival-${V}-${variant}-sysupgrade.signed.bin"
             USIGN=/tmp/usign/build/usign bash scripts/sign-release.sh "$RAW" /tmp/beep-ota.sec "$SIGNED"
@@ -380,6 +386,8 @@ jobs:
           cp /tmp/collected/beep-revival-${V}-ap1-sysupgrade.signed.bin release/
           cp /tmp/collected/beep-revival-${V}-ap2-sysupgrade.bin        release/
           cp /tmp/collected/beep-revival-${V}-ap2-sysupgrade.signed.bin release/
+          cp /tmp/collected/beep-revival-${V}-replaynet-sysupgrade.bin        release/
+          cp /tmp/collected/beep-revival-${V}-replaynet-sysupgrade.signed.bin release/
           cp /tmp/collected/beep-revival-${V}-initramfs-kernel.bin      release/
           cp rootfs-overlay/etc/beep-ota.pub release/beep-ota.pub
           ( cd release && sha256sum * > SHA256SUMS )
@@ -416,6 +424,14 @@ jobs:
 
             **Recommendation:** flash **`*-ap1-sysupgrade.signed.bin`** unless you specifically
             need the Apple Home app — AP1 is lossless, lighter, and keeps Snapcast multi-room.
+
+            ### Experimental: `*-replaynet-*` (new multi-room engine)
+            AirPlay-1 + **`replaynet`**, a from-scratch multi-room sync engine that replaces
+            Snapcast with one small daemon (no C++/boost). Sub-ms sync and dropout-free
+            steady-state validated on hardware (real-time playout thread + click-free
+            resampler); the full double-tap → group → AirPlay path is wired but not yet fully
+            soak-tested. **TRL 3 — for testing.** Flash `*-replaynet-sysupgrade.signed.bin` to
+            try it; flash an `ap1`/`ap2` image to go back.
 
             ### Install (already on Beep Revival)
             In the device's web admin → **Update firmware**, upload your chosen
