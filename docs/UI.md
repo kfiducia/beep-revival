@@ -25,17 +25,26 @@ The knob is a rotary encoder with a push-button, read by the STM8 companion MCU.
 24 LEDs. No LED sits exactly on a clock cardinal — 12 o'clock straddles the top
 two LEDs, 6 o'clock the bottom two.
 
-| State | What you see |
-|---|---|
-| **Boot** | A brief smiley (eyes at ~2 & ~10 o'clock, a wide smile across the bottom), then a short sweep. |
-| **Wi-Fi connecting** | A single dot orbiting a dim track. |
-| **Idle** (connected, nothing playing) | Just the **bottom two LEDs** gently breathing. |
-| **Volume** (while turning) | A bright arc from the bottom, clockwise, over a dim full-scale track. 50% = the whole left side. |
-| **Playing** (AirPlay) | A sparse, slow **twinkle** — random LEDs spark up and fade, ~30% lit at a time (a "something's playing" shimmer). |
-| **Muted** | A slow, dim whole-ring breath (clearly calmer than the playing twinkle). |
-| **Button press** | A single whole-ring pulse (tactile feedback). |
-| **Holding the knob** | The ring fills as a hold-progress meter (see the gesture table). |
-| **Wi-Fi setup mode** | A comet chasing around the ring — "reconfigure me". |
+The animations below are rendered from the actual on-device drawing code (see
+`feed/beepd/src/beepd.c` and `rootfs-overlay/usr/libexec/beep/led-stage`), at the
+device's real 24 Hz.
+
+| State | Animation | What it means |
+|---|---|---|
+| **Boot** | <img src="ui/boot.gif" width="150" alt="Boot"> | A power-on smiley, then "wings" rise from the bottom (6 o'clock) up both sides as it boots, then a full ring as it hands off to live status. |
+| **Wi-Fi connecting** | <img src="ui/wifi-connecting.gif" width="150" alt="Wi-Fi connecting"> | A single bright dot orbiting a dim full track while joining Wi-Fi. |
+| **Wi-Fi setup mode** | <img src="ui/wifi-setup.gif" width="150" alt="Wi-Fi setup"> | A comet chasing around a dark ring — "reconfigure me" (setup AP is up). |
+| **Idle** (connected, nothing playing) | <img src="ui/idle.gif" width="150" alt="Idle"> | Just the **bottom two LEDs** gently breathing — on, at rest. |
+| **Sleep** (deep idle) | <img src="ui/sleep.gif" width="150" alt="Sleep"> | The same bottom two dots, slower and dimmer, after a longer idle. |
+| **Volume** (while turning) | <img src="ui/volume.gif" width="150" alt="Volume"> | A bright arc from the bottom, clockwise, over a dim full-scale track. 50% = the whole left side. |
+| **Playing** (AirPlay) | <img src="ui/playing.gif" width="150" alt="Playing"> | A sparse, slow **twinkle** — random LEDs spark up and fade (a "something's playing" shimmer). |
+| **Muted** | <img src="ui/muted.gif" width="150" alt="Muted"> | A slow, dim whole-ring breath (clearly calmer than the playing twinkle). |
+| **Button press** | <img src="ui/button-press.gif" width="150" alt="Button press"> | A single whole-ring pulse (tactile feedback). |
+| **Holding the knob** | <img src="ui/holding-knob.gif" width="150" alt="Holding the knob"> | A hold-progress meter: fills once at ~10 s (release → Wi-Fi setup), then empties and fills again on a brighter track to ~30 s (factory reset). |
+| **Firmware update** (OTA) | <img src="ui/ota-update.gif" width="150" alt="Firmware update"> | The dial fills clockwise from 12 o'clock over the flash — don't power off. |
+| **Failsafe / warning** | <img src="ui/failsafe.gif" width="150" alt="Failsafe"> | Alternating LEDs blinking — the boot failsafe / a warning state. |
+
+*(GIFs regenerated with `scripts/led-ui-gifs.py`.)*
 
 ---
 
