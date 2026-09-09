@@ -1,0 +1,33 @@
+#!/bin/sh
+# Re-register AirPlay (shairport-sync) mDNS whenever the Wi-Fi STA (re)associates.
+#
+# THE BUG (diagnosed 2026-09-09, copper vs silver on the same AP):
+# At boot every service starts in parallel, and the ath9k STA associates a few
+# seconds in WITH a brief association wobble (a boot-only Reason-6 re-assoc; the
+# wwan IPv4 address is withdrawn then re-added — visible in the avahi log as
+# "Withdrawing address record ... New relevant interface ... Registering new
+# address record"). shairport-sync registers its _raop._tcp service with avahi
+# over D-Bus at startup; if that registration lands DURING the address flap, the
+# Avahi entry group is dropped and nothing re-establishes it once the link is
+# stable. Result: the device is fully up (RTSP :5000 listening, engine running)
+# but INVISIBLE to every AirPlay controller until shairport-sync is restarted.
+# It's a race, so it bites intermittently — a device can be silently un-airplayable
+# with everything otherwise "green". See memory: airplay-mdns-boot-race.
+#
+# THE FIX:
+# hotplug.d/iface fires on netifd's ifup for the logical STA interface (wwan) —
+# which happens at the final boot association AND at the wobble (an L3 address
+# re-add), exactly when we need to re-announce. netcheck's ~20s poll can't see the
+# sub-second reassoc; this hook does. A full ifup only occurs on a real
+# (re)association (which already dropped any active stream), so bouncing shairport
+# here does not interrupt normal playback. shairport-sync's procd init makes the
+# restart idempotent even if this races its own boot start.
+#
+# No-op on variants without shairport (e.g. the LMS build) and when it's disabled.
+# NOTE: hotplug.d scripts are SOURCED, so never `exit` here (it would abort the
+# whole hotplug chain) — guard with a positive if-block instead.
+if [ "$ACTION" = ifup ] && [ "$INTERFACE" = wwan ] \
+   && [ -x /etc/init.d/shairport-sync ] && /etc/init.d/shairport-sync enabled 2>/dev/null; then
+	logger -t beep-airplay "wwan ifup -> restarting shairport-sync to (re)register _raop mDNS"
+	/etc/init.d/shairport-sync restart 2>/dev/null
+fi
