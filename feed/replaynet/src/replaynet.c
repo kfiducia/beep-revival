@@ -170,6 +170,11 @@ static const char *g_role = "replaynet";
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int s) { (void)s; g_stop = 1; }
 
+/* Click-free playout: correct schedule drift with a continuous resample-ratio trim
+ * (rn_rsmp) instead of drop/insert. Opt-in (--resample) so the proven drop/insert path
+ * stays the default; a forked node player (spawn_player) inherits this via the global. */
+static int g_resample = 0;
+
 static void plog(const char *level, const char *fmt, ...)
 {
 	struct timespec ts;
@@ -974,6 +979,14 @@ static int run_sink(const char *out_path, uint16_t port)
 #define RN_SYNC_MAXSTEP     8820         /* ~200 ms max drop/insert per correction */
 #define RN_SYNC_FLOOR       6615         /* ~150 ms — never drop the ring below this (keep
                                             steady output; a starved sink XRUN-cascades) */
+/* --resample (click-free) servo: a gentle P-controller mapping schedule error (frames) to
+ * a resample-ratio trim on rs.step. Gain 3/4 step-unit per frame (~11 ppm/frame, ~2 s time
+ * constant); clamp to ~3000 ppm (max 0.3% pitch shift, inaudible) so a big error can't
+ * starve the window like the earlier ±20000 ppm attempt did. Small deadband since the trim
+ * is click-free — we can hold much tighter than drop/insert's 2 ms. */
+#define RN_RSMP_MAXPPM      197          /* ~3000 ppm, in Q16.16 step units (65536 == 1.0) */
+#define RN_RSMP_DEADBAND    8            /* ~0.18 ms — below this, no trim (avoid micro-dither) */
+#define RN_RSMP_FEED_CHUNK  256          /* frames per feed from ring into the window */
 #define RN_BUF_TOLERANCE_FRAMES 4410     /* ~100 ms — ride wifi jitter in the buffer;
                                             only correct sustained drift, not bursts */
 #define RN_LOCK_PING_NS     (50ll * 1000000ll)     /* fast pings while locking (short prebuffer) */
@@ -1107,11 +1120,17 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 	 * sync now; swapping the drop/insert for the (unit-tested) cubic resampler to make
 	 * corrections click-free is the follow-up. */
 	uint8_t period[RN_ALSA_PERIOD_FRAMES * RN_FRAME_BYTES];
-	uint64_t played_src = 0;          /* source sample index of the next ring frame to pop */
+	uint64_t played_src = 0;          /* source sample index of the next ring frame to pop (drop/insert)
+	                                     or to feed into the resampler (--resample) */
 	int have_played = 0;
 	uint64_t out_frames = 0;
 	int64_t err = 0, cum = 0, last_corr = 0;
 	int frames_since_log = 0, eof = 0;
+
+	/* --resample state: the window is fed from the ring and pulled at a servo-trimmed
+	 * ratio. rsbuf is a properly-typed (int16) output buffer for one period. */
+	static struct rn_rsmp rs; rn_rsmp_init(&rs);
+	int16_t rsbuf[RN_ALSA_PERIOD_FRAMES * RN_CHANNELS];
 
 	/* Cap the lock-phase prebuffer so playout doesn't start seconds deep (keep <= the
 	 * target buffer); the schedule servo does the absolute alignment from here. */
@@ -1136,56 +1155,107 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 			have_played = 1;
 		}
 
-		/* absolute-schedule servo: align the sample leaving the DAC to the shared
-		 * schedule by dropping (behind) or inserting silence (ahead), rate-limited. */
 		snd_pcm_sframes_t queued = 0;
 		if (snd_pcm_delay(pcm, &queued) < 0 || queued < 0) queued = 0;
-		if (have_played) {
-			int64_t audible = (int64_t)played_src - queued;              /* sample leaving the DAC now */
-			int64_t sched = (int64_t)anchor_sample +
-			                ((now_ns() - want_local) * RN_RATE) / 1000000000ll;
-			err = sched - audible;                                       /* >0 => behind => drop ahead */
-			int64_t tnow = now_ns();
-			if ((err > RN_SYNC_DEADBAND || err < -RN_SYNC_DEADBAND) &&
-			    tnow - last_corr >= RN_CORR_PERIOD_NS) {
-				last_corr = tnow;
-				if (err > 0) {                                       /* behind -> skip ahead */
-					int64_t d = err > RN_SYNC_MAXSTEP ? RN_SYNC_MAXSTEP : err;
-					int64_t droppable = (int64_t)(rb_avail(&ring) / RN_FRAME_BYTES) - RN_SYNC_FLOOR;
-					if (d > droppable) d = droppable;                /* keep the ring floor (no XRUN cascade) */
-					if (d > 0) {
-						size_t dropped = rb_drop(&ring, (size_t)d * RN_FRAME_BYTES) / RN_FRAME_BYTES;
-						played_src += dropped; cum += (int64_t)dropped;
+
+		if (!g_resample) {
+			/* DEFAULT — absolute-schedule servo: align the sample leaving the DAC to the
+			 * shared schedule by dropping (behind) or inserting silence (ahead), rate-limited. */
+			if (have_played) {
+				int64_t audible = (int64_t)played_src - queued;              /* sample leaving the DAC now */
+				int64_t sched = (int64_t)anchor_sample +
+				                ((now_ns() - want_local) * RN_RATE) / 1000000000ll;
+				err = sched - audible;                                       /* >0 => behind => drop ahead */
+				int64_t tnow = now_ns();
+				if ((err > RN_SYNC_DEADBAND || err < -RN_SYNC_DEADBAND) &&
+				    tnow - last_corr >= RN_CORR_PERIOD_NS) {
+					last_corr = tnow;
+					if (err > 0) {                                       /* behind -> skip ahead */
+						int64_t d = err > RN_SYNC_MAXSTEP ? RN_SYNC_MAXSTEP : err;
+						int64_t droppable = (int64_t)(rb_avail(&ring) / RN_FRAME_BYTES) - RN_SYNC_FLOOR;
+						if (d > droppable) d = droppable;                /* keep the ring floor (no XRUN cascade) */
+						if (d > 0) {
+							size_t dropped = rb_drop(&ring, (size_t)d * RN_FRAME_BYTES) / RN_FRAME_BYTES;
+							played_src += dropped; cum += (int64_t)dropped;
+						}
+					} else {                                             /* ahead -> hold with silence */
+						int64_t d = -err > RN_SYNC_MAXSTEP ? RN_SYNC_MAXSTEP : -err;
+						if (d > RN_ALSA_PERIOD_FRAMES) d = RN_ALSA_PERIOD_FRAMES;
+						memset(period, 0, (size_t)d * RN_FRAME_BYTES);
+						if (alsa_write(pcm, period, (snd_pcm_uframes_t)d) < 0) { rc = 1; goto drainclose; }
+						out_frames += (uint64_t)d; cum -= d;
 					}
-				} else {                                             /* ahead -> hold with silence */
-					int64_t d = -err > RN_SYNC_MAXSTEP ? RN_SYNC_MAXSTEP : -err;
-					if (d > RN_ALSA_PERIOD_FRAMES) d = RN_ALSA_PERIOD_FRAMES;
-					memset(period, 0, (size_t)d * RN_FRAME_BYTES);
-					if (alsa_write(pcm, period, (snd_pcm_uframes_t)d) < 0) { rc = 1; goto drainclose; }
-					out_frames += (uint64_t)d; cum -= d;
 				}
 			}
-		}
 
-		/* steady output: one full period per iteration (writei paces us at DAC rate) */
-		if (rb_avail(&ring) >= sizeof(period)) {
-			rb_pop(&ring, period, sizeof(period));
-			if (alsa_write(pcm, period, RN_ALSA_PERIOD_FRAMES) < 0) { rc = 1; goto drainclose; }
-			played_src += RN_ALSA_PERIOD_FRAMES; out_frames += RN_ALSA_PERIOD_FRAMES;
-		} else if (eof) {
-			size_t rem = rb_avail(&ring) / RN_FRAME_BYTES;
-			if (rem) { rb_pop(&ring, period, rem * RN_FRAME_BYTES); alsa_write(pcm, period, rem); }
-			break;
+			/* steady output: one full period per iteration (writei paces us at DAC rate) */
+			if (rb_avail(&ring) >= sizeof(period)) {
+				rb_pop(&ring, period, sizeof(period));
+				if (alsa_write(pcm, period, RN_ALSA_PERIOD_FRAMES) < 0) { rc = 1; goto drainclose; }
+				played_src += RN_ALSA_PERIOD_FRAMES; out_frames += RN_ALSA_PERIOD_FRAMES;
+			} else if (eof) {
+				size_t rem = rb_avail(&ring) / RN_FRAME_BYTES;
+				if (rem) { rb_pop(&ring, period, rem * RN_FRAME_BYTES); alsa_write(pcm, period, rem); }
+				break;
+			} else {
+				struct pollfd pfd = { .fd = sock, .events = POLLIN };
+				poll(&pfd, 1, 5);                                         /* wait for network */
+			}
 		} else {
-			struct pollfd pfd = { .fd = sock, .events = POLLIN };
-			poll(&pfd, 1, 5);                                         /* wait for network */
+			/* --resample (click-free) — feed the ring into the resampler and pull a full
+			 * period per iteration at a ratio the schedule servo trims. writei still paces
+			 * us; we NEVER wait mid-period, and we keep step within ~3000 ppm so the window
+			 * drains at ~1x and can't starve (the failure mode of the earlier attempt). */
+			int unconsumed = rs.win_n - rs.ri;              /* input frames buffered in the window */
+			while (unconsumed < RN_ALSA_PERIOD_FRAMES + 64) {
+				size_t availf = rb_avail(&ring) / RN_FRAME_BYTES;
+				if (availf == 0) break;
+				int take = availf > RN_RSMP_FEED_CHUNK ? RN_RSMP_FEED_CHUNK : (int)availf;
+				if (take > RN_RSMP_WIN - unconsumed - 4) take = RN_RSMP_WIN - unconsumed - 4;
+				if (take <= 0) break;
+				int16_t chunk[RN_RSMP_FEED_CHUNK * RN_CHANNELS];
+				rb_pop(&ring, (uint8_t *)chunk, (size_t)take * RN_FRAME_BYTES);
+				rn_rsmp_feed(&rs, chunk, take);
+				played_src += (uint64_t)take;               /* ring frames consumed (source samples) */
+				unconsumed = rs.win_n - rs.ri;
+			}
+
+			/* schedule servo -> resample ratio: P-controller, click-free, clamped. */
+			if (have_played) {
+				int64_t res_src = (int64_t)played_src - unconsumed;              /* source sample at read head */
+				int64_t queued_src = ((int64_t)queued * rs.step) >> 16;          /* ALSA-queued output -> source samples */
+				int64_t audible = res_src - queued_src;
+				int64_t sched = (int64_t)anchor_sample +
+				                ((now_ns() - want_local) * RN_RATE) / 1000000000ll;
+				err = sched - audible;                                           /* >0 => behind => read faster */
+				int64_t d = 0;
+				if (err > RN_RSMP_DEADBAND || err < -RN_RSMP_DEADBAND) d = (err * 3) / 4;
+				if (d >  RN_RSMP_MAXPPM) d =  RN_RSMP_MAXPPM;
+				if (d < -RN_RSMP_MAXPPM) d = -RN_RSMP_MAXPPM;
+				rs.step = 65536 + d;                                             /* >1 => catch up; <1 => hold back */
+				cum = d * 1000000 / 65536;                                       /* report current trim, ppm */
+			}
+
+			/* steady output: always a full period; the DAC paces us. If the window is short
+			 * (ring starved) write silence rather than a partial buffer, to avoid an XRUN. */
+			if ((rs.win_n - rs.ri) >= RN_ALSA_PERIOD_FRAMES + 3) {
+				rn_rsmp_pull(&rs, rsbuf, RN_ALSA_PERIOD_FRAMES);
+				if (alsa_write(pcm, (const uint8_t *)rsbuf, RN_ALSA_PERIOD_FRAMES) < 0) { rc = 1; goto drainclose; }
+				out_frames += RN_ALSA_PERIOD_FRAMES;
+			} else if (eof) {
+				break;
+			} else {
+				struct pollfd pfd = { .fd = sock, .events = POLLIN };
+				poll(&pfd, 1, 5);                                                /* wait for network */
+			}
 		}
 
 		if (++frames_since_log >= 100) {                                 /* ~1 s */
 			frames_since_log = 0;
 			plog("INFO", "playout: %" PRIu64 " out, sched err %+" PRId64 " frames (%+" PRId64
-			     " us), net corr %+" PRId64 ", ring %zu ms",
-			     out_frames, err, err * 1000000 / RN_RATE, cum,
+			     " us), %s %+" PRId64 "%s, ring %zu ms",
+			     out_frames, err, err * 1000000 / RN_RATE,
+			     g_resample ? "trim" : "net corr", cum, g_resample ? " ppm" : "",
 			     rb_avail(&ring) / RN_FRAME_BYTES * 1000 / RN_RATE);
 		}
 	}
@@ -1640,9 +1710,9 @@ static void usage(const char *argv0)
 		"usage:\n"
 		"  %s --source --peer <ip:port> [--pcm <file|->]\n"
 		"            [--fake-clock-offset-ns N] [--fake-clock-rate-ppm P]\n"
-		"  %s --sink   --listen <port>  [--out <file|-> | --alsa <device>]\n"
+		"  %s --sink   --listen <port>  [--out <file|-> | --alsa <device>] [--resample]\n"
 		"  %s --node   --id <name> [--group <id>] [--listen <audio-port>]\n"
-		"            [--alsa <dev>] [--pcm <src>] [--signal N] [--no-audio]\n"
+		"            [--alsa <dev>] [--pcm <src>] [--signal N] [--no-audio] [--resample]\n"
 		"  %s --fanout --peers <ip1,ip2,...> [--listen <port>] [--pcm <src>]\n"
 		"  %s --ctl <cmd>          (become-source | join <id> | leave | status)\n"
 		"  %s --selftest\n"
@@ -1681,7 +1751,7 @@ int main(int argc, char **argv)
 	char host[64] = "127.0.0.1";
 	uint16_t port = 0;
 
-	enum { O_ID = 1001, O_GROUP, O_GPORT, O_SIGNAL, O_NOAUDIO, O_CTLPATH, O_PEERS, O_FANOUT };
+	enum { O_ID = 1001, O_GROUP, O_GPORT, O_SIGNAL, O_NOAUDIO, O_CTLPATH, O_PEERS, O_FANOUT, O_RESAMPLE };
 	static const struct option opts[] = {
 		{ "source", no_argument,       0, 'S' },
 		{ "sink",   no_argument,       0, 'K' },
@@ -1700,6 +1770,7 @@ int main(int argc, char **argv)
 		{ "gossip-port", required_argument, 0, O_GPORT },
 		{ "signal",   required_argument, 0, O_SIGNAL },
 		{ "no-audio", no_argument,       0, O_NOAUDIO },
+		{ "resample", no_argument,       0, O_RESAMPLE },
 		{ "ctl-path", required_argument, 0, O_CTLPATH },
 		{ "fake-clock-offset-ns", required_argument, 0, 'F' },
 		{ "fake-clock-rate-ppm",  required_argument, 0, 'R' },
@@ -1734,6 +1805,7 @@ int main(int argc, char **argv)
 		case O_GPORT: gossip_port = (uint16_t)atoi(optarg); break;
 		case O_SIGNAL: signal_lvl = atoi(optarg); break;
 		case O_NOAUDIO: no_audio = 1; break;
+		case O_RESAMPLE: g_resample = 1; break;
 		case O_CTLPATH: ctl_path = optarg; break;
 		case 'F': g_fake_clock_offset_ns = strtoll(optarg, NULL, 10); break;
 		case 'R': g_fake_clock_rate_ppm = strtoll(optarg, NULL, 10); break;

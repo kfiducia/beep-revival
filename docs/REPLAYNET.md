@@ -218,10 +218,16 @@ sink can't drop itself into starvation/XRUN. The click-free corrector is built a
 unit-tested as a pure component — `cubic_q16` (Catmull-Rom) plus a streaming `rn_rsmp`
 resampler (feed input / pull output at a Q16.16 `step`, phase + window carried across
 calls). `--selftest` covers unity fidelity, **cross-block continuity** (strictly monotone
-→ no splice → no click), and rate accuracy at a non-unity ratio. What remains is wiring it
-into `run_sink_alsa` in place of drop/insert (map the schedule error to a small ppm on
-`step`) and tuning the ppm gain/clamp on hardware — the math is proven, so that's a small,
-low-risk change once a unit is available to listen on.
+→ no splice → no click), and rate accuracy at a non-unity ratio. It is now **wired into
+`run_sink_alsa` behind `--resample`** (opt-in; drop/insert stays the default): the same
+schedule error drives a gentle P-controller (`~0.75` step-unit/frame, `~2 s` time constant)
+that trims `rs.step` within `±3000 ppm` — a max `0.3%` pitch shift, inaudible — instead of
+dropping/inserting samples. The ring feeds the resampler window in `256`-frame chunks and a
+full period is pulled every iteration (the DAC still paces us; we never wait mid-period and
+the near-unity ratio keeps the window from starving — the failure mode of the earlier
+attempt). The read head is tracked exactly as `played_src − (win_n − ri)`, so the servo math
+is unchanged. Remaining: tune the gain/clamp by ear on hardware and, if it holds, promote it
+to the default (and wire a UCI/init flag to pass `--resample` to the node).
 
 `--fanout` is a first-class mode (one source → many sinks) used by the node. Its sends
 are **non-blocking**: a frame goes to a sink only when it's writable (`POLLOUT`), else
