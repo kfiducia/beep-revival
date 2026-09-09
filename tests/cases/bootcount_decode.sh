@@ -6,7 +6,7 @@
 #
 # March scheme (top-bit-first per byte): 0xff->0x7f->0x3f->0x1f (high nibble),
 # then 0x0f->0x07->0x03->0x01 (low). Active nibble maps 0xf->0, 0x7->1, 0x3->2, 0x1->3.
-: "${REPO_ROOT:=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}"
+: "${REPO_ROOT:=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)}"
 . "$REPO_ROOT/tests/lib/harness.sh"
 T_NAME="bootcount-decode"
 

@@ -6,7 +6,7 @@
 #   ./tests/run.sh volume     # run only cases whose filename matches *volume*
 set -u
 
-REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 export REPO_ROOT
 filter="${1:-}"
 

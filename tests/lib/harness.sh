@@ -19,7 +19,7 @@ T_FAIL=0
 T_NAME="${T_NAME:-$(basename "${0:-tests}")}"
 
 # Locate the repo root so cases can run standalone (REPO_ROOT wins if run.sh set it).
-: "${REPO_ROOT:=$(CDPATH= cd -- "$(dirname -- "$0")/../.." 2>/dev/null && pwd)}"
+: "${REPO_ROOT:=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." 2>/dev/null && pwd)}"
 T_STUBS="$REPO_ROOT/tests/stubs"
 
 _t_ok()   { T_PASS=$((T_PASS + 1)); printf '  ok   %s\n' "$1"; }

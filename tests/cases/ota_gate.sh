@@ -7,7 +7,7 @@
 #
 # Threat model: SIGNED needs a valid signature (+admin session on a primary); UNSIGNED
 # needs a FRESH physical triple-tap (the phys-confirm window), which no remote actor has.
-: "${REPO_ROOT:=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}"
+: "${REPO_ROOT:=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)}"
 . "$REPO_ROOT/tests/lib/harness.sh"
 T_NAME="ota-gate"
 t_use_stubs

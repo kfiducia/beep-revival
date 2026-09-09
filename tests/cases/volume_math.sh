@@ -6,7 +6,7 @@
 #
 # turn math (NLEDS=24): lvl = round(cur*24/100) + step(±1), clamped 0..24;
 #                       pct = round(lvl*100/24). One call = exactly one LED step.
-: "${REPO_ROOT:=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}"
+: "${REPO_ROOT:=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)}"
 . "$REPO_ROOT/tests/lib/harness.sh"
 T_NAME="volume-math"
 t_use_stubs
