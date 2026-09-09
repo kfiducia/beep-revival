@@ -1,0 +1,21 @@
+# shellcheck configuration for the Beep firmware (BusyBox ash / OpenWrt) tree.
+#
+# These disables silence the KNOWN false positives for this codebase so the CI report
+# shows real signal instead of ~90 recurring non-issues. This does NOT change enforcement
+# (the CI shellcheck job is report-only); it just makes the output worth reading. Real
+# findings (unquoted expansions that matter, genuine parse errors, etc.) still surface.
+# Prefer a targeted inline `# shellcheck disable=SCxxxx` in a single file over adding a
+# code here, so a repo-wide disable stays reserved for genuinely repo-wide patterns.
+
+# SC3043: "In POSIX sh, 'local' is undefined." — false here. The target shell is BusyBox
+# ash, which DOES implement `local`; every init.d/rpcd script relies on it.
+disable=SC3043
+
+# SC2034: "VAR appears unused." — OpenWrt's /etc/rc.common consumes START/STOP/USE_PROCD
+# from init scripts by convention; they are used, just not visibly in-file.
+disable=SC2034
+
+# SC2317: "Command appears unreachable." — some scripts intentionally retain reference
+# code after `exit 0` (e.g. usr/libexec/beep/bootcount-reset documents the disabled
+# fw_setenv approach below its early exit).
+disable=SC2317
