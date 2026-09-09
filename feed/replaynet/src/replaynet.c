@@ -979,14 +979,27 @@ static int run_sink(const char *out_path, uint16_t port)
 #define RN_SYNC_MAXSTEP     8820         /* ~200 ms max drop/insert per correction */
 #define RN_SYNC_FLOOR       6615         /* ~150 ms — never drop the ring below this (keep
                                             steady output; a starved sink XRUN-cascades) */
-/* --resample (click-free) servo: a gentle P-controller mapping schedule error (frames) to
- * a resample-ratio trim on rs.step. Gain 3/4 step-unit per frame (~11 ppm/frame, ~2 s time
- * constant); clamp to ~3000 ppm (max 0.3% pitch shift, inaudible) so a big error can't
- * starve the window like the earlier ±20000 ppm attempt did. Small deadband since the trim
- * is click-free — we can hold much tighter than drop/insert's 2 ms. */
-#define RN_RSMP_MAXPPM      197          /* ~3000 ppm, in Q16.16 step units (65536 == 1.0) */
+/* --resample (click-free) servo is a HYBRID, like Snapcast-class engines: a rate trim for
+ * the steady state and a drop/insert "snap" for gross errors.
+ *   FINE (|err| <= SNAP): a gentle P-controller trims the resample ratio rs.step (65536 ==
+ *   1.0). Gain 3/4 step-unit per frame (~11 ppm/frame, ~2 s time constant), clamped to
+ *   ~3000 ppm (a 0.3% pitch shift, inaudible) so ongoing crystal drift is nulled with NO
+ *   clicks. The clamp also keeps step near unity so the window drains at ~1x and can't
+ *   starve (the failure mode of the earlier unclamped attempt). Small deadband since the
+ *   trim is click-free: we hold far tighter than drop/insert's 2 ms.
+ *   COARSE (|err| > SNAP): a resample can only trim ~1%, so it can't reel in a deep startup
+ *   prebuffer or a big network gap in reasonable time. Those snap via a rate-limited
+ *   drop/insert — instant, and rare enough that the one splice click lands only during the
+ *   join transient (exactly where plain drop/insert would click too). */
+#define RN_RSMP_STEP_FINE   197          /* ~3000 ppm — click-free steady-state ratio clamp */
+#define RN_RSMP_SNAP        882          /* >20 ms off => snap via drop/insert, else fine trim */
 #define RN_RSMP_DEADBAND    8            /* ~0.18 ms — below this, no trim (avoid micro-dither) */
 #define RN_RSMP_FEED_CHUNK  256          /* frames per feed from ring into the window */
+/* Slew-limit how fast the ratio may change per period (~10 ms). snd_pcm_delay on the i2s
+ * driver jitters by a few frames; without this, one noisy sample would yank the trim (and
+ * audibly bend pitch) chasing a phantom. 8 step-units/period ≈ 12000 ppm/s — fast enough
+ * to track any real crystal drift, slow enough to reject per-period measurement spikes. */
+#define RN_RSMP_SLEW        8
 #define RN_BUF_TOLERANCE_FRAMES 4410     /* ~100 ms — ride wifi jitter in the buffer;
                                             only correct sustained drift, not bursts */
 #define RN_LOCK_PING_NS     (50ll * 1000000ll)     /* fast pings while locking (short prebuffer) */
@@ -1220,20 +1233,42 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 				unconsumed = rs.win_n - rs.ri;
 			}
 
-			/* schedule servo -> resample ratio: P-controller, click-free, clamped. */
+			/* schedule servo: COARSE snap (drop/insert) for gross errors, else FINE ratio trim. */
 			if (have_played) {
 				int64_t res_src = (int64_t)played_src - unconsumed;              /* source sample at read head */
 				int64_t queued_src = ((int64_t)queued * rs.step) >> 16;          /* ALSA-queued output -> source samples */
 				int64_t audible = res_src - queued_src;
 				int64_t sched = (int64_t)anchor_sample +
 				                ((now_ns() - want_local) * RN_RATE) / 1000000000ll;
-				err = sched - audible;                                           /* >0 => behind => read faster */
-				int64_t d = 0;
-				if (err > RN_RSMP_DEADBAND || err < -RN_RSMP_DEADBAND) d = (err * 3) / 4;
-				if (d >  RN_RSMP_MAXPPM) d =  RN_RSMP_MAXPPM;
-				if (d < -RN_RSMP_MAXPPM) d = -RN_RSMP_MAXPPM;
-				rs.step = 65536 + d;                                             /* >1 => catch up; <1 => hold back */
-				cum = d * 1000000 / 65536;                                       /* report current trim, ppm */
+				err = sched - audible;                                           /* >0 => behind */
+				int64_t tnow = now_ns();
+				if ((err > RN_RSMP_SNAP || err < -RN_RSMP_SNAP) &&
+				    tnow - last_corr >= RN_CORR_PERIOD_NS) {                      /* COARSE: snap */
+					last_corr = tnow;
+					if (err > 0) {                                           /* behind -> drop from ring */
+						int64_t droppable = (int64_t)(rb_avail(&ring) / RN_FRAME_BYTES) - RN_SYNC_FLOOR;
+						int64_t drp = err < droppable ? err : droppable;
+						if (drp > 0) {
+							size_t dropped = rb_drop(&ring, (size_t)drp * RN_FRAME_BYTES) / RN_FRAME_BYTES;
+							played_src += dropped; cum += (int64_t)dropped;
+						}
+					} else {                                                 /* ahead -> insert silence */
+						int64_t ins = -err > RN_ALSA_PERIOD_FRAMES ? RN_ALSA_PERIOD_FRAMES : -err;
+						memset(rsbuf, 0, (size_t)ins * RN_FRAME_BYTES);
+						if (alsa_write(pcm, (const uint8_t *)rsbuf, (snd_pcm_uframes_t)ins) < 0) { rc = 1; goto drainclose; }
+						out_frames += (uint64_t)ins; cum -= ins;
+					}
+					rs.step = 65536;                                         /* reset trim; fine servo re-settles */
+				} else {                                                         /* FINE: click-free ratio trim */
+					int64_t d = 0;
+					if (err > RN_RSMP_DEADBAND || err < -RN_RSMP_DEADBAND) d = (err * 3) / 4;
+					if (d >  RN_RSMP_STEP_FINE) d =  RN_RSMP_STEP_FINE;
+					if (d < -RN_RSMP_STEP_FINE) d = -RN_RSMP_STEP_FINE;
+					int64_t target = 65536 + d, delta = target - rs.step;    /* slew toward target */
+					if (delta >  RN_RSMP_SLEW) delta =  RN_RSMP_SLEW;
+					if (delta < -RN_RSMP_SLEW) delta = -RN_RSMP_SLEW;
+					rs.step += delta;                                        /* >1 => catch up; <1 => hold back */
+				}
 			}
 
 			/* steady output: always a full period; the DAC paces us. If the window is short
@@ -1252,11 +1287,17 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 
 		if (++frames_since_log >= 100) {                                 /* ~1 s */
 			frames_since_log = 0;
-			plog("INFO", "playout: %" PRIu64 " out, sched err %+" PRId64 " frames (%+" PRId64
-			     " us), %s %+" PRId64 "%s, ring %zu ms",
-			     out_frames, err, err * 1000000 / RN_RATE,
-			     g_resample ? "trim" : "net corr", cum, g_resample ? " ppm" : "",
-			     rb_avail(&ring) / RN_FRAME_BYTES * 1000 / RN_RATE);
+			if (g_resample)
+				plog("INFO", "playout: %" PRIu64 " out, sched err %+" PRId64 " frames (%+" PRId64
+				     " us), trim %+" PRId64 " ppm, snap %+" PRId64 " fr, ring %zu ms",
+				     out_frames, err, err * 1000000 / RN_RATE,
+				     (rs.step - 65536) * 1000000 / 65536, cum,
+				     rb_avail(&ring) / RN_FRAME_BYTES * 1000 / RN_RATE);
+			else
+				plog("INFO", "playout: %" PRIu64 " out, sched err %+" PRId64 " frames (%+" PRId64
+				     " us), net corr %+" PRId64 ", ring %zu ms",
+				     out_frames, err, err * 1000000 / RN_RATE, cum,
+				     rb_avail(&ring) / RN_FRAME_BYTES * 1000 / RN_RATE);
 		}
 	}
 
