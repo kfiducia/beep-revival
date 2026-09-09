@@ -458,15 +458,18 @@ rm -rf "$OW"/build_dir/target-*/root-* 2>/dev/null || true
 # build_dir/target-*/linux-*/beepd` was wrong: beepd is a USERSPACE package
 # (build_dir/target-*/beepd-*/), not a kernel module, so its stamp was never cleared.
 # Use `package/.../clean`, which wipes BOTH the build_dir/stamp and the .ipk, so every
-# build recompiles our /src-linked packages from scratch. Feed dir = beepfeed; source
-# dirs = beepd, beep-i2s, sound-soc-extra (kmod target names derive from these).
-for p in beepd beep-i2s sound-soc-extra; do
+# build recompiles from scratch. Derive the list from feed/ (the beepfeed src dirs) so
+# EVERY local package is covered and a newly-added one can't silently fall out of the
+# list — the hardcoded {beepd,beep-i2s,sound-soc-extra} set had already gone stale:
+# replaynet + snapcast were added to feed/ but not here, leaving them droppable too.
+for p in $(ls -1 "$SRC/feed" 2>/dev/null); do
+	[ -f "$SRC/feed/$p/Makefile" ] || continue
 	make "package/feeds/beepfeed/$p/clean" >/dev/null 2>&1 \
-		|| echo "   (note: clean of $p returned non-zero — continuing)"
+		|| echo "   (note: clean of feed pkg '$p' returned non-zero — continuing)"
+	# also nuke any stale .ipk for this package (name may differ from the src dir,
+	# e.g. kmod-*; match loosely on the src-dir name).
+	find "$OW"/bin "$OW"/build_dir -name "*${p}*.ipk" -delete 2>/dev/null || true
 done
-find "$OW"/bin "$OW"/build_dir -name '*beep-i2s*.ipk' -delete 2>/dev/null || true
-find "$OW"/bin "$OW"/build_dir -name '*beepd*.ipk' -delete 2>/dev/null || true
-find "$OW"/bin "$OW"/build_dir -name '*sound-soc-extra*.ipk' -delete 2>/dev/null || true
 set -o pipefail   # else the pipe's exit = tee/tail, masking a make failure
 # Cap parallelism. On many-core hosts OpenWrt's recursive sub-makes (notably gcc's
 # bootstrap, and several base packages: zlib/usign/libjson-c) RACE at very high -j
@@ -478,20 +481,53 @@ make -j"$JOBS" 2>&1 | tee /build/image-build.log | tail -1
 MAKE_RC=$?
 [ "$MAKE_RC" -eq 0 ] || { echo "!! make FAILED (rc=$MAKE_RC) — see /build/image-build.log"; exit "$MAKE_RC"; }
 
-# GUARD: beepd (the STM8 knob/tap/LED daemon) and its kmod MUST be in the image. A
-# /src-linked feed package can go stale on a persistent runner and be silently DROPPED
-# — a green build that ships a daemon-less device (no ring/knob/volume). This shipped a
-# beepd-less 1.2.1 once (2026-09-09) and reached hardware. Fail loudly instead.
+# ============================================================================
+# OUTPUT TESTS — a green `make` is NOT proof the image is shippable. Verify, per
+# variant, that the built image actually contains what it should BEFORE it can be
+# signed/published. Two real regressions reached hardware and motivate these:
+#   * a stale /src-linked feed package was silently dropped -> a beepd-less image
+#     (no ring/knob/volume), 2026-09-09; and
+#   * the ap1 sysupgrade image came out with NO metadata -> on-device `sysupgrade -T`
+#     rejected it ("Image metadata not present"), same run, while replaynet was fine.
+# These checks fail the build loudly so neither can ship again.
+# ============================================================================
 BROOT="$(ls -d "$OW"/staging_dir/target-*/root-* 2>/dev/null | head -1)"
-[ -n "$BROOT" ] || { echo "!! GUARD: no staged rootfs found to verify beepd"; exit 6; }
-[ -x "$BROOT/usr/sbin/beepd" ] || {
-	echo "!! GUARD: beepd MISSING from the image rootfs ($BROOT/usr/sbin/beepd) —"
-	echo "   the beepfeed package did not build/install. Do NOT ship this image."
-	exit 6; }
-ls "$BROOT"/lib/modules/*/*beep*i2s* >/dev/null 2>&1 || {
-	echo "!! GUARD: kmod-beep-i2s MISSING from the image rootfs — I2S audio would be dead."
-	exit 6; }
-echo "   guard OK: beepd + kmod-beep-i2s present in the image rootfs"
+MANIFEST="$(ls "$OW"/bin/targets/ath79/generic/*8dev_carambola2*.manifest 2>/dev/null | head -1)"
+IMG="$(ls "$OW"/bin/targets/ath79/generic/*8dev_carambola2-squashfs-sysupgrade.bin 2>/dev/null | head -1)"
+[ -n "$BROOT" ] || { echo "!! OUTPUT-TEST: no staged rootfs found"; exit 6; }
+
+# 1) Required packages must be IN THE IMAGE (the manifest is authoritative). Core set
+# is always required; the multi-room engine is variant-specific (default = snapcast;
+# MULTIROOM=replaynet drops snapcast and ships the replaynet engine instead).
+req="beepd kmod-beep-i2s shairport-sync-mbedtls"
+if [ "${MULTIROOM:-}" = replaynet ]; then req="$req replaynet"; else req="$req snapserver snapclient"; fi
+[ -n "$MANIFEST" ] || { echo "!! OUTPUT-TEST: no image manifest found to verify packages"; exit 6; }
+for pkg in $req; do
+	grep -q "^$pkg " "$MANIFEST" || { echo "!! OUTPUT-TEST: package '$pkg' NOT in image manifest ($MANIFEST) — do NOT ship"; exit 6; }
+done
+echo "   output-test OK: packages present ($req)"
+# belt-and-suspenders: the beepd binary + kmod are physically in the rootfs
+[ -x "$BROOT/usr/sbin/beepd" ] || { echo "!! OUTPUT-TEST: /usr/sbin/beepd missing from rootfs — do NOT ship"; exit 6; }
+ls "$BROOT"/lib/modules/*/*beep*i2s* >/dev/null 2>&1 || { echo "!! OUTPUT-TEST: kmod-beep-i2s missing from rootfs — I2S audio dead"; exit 6; }
+
+# 2) sysupgrade METADATA must be present, or the device rejects the image with "Image
+# metadata not present". fwtool (host tool) extracts it: a non-zero rc with an empty
+# extract = definitively no metadata -> HARD fail. A missing fwtool / inconclusive
+# result only warns, so a tooling quirk can't false-fail an otherwise good build.
+FWTOOL="$OW/staging_dir/host/bin/fwtool"
+if [ -x "$FWTOOL" ] && [ -n "$IMG" ]; then
+	rm -f /tmp/beep-meta.json 2>/dev/null
+	"$FWTOOL" -q -i /tmp/beep-meta.json "$IMG" 2>/dev/null; fwrc=$?
+	if [ -s /tmp/beep-meta.json ]; then
+		echo "   output-test OK: sysupgrade metadata present ($IMG)"
+	elif [ "$fwrc" -ne 0 ]; then
+		echo "!! OUTPUT-TEST: sysupgrade metadata MISSING from $IMG — on-device 'sysupgrade -T' will reject it. Do NOT ship."; exit 6
+	else
+		echo "   WARN: metadata output-test inconclusive (fwtool rc=0, empty extract) — verify manually"
+	fi
+else
+	echo "   WARN: fwtool ($FWTOOL) or image not found — skipping metadata output-test"
+fi
 
 # GUARD: an AIRPLAY2 build MUST actually contain AirPlay 2. This silently regressed
 # once when a prior default build's --with-airplay-2 strip leaked into the Makefile,
