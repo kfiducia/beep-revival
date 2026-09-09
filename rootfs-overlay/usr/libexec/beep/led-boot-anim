@@ -1,0 +1,48 @@
+#!/bin/sh
+# led-boot-anim <total_secs> [brightness] [keep] — time-paced ring fill.
+#
+# Fills the STM8 ring from empty to full over ~total_secs, so the dots reach the top
+# about when the operation (a boot, or a firmware flash) finishes. It is PURELY
+# time-based, not real progress — that's deliberate: overshoot is fine (once full it
+# just holds), and it's the behaviour asked for ("the animation should take about as
+# long as the boot / the update"). Calibrate total_secs to the observed duration
+# (boot ~= 120 s on this unit; the flash ~= 60 s) — being a bit short only means the
+# ring sits full for the tail, which is acceptable.
+#
+# SAFE: led-stage is a no-op while the i2c bus is down, and callers background this so
+# it never blocks boot. Monotonic /proc/uptime is used so a pre-NTP wall-clock jump
+# can't mis-pace it.
+#
+# Stops on ANY of:
+#   * the stop marker /tmp/beep-led-anim-stop  (set_state done/failsafe drops it), or
+#   * beepd is running — it owns the ring from init START=95 (= "boot done"), so we
+#     hand off cleanly. Pass a 3rd arg "keep" to skip this check (used for the flash,
+#     where beepd is being torn down and must not abort the animation), or
+#   * a hard safety cap of 3x total_secs, so it can never spin forever.
+TOTAL="${1:-120}"
+V="${2:-50}"
+KEEP="$3"
+LEDSTAGE=/usr/libexec/beep/led-stage
+STOP=/tmp/beep-led-anim-stop
+NLED=24
+
+case "$TOTAL" in ''|*[!0-9]*|0) TOTAL=120 ;; esac
+case "$V"     in ''|*[!0-9]*)   V=50    ;; esac
+
+rm -f "$STOP" 2>/dev/null
+start="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+cap=$((TOTAL * 3))
+last=-1
+
+while [ ! -e "$STOP" ]; do
+	[ "$KEEP" = keep ] || { pidof beepd >/dev/null 2>&1 && break; }
+	now="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+	el=$((now - start)); [ "$el" -lt 0 ] && el=0
+	[ "$el" -ge "$cap" ] && break
+	# n = round(NLED * elapsed / TOTAL), clamped to a full ring.
+	n=$(( (el * NLED + TOTAL / 2) / TOTAL ))
+	[ "$n" -gt "$NLED" ] && n="$NLED"
+	[ "$n" -ne "$last" ] && { "$LEDSTAGE" fill "$n" "$V" 2>/dev/null; last="$n"; }
+	sleep 2
+done
+exit 0
