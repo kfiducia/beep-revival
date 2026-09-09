@@ -467,13 +467,15 @@ if [ "${MULTIROOM:-snapcast}" = replaynet ]; then
   mkdir -p "$OW/files/etc/uci-defaults"
   cat > "$OW/files/etc/uci-defaults/98-beep-multiroom-replaynet" <<'RNDEF'
 #!/bin/sh
-# Make replaynet the active multi-room engine (image built with MULTIROOM=replaynet):
-# select it in beep-group, enable the node, and default it to the shared group so Beeps
-# left at defaults auto-form one synced group. shairport is repointed to the replaynet
-# pipe by `beep-group apply` (the group_engine=replaynet branch).
+# Select replaynet as the multi-room engine (image built with MULTIROOM=replaynet) and
+# default it to the shared group so Beeps that DO group auto-form one synced group.
+# The unit still SHIPS SOLO/DIRECT: `beep-group apply` runs the solo case below, which
+# keeps the node engine OFF and plays shairport->ALSA directly, so a fresh single unit
+# has working AirPlay out of the box. The pipe engine is opt-in — a double-tap forms/
+# joins a group and flips shairport onto the /tmp/beep-pcm pipe + starts the node.
+# beep-group owns replaynet.node.enabled (on when grouped, off when solo).
 uci -q batch <<UCI
 set beep.main.group_engine=replaynet
-set replaynet.node.enabled=1
 set replaynet.node.group=1
 commit beep
 commit replaynet
