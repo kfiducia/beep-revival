@@ -183,20 +183,55 @@ verified `/etc/fw_env.config`, treat a lost env as a brick risk) is binding.
 | Wrong wifi pw / router moved / dead AP | 🔧 implemented, unverified on HW | netcheck watchdog → `Beep-Setup` WPA2 AP + web reconfig |
 | Bad config generally | 🔧 mostly (same, unverified) | same watchdog |
 | **Corrupt primary uImage** (bad CRC) | ⬜ this doc | `bootm` fails → `bootb` boots recovery on boot 1 |
-| **Primary loads but PANICS/HANGS** (e.g. interrupted sysupgrade: kernel wrote, rootfs didn't) | ⚠️ **NOT auto-covered** — see note | needs a good-boot bootcount reset we don't have yet |
+| **Primary loads but PANICS/HANGS** (e.g. interrupted sysupgrade: kernel wrote, rootfs didn't) | ⚠️ **actively DANGEROUS on our layout** — see DEFINITIVE note | `bootb` is a **3-strikes** failsafe; after 3 non-reset boots it jumps to `beep_recovery`. Our reset is OFF and `beep_recovery` is garbage → **brick**. Repoint fixes it. |
 | Pushing a bad *update* | ⬜ this doc | signed OTA + recovery slot as backstop |
 
-> ⚠️ **Honest caveat (from the pre-flash review):** `bootb`'s two recovery triggers
-> are (a) *immediate* when `bootm` of the primary uImage fails its CRC — covers a
-> corrupt kernel on boot 1 — and (b) *bootcount-exceeded*. But our investigation
-> found the bootcount only resets on a `saveenv` (never on a healthy boot) and the
-> threshold is enormous, so it **cannot distinguish a good boot from a hanging
-> one** — a kernel that loads but panics won't trip recovery for ~dozens+ of
-> power-cycles, if ever. To truly cover the panic case we must add a **good-boot
-> bootcount reset** in the primary firmware (clear the counter once userspace is
-> healthy) and measure the real `bootlimit` from the serial `"Set bootcount…"`
-> line. Until then, only *corrupt-uImage* auto-recovers; a panicking kernel still
-> needs the UART. Do not ship claiming hang-recovery.
+## Bootcount — DEFINITIVE (U-Boot `bootb` disassembly, 2026-09-08 rev 2)
+
+**This section supersedes every earlier bootcount claim in this doc.** Decoded from
+`mtd_u-boot.bin`, the stock `beepupdate` binary, and the env dumps.
+
+**`bootb` is a 3-STRIKES failsafe, not a large cumulative counter.**
+- Compare is literally `slti v0, v0, 3` (@ file `0x18104`); the recovery branch
+  (`beqz`, `0x18114`) is taken when the count **≥ 3**. So after **3 consecutive boots
+  that are not reset, the 4th boots `beep_recovery`.**
+- Counter lives in env0 at `0x8000–0xFFFF` (a 32 KB scratch area, **outside** the CRC'd
+  env; `CONFIG_ENV_SIZE = 0x8000`). U-Boot **clears one bit on every primary boot**
+  (`0xff→0x7f→0x3f→0x1f`); a per-nibble map (`0xf→0, 0x7→1, 0x3→2, 0x1→3`) yields the
+  count. It skips fully-cleared bytes and scores only the current nibble.
+- **Stock resets it every GOOD boot:** `beepupdate bootcount` (cmd 6) advances the
+  nibble (a single bit clear on `/dev/mtd1`, no erase). The dumped unit had 84 bits
+  cleared but still booted primary = **~21 good boots each reset** — *that* is why it
+  looked like "huge headroom." It was resets, not headroom.
+
+**Why this is dangerous on OUR firmware (fix before any unit ships):**
+- We replaced `beepupdate`, and our own reset (`usr/libexec/beep/bootcount-reset`) is
+  **gated OFF by default** → **nothing resets the counter.** If U-Boot increments every
+  primary boot, ~3 non-reset boots reach count 3 → boot 4 jumps to `beep_recovery` →
+  which on our layout is the garbage `0x9f550000` → **brick.**
+- The stock dumped unit is safe only by accident: its `beep_recovery == beep_primary`
+  (both `0x9f550000`), so "recovery" re-boots the *same* image.
+- Correction to an earlier worry: the env **variables** ARE redundant (env0/env1 mirror,
+  `0xbe` redundant-env flag), so a *variable* `saveenv` is survivable. Only the bootcount
+  half is single-copy — which is fine (increment is one atomic 1→0 bit flip, no erase).
+
+### Graduation criteria (stop re-claiming — these are the gates)
+1. **Threshold = 3.** ✅ known from the binary (`slti …,3`). No longer a guess.
+2. **Repoint `beep_recovery` → `0x9f050000`** (UART, `saveenv`). This is the safety net:
+   it turns a count-3 trip into "re-boot primary" (harmless, like the stock unit) instead
+   of a jump to garbage. **Safety-critical; gates "safe to disconnect UART."**
+3. **Bench-confirm the increment** (deterministic, ~10 min): on a UART unit, reboot 3–4×
+   cleanly with **no** reset, watch the serial `Set bootcount 0x%02x offset …` climb, and
+   confirm whether boot 4 goes to recovery. Settles the one open question — is the
+   increment strictly per-boot (⇒ our reset-off units are on borrowed time) or conditional.
+4. **Re-instate a good-boot reset**, preferring stock's lightweight **nibble-advance** on
+   `/dev/mtd1` over our current full-sector `fw_setenv` erase; then enable it (prove the
+   `fw_env.config` round-trip, `touch /etc/beep-fwenv-verified`).
+
+Until 2–4 are done, only *corrupt-uImage* auto-recovers; and with the repoint absent a
+panicking/looping primary **bricks** (it does not merely fail to self-heal). Do not ship
+claiming hang-recovery, and do not tell anyone to disconnect UART, until the repoint (2)
+is in place.
 
 ## Flash layout (16 MB, w25q128)
 
@@ -264,6 +299,11 @@ bootcount-exceeded, with the count stored at a flash offset.
 
 ### Bootcount — decoded empirically (flash diff across a reboot, 2026-09-06)
 
+> 🛑 **SUPERSEDED (2026-09-08 rev 2 — binary disassembly).** This section's
+> conclusion that the threshold is "astronomically far off / defer it" is **WRONG**.
+> The threshold is **3** (a 3-strikes failsafe). See **"Bootcount — DEFINITIVE
+> (U-Boot disassembly)"** below; that section governs.
+
 Method: dumped `mtd0`+`mtd1`, rebooted once, re-dumped, diffed. `mtd0` unchanged;
 `mtd1` changed **exactly one byte** at offset `0x8000`.
 
@@ -307,7 +347,11 @@ The stock 16 MB flash dump settled the remaining unknowns:
   `0x80060000`). So `bootb`'s `bootm` boots it directly, and because it's an
   *initramfs* (rootfs embedded in the kernel) it needs no rootfs partition — ideal
   for a self-contained recovery slot.
-- **Bootcount reset mechanism SOLVED:** the old dump had ~84 bits cleared at `0x48000`
+- **Bootcount reset mechanism SOLVED:** ⚠️ *partly right, dangerously mis-framed — see
+  the DEFINITIVE section below.* The "non-issue for any device lifetime" conclusion is
+  **wrong**: the reset in that dump was the stock `beepupdate` clearing the counter on
+  **every good boot** (~84 bits = ~21 good boots), not headroom under a huge threshold.
+  Our firmware dropped `beepupdate` and gates its reset OFF, so nothing resets it. Original text: the old dump had ~84 bits cleared at `0x48000`
   yet still booted primary (threshold ≫ 84), and our current flash is near-fresh
   (~2 bits) because our `saveenv` (setting `beep_primary`) erased the whole env block,
   resetting the `0x8000` region to `0xFF`. So: accumulates ~1 bit/boot, **resets on
