@@ -46,9 +46,11 @@ start_service() {
 	[ -p "$FIFO" ] || { rm -f "$FIFO"; mkfifo -m 666 "$FIFO"; }
 
 	procd_open_instance
-	procd_set_param command "$PROG" --node --id "$id" --alsa "$device" --pcm "$FIFO" --signal "$signal"
+	# --resample: click-free drift correction (validated dropout-free on HW). The sink also
+	# self-pins SCHED_FIFO + mlockall so the wifi stack can't preempt playout into a dropout.
+	procd_set_param command "$PROG" --node --id "$id" --alsa "$device" --pcm "$FIFO" --signal "$signal" --resample
 	[ -n "$group" ] && procd_append_param command --group "$group"
-	# Audio-thread scheduling edge on the single-core AR9331 (matches squeezelite/shairport).
+	# nice floor as a fallback; the sink promotes its playout thread to SCHED_FIFO at runtime.
 	procd_set_param nice -12
 	procd_set_param respawn
 	procd_set_param stdout 1
