@@ -1,0 +1,31 @@
+#!/bin/sh
+# beep-airplay-volume — shairport-sync `run_this_when_volume_is_set` hook.
+#
+# Under the replaynet engine shairport uses the PIPE backend (feeding /tmp/beep-pcm), which
+# has no ALSA mixer — so unlike the alsa backend it can't bind AirPlay volume to the shared
+# "Master" softvol. Without this hook, moving the phone's AirPlay volume no longer moves
+# Master, so the web UI and LED arc (both read Master) stop tracking it. This hook restores
+# that: shairport calls it with the AirPlay volume, and we map it onto Master so AirPlay, the
+# knob and the web slider all stay on one unified control (same model as the alsa backend).
+#
+# shairport passes the AirPlay volume as $1: 0.00 (max) .. -30.00 (min), and -144.00 = mute.
+# Pair this with `ignore_volume_control = "yes"` so shairport does NOT also attenuate the pipe
+# PCM in software — Master is the single attenuation point (no double attenuation).
+
+V="$1"
+BEEP_RUN="${BEEP_RUN_DIR:-/var/run/beep}"
+
+# Map the AirPlay volume onto 0..100% (busybox sh has no float math -> awk). Linear in the
+# AirPlay scale: 0.00 -> 100%, -30.00 -> 0%, <=-144 (mute) -> 0%.
+PCT=$(awk -v v="$V" 'BEGIN{
+	if (v == "" || v <= -144) { print 0; exit }
+	p = (v + 30.0) / 30.0 * 100.0;
+	if (p < 0) p = 0; if (p > 100) p = 100;
+	printf "%d", p + 0.5;
+}')
+case "$PCT" in ''|*[!0-9]*) PCT=0 ;; esac
+
+amixer -M -q set Master "${PCT}%" 2>/dev/null
+mkdir -p "$BEEP_RUN"
+echo "$PCT" > "$BEEP_RUN/volume"      # beepd LED arc + knob start-level read this
+logger -t beep-airplay-vol "AirPlay volume $V -> Master ${PCT}%"

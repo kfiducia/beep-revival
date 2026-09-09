@@ -82,6 +82,21 @@ role="${1:-apply}"
 ENGINE="$(uci -q get beep.main.group_engine 2>/dev/null || echo snapcast)"
 RN=/usr/sbin/replaynet
 RNFIFO=/tmp/beep-pcm
+AVOL=/usr/libexec/beep/beep-airplay-volume
+
+# The pipe backend has no ALSA mixer, so (unlike the alsa backend) shairport can't bind
+# AirPlay volume to the shared "Master" softvol — the web UI + LED arc (which read Master)
+# stop tracking the phone's volume. Restore it with shairport's volume hook mapping AirPlay
+# volume onto Master, and set ignore_volume_control so shairport does NOT also attenuate the
+# pipe PCM in software (Master is the single volume control; no double attenuation).
+# $1 = on (add, pipe path) | off (remove, alsa/direct path — the mixer handles volume there).
+sp_airplay_vol_hook() {
+	[ -f "$SPCONF" ] || return 0
+	sed -i '/run_this_when_volume_is_set/d; /ignore_volume_control/d' "$SPCONF"   # start clean
+	[ "$1" = on ] || return 0
+	sed -i '/^general = {/a\	ignore_volume_control = "yes";' "$SPCONF"
+	sed -i '/^general = {/a\	run_this_when_volume_is_set = "'"$AVOL"'";' "$SPCONF"
+}
 
 sp_replaynet() {  # point shairport-sync at replaynet: pipe -> FIFO + play/stop hooks
 	[ -f "$SPCONF" ] || return 0
@@ -91,22 +106,53 @@ sp_replaynet() {  # point shairport-sync at replaynet: pipe -> FIFO + play/stop 
 	grep -q '^sessioncontrol = {' "$SPCONF" || printf \
 		'\nsessioncontrol = {\n\trun_this_before_play_begins = "%s --ctl become-source";\n\trun_this_after_play_ends = "%s --ctl leave";\n};\n' \
 		"$RN" "$RN" >> "$SPCONF"
+	sp_airplay_vol_hook on
 }
 
 if [ "$ENGINE" = replaynet ]; then
-	# snapcast off; the replaynet node + shairport(pipe) up; roles -> control socket.
+	# snapcast is never the sync engine under replaynet.
 	svc snapserver disable; svc snapserver stop
 	svc snapclient disable; svc snapclient stop
-	uci -q set replaynet.node.enabled=1; uci -q commit replaynet
-	svc replaynet enable; svc replaynet restart
-	sp_replaynet
-	sp_apply
+
+	# Bring the replaynet node engine up (grouped) or down (solo). The pipe->node->ALSA
+	# path is used ONLY for an active group; solo bypasses it and plays shairport->ALSA
+	# directly (see the solo case for why).
+	rn_engine_up() {
+		uci -q set replaynet.node.enabled=1; uci -q commit replaynet
+		svc replaynet enable; svc replaynet restart
+		sp_replaynet          # shairport -> /tmp/beep-pcm pipe + become-source/leave hooks
+	}
+	rn_engine_down() {
+		"$RN" --ctl leave >/dev/null 2>&1               # best-effort if the node is still up
+		svc replaynet disable; svc replaynet stop
+		uci -q set replaynet.node.enabled=0; uci -q commit replaynet
+		sp_backend alsa       # shairport -> ALSA directly (low-latency, known-good path)
+		sp_airplay_vol_hook off   # alsa backend drives Master via the mixer natively
+	}
+
 	case "$role" in
-		primary) uci -q set beep.main.group_role=primary; uci -q commit beep; "$RN" --ctl become-source >/dev/null 2>&1; echo primary ;;
-		member)  uci -q set beep.main.group_role=member;  uci -q commit beep; "$RN" --ctl join         >/dev/null 2>&1; echo member ;;
-		solo)    uci -q set beep.main.group_role=solo;    uci -q commit beep; "$RN" --ctl leave        >/dev/null 2>&1; echo solo ;;
-		toggle)  out="$("$RN" --ctl toggle 2>/dev/null)"; echo "${out:-toggled}" ;;
-		status)  "$RN" --ctl status 2>/dev/null || echo "role=? (replaynet down)" ;;
+		primary) uci -q set beep.main.group_role=primary; uci -q commit beep
+			rn_engine_up; sp_apply; "$RN" --ctl become-source >/dev/null 2>&1
+			mkdir -p "$RUNDIR"; echo primary > "$RUNDIR/group"; echo primary ;;
+		member)  uci -q set beep.main.group_role=member;  uci -q commit beep
+			rn_engine_up; sp_apply; "$RN" --ctl join >/dev/null 2>&1
+			mkdir -p "$RUNDIR"; echo member > "$RUNDIR/group"; echo member ;;
+		solo)    uci -q set beep.main.group_role=solo;    uci -q commit beep
+			# Ungrouped default: bypass the pipe engine. A fresh/solo unit run through
+			# replaynet's pipe->node->ALSA path produced no audio (the loopback sink never
+			# opened), so solo stays shairport->ALSA direct and the engine is OPT-IN — a
+			# double-tap (toggle) forms/joins a group and flips to the pipe engine.
+			rn_engine_down; sp_apply; rm -f "$RUNDIR/group" 2>/dev/null; echo solo ;;
+		toggle)  # double-tap: leave the group if in it, else (re)join as member.
+			if [ -f "$RUNDIR/group" ]; then
+				uci -q set beep.main.group_role=solo;   uci -q commit beep
+				rn_engine_down; sp_apply; rm -f "$RUNDIR/group" 2>/dev/null; echo solo
+			else
+				uci -q set beep.main.group_role=member; uci -q commit beep
+				rn_engine_up; sp_apply; "$RN" --ctl join >/dev/null 2>&1
+				mkdir -p "$RUNDIR"; echo member > "$RUNDIR/group"; echo member
+			fi ;;
+		status)  "$RN" --ctl status 2>/dev/null || echo "role=solo (replaynet engine idle)" ;;
 		*) echo "usage: beep-group apply|primary|member|solo|toggle|status" >&2; exit 1 ;;
 	esac
 	exit 0

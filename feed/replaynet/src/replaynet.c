@@ -62,6 +62,7 @@
 #include <inttypes.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -157,6 +158,21 @@ static uint64_t be64_get(const uint8_t *p)
 static int16_t le16_get(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
 static void    le16_put(uint8_t *p, int16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)((uint16_t)v >> 8); }
 #endif
+
+/* shairport-sync's pipe backend writes S16 in HOST byte order, but replaynet's wire format
+ * and ALSA sink are S16_LE. On the big-endian AR9331 that host order is big-endian, so the
+ * raw pipe bytes are byte-swapped relative to what the sink expects — playing them as S16_LE
+ * yields clipping/garbage (verified by capturing the pipe: the BE reading is smooth audio,
+ * the LE reading is full-scale noise). Normalise host-order S16 to LE where PCM enters
+ * replaynet (the FIFO readers). Compiled as a no-op on little-endian hosts. */
+static void pcm_host_to_le(uint8_t *p, size_t nbytes)
+{
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	for (size_t i = 0; i + 1 < nbytes; i += 2) { uint8_t t = p[i]; p[i] = p[i + 1]; p[i + 1] = t; }
+#else
+	(void)p; (void)nbytes;
+#endif
+}
 
 static void hdr_pack(uint8_t buf[RN_HDR_SIZE], uint8_t type, uint32_t seq, uint32_t body_len)
 {
@@ -659,6 +675,7 @@ static int run_source(const char *pcm_path, const char *host, uint16_t port)
 			plog("INFO", "source EOF (sub-frame tail %zu B dropped)", partial);
 			break;
 		}
+		pcm_host_to_le(pcm, send_bytes);   /* shairport writes host-order S16; wire is S16_LE */
 		int64_t src_t = now_ns();
 		hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)(RN_AUDIO_FIXED + send_bytes));
 		be64_put(frame + RN_HDR_SIZE + 0, track_samples);
@@ -693,10 +710,14 @@ static int run_source(const char *pcm_path, const char *host, uint16_t port)
 
 static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16_t port)
 {
+	int use_stdin = (!pcm_path || strcmp(pcm_path, "-") == 0);
 	int in = STDIN_FILENO;
-	if (pcm_path && strcmp(pcm_path, "-") != 0) {
+	int src_is_fifo = 0;               /* only a FIFO is reopened on EOF (a regular file EOFs) */
+	if (!use_stdin) {
 		in = open(pcm_path, O_RDONLY);
 		if (in < 0) { plog("ERROR", "open %s: %s", pcm_path, strerror(errno)); return 1; }
+		struct stat st;
+		src_is_fifo = (fstat(in, &st) == 0 && S_ISFIFO(st.st_mode));
 	}
 	int sock[RN_FANOUT_MAX];
 	int skips[RN_FANOUT_MAX] = { 0 };   /* consecutive skipped frames per lagging sink */
@@ -733,44 +754,78 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 		}
 		if (g_stop) break;
 
-		ssize_t r = read_upto(in, pcm, RN_CHUNK_BYTES);
-		if (r <= 0) { plog("INFO", "fan-out EOF after %u frames", seq); break; }
-		size_t send_bytes = (size_t)r - (size_t)r % RN_FRAME_BYTES;
-		if (send_bytes == 0) break;
-
-		hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)(RN_AUDIO_FIXED + send_bytes));
-		be64_put(frame + RN_HDR_SIZE + 0, track_samples);
-		be64_put(frame + RN_HDR_SIZE + 8, 0);
-		be64_put(frame + RN_HDR_SIZE + 16, (uint64_t)now_ns());
-		be32_put(frame + RN_HDR_SIZE + 24, (uint32_t)send_bytes);
-		size_t total = RN_HDR_SIZE + RN_AUDIO_FIXED + send_bytes;
-		int alive = 0;
+		/* Drain any pending sink PINGs NOW, even though the pacing wait above may not have
+		 * run. During a fast feed — e.g. shairport flushing AirPlay's ~2 s startup buffer —
+		 * the pacing loop never blocks, so a sink's clock PING would sit unanswered; the sink
+		 * keeps one ping in flight and never sends another, so it never clock-locks and never
+		 * opens ALSA (observed as a continuous ring-overrun flood with 0 pongs). Answer them
+		 * unconditionally, non-blocking, so the handshake completes under any feed rate. */
 		for (int i = 0; i < nsock; i++) {
 			if (sock[i] < 0) continue;
-			/* Only send when the sink can accept a whole frame NOW. A sink that is slow
-			 * (still clock-locking, or wifi-congested) must NOT block the fan-out — that
-			 * deadlocks: blocked here we can't answer its pings, so it never locks, so it
-			 * never drains. Skip its frame instead (its schedule servo rides the gap);
-			 * drop it only if it stays stuck for seconds. */
-			struct pollfd wp = { .fd = sock[i], .events = POLLOUT };
-			if (poll(&wp, 1, 0) > 0 && (wp.revents & POLLOUT)) {
-				if (write_full(sock[i], frame, total) < 0) {
-					plog("WARN", "sink %d write error — dropping", i);
-					close(sock[i]); sock[i] = -1; continue;
-				}
-				skips[i] = 0; alive++;
-			} else if (++skips[i] > 500) {           /* ~13 s stuck -> give up on it */
-				plog("WARN", "sink %d stuck (no drain) — dropping", i);
-				close(sock[i]); sock[i] = -1;
-			} else {
-				if (skips[i] == 1) plog("WARN", "sink %d not draining — skipping frames", i);
-				alive++;                              /* temporarily lagging, keep it */
+			struct pollfd rp = { .fd = sock[i], .events = POLLIN };
+			while (poll(&rp, 1, 0) > 0 && (rp.revents & POLLIN)) {
+				if (source_answer_ping(sock[i]) != 0) { close(sock[i]); sock[i] = -1; break; }
+				rp.revents = 0;
 			}
 		}
-		if (alive == 0) { plog("INFO", "all sinks gone"); break; }
-		track_samples += send_bytes / RN_FRAME_BYTES;
-		seq++;
-		if ((size_t)r < RN_CHUNK_BYTES) { plog("INFO", "fan-out EOF after %u frames", seq); break; }
+
+		ssize_t r = read_upto(in, pcm, RN_CHUNK_BYTES);
+		if (r < 0) { plog("ERROR", "pcm read: %s", strerror(errno)); rc = 1; break; }
+		size_t send_bytes = (size_t)r - (size_t)r % RN_FRAME_BYTES;
+		if (send_bytes) {
+			pcm_host_to_le(pcm, send_bytes);   /* shairport writes host-order S16; wire is S16_LE */
+			hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)(RN_AUDIO_FIXED + send_bytes));
+			be64_put(frame + RN_HDR_SIZE + 0, track_samples);
+			be64_put(frame + RN_HDR_SIZE + 8, 0);
+			be64_put(frame + RN_HDR_SIZE + 16, (uint64_t)now_ns());
+			be32_put(frame + RN_HDR_SIZE + 24, (uint32_t)send_bytes);
+			size_t total = RN_HDR_SIZE + RN_AUDIO_FIXED + send_bytes;
+			int alive = 0;
+			for (int i = 0; i < nsock; i++) {
+				if (sock[i] < 0) continue;
+				/* Only send when the sink can accept a whole frame NOW. A sink that is slow
+				 * (still clock-locking, or wifi-congested) must NOT block the fan-out — that
+				 * deadlocks: blocked here we can't answer its pings, so it never locks, so it
+				 * never drains. Skip its frame instead (its schedule servo rides the gap);
+				 * drop it only if it stays stuck for seconds. */
+				struct pollfd wp = { .fd = sock[i], .events = POLLOUT };
+				if (poll(&wp, 1, 0) > 0 && (wp.revents & POLLOUT)) {
+					if (write_full(sock[i], frame, total) < 0) {
+						plog("WARN", "sink %d write error — dropping", i);
+						close(sock[i]); sock[i] = -1; continue;
+					}
+					skips[i] = 0; alive++;
+				} else if (++skips[i] > 500) {           /* ~13 s stuck -> give up on it */
+					plog("WARN", "sink %d stuck (no drain) — dropping", i);
+					close(sock[i]); sock[i] = -1;
+				} else {
+					if (skips[i] == 1) plog("WARN", "sink %d not draining — skipping frames", i);
+					alive++;                              /* temporarily lagging, keep it */
+				}
+			}
+			if (alive == 0) { plog("INFO", "all sinks gone"); break; }
+			track_samples += send_bytes / RN_FRAME_BYTES;
+			seq++;
+		}
+		if ((size_t)r < RN_CHUNK_BYTES) {
+			/* FIFO writer (shairport) closed the pipe: end-of-session or a brief gap
+			 * between tracks — NOT a reason to tear down. Exiting here drops every sink's
+			 * TCP connection and forces each sink to re-prebuffer from scratch on the next
+			 * track; over a flappy pipe that churn is why a sink never survives long enough
+			 * to open ALSA. Reopen the FIFO (blocks until shairport writes again) and
+			 * resume streaming to the SAME sinks. (stdin can't be reopened: real EOF.) */
+			if (!src_is_fifo) { plog("INFO", "fan-out EOF after %u frames", seq); break; }
+			plog("INFO", "fan-out: pipe closed after %u frames — reopening, sinks kept", seq);
+			close(in);
+			in = open(pcm_path, O_RDONLY);           /* blocks for the next writer */
+			if (in < 0) { plog("ERROR", "reopen %s: %s", pcm_path, strerror(errno)); rc = 1; break; }
+			/* Re-anchor 1x pacing so the CURRENT (already-advanced) track_samples maps to
+			 * "now": pace_start = now - track_samples/RATE. Plain pace_start=0 would instead
+			 * make the next target = now + track_samples/RATE and stall the fan-out for
+			 * seconds; not re-anchoring at all would make target land in the past and blast
+			 * a burst of frames (sink ring overrun). This keeps the resume seamless at 1x. */
+			pace_start = real_now_ns() - (int64_t)(track_samples * 1000000000ull / RN_RATE);
+		}
 	}
 	for (int i = 0; i < nsock; i++) if (sock[i] >= 0) close(sock[i]);
 	if (in != STDIN_FILENO) close(in);
@@ -1036,6 +1091,10 @@ static int run_sink(const char *out_path, uint16_t port)
 #define RN_BUF_TOLERANCE_FRAMES 4410     /* ~100 ms — ride wifi jitter in the buffer;
                                             only correct sustained drift, not bursts */
 #define RN_LOCK_PING_NS     (50ll * 1000000ll)     /* fast pings while locking (short prebuffer) */
+/* If a PING's PONG hasn't come back within this long, treat the ping as lost and allow a
+ * resend instead of blocking the lock forever on one in-flight ping (a single dropped ping
+ * during a startup burst otherwise wedges the clock lock -> ALSA never opens). */
+#define RN_PING_TIMEOUT_NS  (300ll * 1000000ll)
 /* Real-time playout: the sink loop must refill the DAC every ~10 ms or it underruns. On the
  * single-core 400 MHz AR9331 the wifi stack (ath9k/wpad softirqs) preempts a normal-priority
  * thread for 150-700 ms at a time — instrumentation showed exactly this (loop_dt spikes with
@@ -1043,6 +1102,12 @@ static int run_sink(const char *out_path, uint16_t port)
  * ksoftirqd, and mlockall stops a page fault from stalling it. This is the pro-audio fix and
  * targets the measured root cause (thread starvation), not a symptom. */
 #define RN_SINK_RT_PRIO     50           /* SCHED_FIFO priority (1-99); above ksoftirqd, below crit */
+/* Sanity band on the Phase-1 startup wait. want_local should land ~RN_BUFFER_NS ahead of
+ * now; if the clock-offset lock (theta) fails to capture the source/sink monotonic-uptime
+ * gap, want_local can land minutes out and the sink would wait that long before it ever
+ * opens ALSA (the "never opens the sink" failure). If the computed wait is outside
+ * [RN_BUFFER_NS +/- RN_STARTUP_SLOP_NS], distrust theta and start on our own clock. */
+#define RN_STARTUP_SLOP_NS  (3000ll * 1000000ll)   /* +/-3 s tolerance around the prebuffer */
 
 #ifdef RN_ALSA
 static snd_pcm_t *alsa_open(const char *dev)
@@ -1136,13 +1201,20 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 
 	int have_anchor = 0, started = 0, rc = 0;
 	int64_t want_local = 0, last_ping = 0;
+	int64_t phase1_start = now_ns(), last_hb = phase1_start;
 	uint64_t anchor_sample = 0, track_samples = 0, rx_next_src = 0;
 	int64_t source_time_ns = 0;
+
+	plog("INFO", "prebuffering: locking clock (%d pongs) + filling %lld ms buffer before ALSA open",
+	     RN_LOCK_MIN_SAMPLES, (long long)(RN_BUFFER_NS / 1000000));
 
 	/* Phase 1: lock the clock offset, anchor the schedule, and prebuffer until the
 	 * anchor sample's local presentation time arrives (fills ~RN_BUFFER_NS of audio). */
 	while (!g_stop && !started) {
 		int64_t t = now_ns();
+		/* Drop a ping presumed lost so the lock isn't stuck on one in-flight ping forever. */
+		if (ce.inflight_t1 >= 0 && t - last_ping >= RN_PING_TIMEOUT_NS)
+			ce.inflight_t1 = -1;
 		if (t - last_ping >= RN_LOCK_PING_NS && ce.inflight_t1 < 0) {
 			sink_send_ping(sock, &ce); last_ping = t;
 		}
@@ -1157,9 +1229,38 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 				have_anchor = 1; ce.locked = 1;
 				want_local = source_time_ns - ce.theta + RN_BUFFER_NS;
 				anchor_sample = track_samples;
+				/* Distrust a wildly-out-of-band startup wait (bad theta lock — see
+				 * RN_STARTUP_SLOP_NS) and start on our own clock rather than stalling
+				 * for the whole uptime gap. */
+				int64_t wait = want_local - now_ns();
+				if (wait > RN_BUFFER_NS + RN_STARTUP_SLOP_NS ||
+				    wait < RN_BUFFER_NS - RN_STARTUP_SLOP_NS) {
+					plog("WARN", "startup wait %lld ms implausible (theta=%+lld us) — clamping "
+					     "to %lld ms; clock lock is suspect",
+					     (long long)(wait / 1000000), (long long)(ce.theta / 1000),
+					     (long long)(RN_BUFFER_NS / 1000000));
+					want_local = now_ns() + RN_BUFFER_NS;
+				}
 				plog("INFO", "anchored sample %" PRIu64 ", offset locked theta=%+" PRId64
 				     " us, start in %" PRId64 " ms",
 				     anchor_sample, ce.theta / 1000, (want_local - now_ns()) / 1000000);
+			}
+		}
+		/* Heartbeat: this loop was otherwise silent, so a stall here (no pongs -> no
+		 * clock lock, or a far-future want_local) surfaced only as "no audio, no error"
+		 * with /dev/snd never opened. Log ~1/s which sub-condition we are waiting on. */
+		{
+			int64_t nt = now_ns();
+			if (nt - last_hb >= 1000000000ll) {
+				last_hb = nt;
+				if (have_anchor)
+					plog("INFO", "prebuffering: %lld ms to ALSA open, ring %zu ms buffered",
+					     (long long)((want_local - nt) / 1000000),
+					     rb_avail(&ring) / RN_FRAME_BYTES * 1000 / RN_RATE);
+				else
+					plog("INFO", "prebuffering: waiting for clock lock (%d/%d pongs%s), waited %lld ms",
+					     ce.samples, RN_LOCK_MIN_SAMPLES, ce.have ? "" : ", none yet",
+					     (long long)((nt - phase1_start) / 1000000));
 			}
 		}
 		if (have_anchor && now_ns() >= want_local)
@@ -1527,8 +1628,17 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 		/* reap children; keep the player alive */
 		int st; pid_t d;
 		while ((d = waitpid(-1, &st, WNOHANG)) > 0) {
-			if (d == fanout) fanout = 0;
-			else if (d == player && !no_audio) player = spawn_player(dev, audio_port, no_audio);
+			int ex = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+			if (d == fanout) {
+				plog("INFO", "fanout %d exited (status %d)", (int)d, ex);
+				fanout = 0;
+			} else if (d == player && !no_audio) {
+				/* Every respawn restarts the sink's clock-lock + prebuffer from zero, so
+				 * frequent respawns here are the churn that keeps ALSA from ever opening. */
+				plog("WARN", "player %d exited (status %d) — respawning sink (prebuffer resets)",
+				     (int)d, ex);
+				player = spawn_player(dev, audio_port, no_audio);
+			}
 		}
 
 		int64_t now = now_ns();
