@@ -50,7 +50,10 @@ for yy in range(2*GLOWR):
         _glow.putpixel((xx, yy), int(255*v))
 
 def _pos(i):
-    a = math.radians(i * (360.0/NLED))      # 0 at top, clockwise
+    # +half-a-step so NO LED sits on a cardinal, matching the real ring: 12 o'clock
+    # straddles LEDs 23/0 (wire 0 lands ~12:15) and 6 o'clock straddles 11/12. Without
+    # this offset, patterns symmetric about the 11/12 axis (the wings) render tilted.
+    a = math.radians(i * (360.0/NLED) + (360.0/NLED)/2)   # 0 just CW of top, clockwise
     return CX + RING_R*math.sin(a), CY - RING_R*math.cos(a)
 
 def render(bright, label):
