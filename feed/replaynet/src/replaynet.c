@@ -140,6 +140,16 @@ static uint64_t be64_get(const uint8_t *p)
 	return ((uint64_t)be32_get(p) << 32) | (uint64_t)be32_get(p + 4);
 }
 
+/* Audio PCM on the wire and to ALSA is S16_LE (SND_PCM_FORMAT_S16_LE), independent of CPU
+ * endianness. The drop/insert path is byte-transparent, but the resampler does integer
+ * arithmetic on sample VALUES, so it must read/write them as little-endian explicitly —
+ * on the big-endian AR9331 a native int16 view would be byte-swapped garbage. These
+ * assemble/disassemble LE bytes by hand, so they are correct on any CPU. */
+#ifdef RN_ALSA
+static int16_t le16_get(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
+static void    le16_put(uint8_t *p, int16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)((uint16_t)v >> 8); }
+#endif
+
 static void hdr_pack(uint8_t buf[RN_HDR_SIZE], uint8_t type, uint32_t seq, uint32_t body_len)
 {
 	be32_put(buf + 0, RN_MAGIC);
@@ -1226,8 +1236,11 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 				int take = availf > RN_RSMP_FEED_CHUNK ? RN_RSMP_FEED_CHUNK : (int)availf;
 				if (take > RN_RSMP_WIN - unconsumed - 4) take = RN_RSMP_WIN - unconsumed - 4;
 				if (take <= 0) break;
+				uint8_t raw[RN_RSMP_FEED_CHUNK * RN_FRAME_BYTES];
 				int16_t chunk[RN_RSMP_FEED_CHUNK * RN_CHANNELS];
-				rb_pop(&ring, (uint8_t *)chunk, (size_t)take * RN_FRAME_BYTES);
+				rb_pop(&ring, raw, (size_t)take * RN_FRAME_BYTES);
+				for (int s = 0; s < take * RN_CHANNELS; s++)     /* S16_LE bytes -> native int16 */
+					chunk[s] = le16_get(raw + s * 2);
 				rn_rsmp_feed(&rs, chunk, take);
 				played_src += (uint64_t)take;               /* ring frames consumed (source samples) */
 				unconsumed = rs.win_n - rs.ri;
@@ -1275,7 +1288,9 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 			 * (ring starved) write silence rather than a partial buffer, to avoid an XRUN. */
 			if ((rs.win_n - rs.ri) >= RN_ALSA_PERIOD_FRAMES + 3) {
 				rn_rsmp_pull(&rs, rsbuf, RN_ALSA_PERIOD_FRAMES);
-				if (alsa_write(pcm, (const uint8_t *)rsbuf, RN_ALSA_PERIOD_FRAMES) < 0) { rc = 1; goto drainclose; }
+				for (int s = 0; s < RN_ALSA_PERIOD_FRAMES * RN_CHANNELS; s++)  /* native int16 -> S16_LE */
+					le16_put(period + s * 2, rsbuf[s]);
+				if (alsa_write(pcm, period, RN_ALSA_PERIOD_FRAMES) < 0) { rc = 1; goto drainclose; }
 				out_frames += RN_ALSA_PERIOD_FRAMES;
 			} else if (eof) {
 				break;
