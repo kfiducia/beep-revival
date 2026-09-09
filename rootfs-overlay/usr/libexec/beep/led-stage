@@ -1,13 +1,13 @@
 #!/bin/sh
-# led-stage <stage> — paint one static boot-progress frame on the STM8 ring.
+# led-stage <mode> [args] — paint one static frame on the STM8 ring.
 #
 # Why this exists: the light ring is driven by the STM8L151 MCU (i2c addr 0x23 on
 # the bit-banged i2c-gpio bus, /dev/i2c-0), and our firmware only takes the ring
 # over once `beepd` starts (init START=95 — effectively "boot done"). So today a
 # hang anywhere before that (e.g. the 2026-09-08 first-boot config-restore brick)
-# is invisible: the ring just holds the STM8's own power-on "smiley". This helper
-# lets the earlier boot stages paint a coarse progress arc so a stall is VISIBLE —
-# a partly-filled ring that never advances tells you which stage hung.
+# is invisible unless the earlier boot stages paint the ring themselves. This helper
+# is the primitive they step through: the boot animator (led-boot-anim) calls it
+# frame-by-frame to draw the smiley, the rising boot "wings", and the OTA fill.
 #
 # It writes the same 25-byte frame beepd does: reg 0x80 <- [led_1..led_24, ack].
 # ack=0x00 (we are NOT requesting an input frame; beepd owns polling once it runs).
@@ -23,37 +23,57 @@ DEV="/dev/i2c-${BUS}"
 ADDR=0x23
 REG=0x80
 NLED=24
-ROT=11          # physical->wire rotation: wire[i] = phys[(i+11) % 24] (from beepd.c)
+# logical->wire rotation. 0 = wire index == logical index. MUST match beepd.c's
+# LED_ROT so the early-boot ring and beepd's ring agree on where 12 o'clock is
+# (beepd bench-calibration: lighting wire 0 lands ~12:15 and runs clockwise, so no
+# rotation is needed). Was 11 — a stale copy of beepd's OLD value that rotated the
+# whole ring ~180 deg, so a "fill from 12" actually started at the bottom.
+ROT=0
+
+# Ring geometry (logical index 0..23: 0 = 12 o'clock, increasing clockwise) — the
+# same calibration constants beepd uses, so the smiley here matches beepd's smiley.
+LED_BOT=12      # 6 o'clock
+EYE_L=20        # ~10 o'clock
+EYE_R=3         # ~2 o'clock
+# smile: 8 LEDs across the bottom, LED_BOT-4 .. LED_BOT+3 = indices 8..15.
+SMILE_LO=8
+SMILE_HI=15
 
 command -v i2ctransfer >/dev/null 2>&1 || exit 0
 [ -e "$DEV" ] || exit 0
 
-warn=""
-case "$1" in
-	early)    n=4;  v=40 ;;   # kernel + modules alive (earliest reachable)
-	config)   n=8;  v=40 ;;   # rootfs mounted / config restore in progress
-	network)  n=16; v=60 ;;   # network is up
-	ready)    n=24; v=60 ;;   # services healthy — brief; beepd takes over
-	upgrade)  n=24; v=90 ;;   # FLASHING — do not power off
-	failsafe) n=0;  v=30; warn=1 ;;   # alternating warning ring
-	off)      n=0;  v=0  ;;
-	# fill <n> <v> — light exactly n (0..24) LEDs at brightness v. The primitive the
-	# time-paced animator (led-boot-anim) drives frame-by-frame so the ring fills
-	# smoothly over the length of a boot / flash instead of jumping between milestones.
+mode="$1"
+case "$mode" in
+	smiley)   v=255 ;;                 # boot-OK happy face (two eyes + a bottom smile arc)
+	failsafe) v=30 ;;                  # alternating warning ring
+	off)      v=0 ;;
+	# wings <k> <v> — symmetric bottom-to-top fill: light every LED within k ring-steps
+	# of 6 o'clock (k=0 lights just the bottom; k=12 lights the whole ring). The frame
+	# the boot animator steps through so the "wings" rise from the bottom to the top.
+	wings)    k="$2"; v="${3:-50}"
+	          case "$k" in ''|*[!0-9]*) exit 0 ;; esac
+	          [ "$k" -gt 12 ] && k=12 ;;
+	# fill <n> <v> — light the first n (0..24) LEDs as one arc growing CLOCKWISE from
+	# 12 o'clock. The frame the OTA animator steps through so the dial fills from the top.
 	fill)     n="$2"; v="${3:-50}"
 	          case "$n" in ''|*[!0-9]*) exit 0 ;; esac
 	          [ "$n" -gt "$NLED" ] && n="$NLED" ;;
 	*)        exit 0 ;;
 esac
 
-# Build the physical LED array (space-separated decimals), then rotate to wire order.
+# Build the physical LED array (space-separated decimals) per mode, then rotate to wire.
 i=0; phys=""
 while [ "$i" -lt "$NLED" ]; do
-	if [ -n "$warn" ]; then
-		[ $((i % 2)) -eq 0 ] && phys="$phys $v" || phys="$phys 0"
-	else
-		[ "$i" -lt "$n" ] && phys="$phys $v" || phys="$phys 0"
-	fi
+	lit=0
+	case "$mode" in
+		smiley)   if [ "$i" -eq "$EYE_L" ] || [ "$i" -eq "$EYE_R" ] || \
+		             { [ "$i" -ge "$SMILE_LO" ] && [ "$i" -le "$SMILE_HI" ]; }; then lit=1; fi ;;
+		failsafe) [ $((i % 2)) -eq 0 ] && lit=1 ;;
+		wings)    d=$((i - LED_BOT)); [ "$d" -lt 0 ] && d=$((-d)); [ "$d" -le "$k" ] && lit=1 ;;
+		fill)     [ "$i" -lt "$n" ] && lit=1 ;;
+		off)      lit=0 ;;
+	esac
+	[ "$lit" -eq 1 ] && phys="$phys $v" || phys="$phys 0"
 	i=$((i + 1))
 done
 # shellcheck disable=SC2086

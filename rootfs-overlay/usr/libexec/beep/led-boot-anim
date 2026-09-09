@@ -1,12 +1,16 @@
 #!/bin/sh
-# led-boot-anim <total_secs> [brightness] [keep] — time-paced ring fill.
+# led-boot-anim <total_secs> <shape> [brightness] [keep] — time-paced ring animation.
 #
-# Fills the STM8 ring from empty to full over ~total_secs, so the dots reach the top
-# about when the operation (a boot, or a firmware flash) finishes. It is PURELY
-# time-based, not real progress — that's deliberate: overshoot is fine (once full it
-# just holds), and it's the behaviour asked for ("the animation should take about as
-# long as the boot / the update"). Calibrate total_secs to the observed duration
-# (boot ~= 120 s on this unit; the flash ~= 60 s) — being a bit short only means the
+#   shape=wings : boot. Shows the boot-OK smiley briefly, then raises symmetric
+#                 "wings" from the bottom (6 o'clock) to the top (12 o'clock) over
+#                 ~total_secs, so they near the top about when boot finishes.
+#   shape=fill  : OTA flash. Fills the dial as one arc growing CLOCKWISE from 12
+#                 o'clock over ~total_secs.
+#
+# PURELY time-based, not real progress — that's deliberate: overshoot is fine (once
+# full it just holds), and it's the behaviour asked for ("the animation should take
+# about as long as the boot / the update"). Calibrate total_secs to the observed
+# duration (boot ~= 120 s; the flash ~= 300 s) — being a bit short only means the
 # ring sits full for the tail, which is acceptable.
 #
 # SAFE: led-stage is a no-op while the i2c bus is down, and callers background this so
@@ -16,20 +20,33 @@
 # Stops on ANY of:
 #   * the stop marker /tmp/beep-led-anim-stop  (set_state done/failsafe drops it), or
 #   * beepd is running — it owns the ring from init START=95 (= "boot done"), so we
-#     hand off cleanly. Pass a 3rd arg "keep" to skip this check (used for the flash,
-#     where beepd is being torn down and must not abort the animation), or
+#     hand off cleanly (beepd "completes the wings" with a brief full ring). Pass a
+#     4th arg "keep" to skip this check (used for the flash, where beepd is being torn
+#     down and must not abort the animation), or
 #   * a hard safety cap of 3x total_secs, so it can never spin forever.
 TOTAL="${1:-120}"
-V="${2:-50}"
-KEEP="$3"
+SHAPE="${2:-wings}"
+V="${3:-50}"
+KEEP="$4"
 LEDSTAGE=/usr/libexec/beep/led-stage
 STOP=/tmp/beep-led-anim-stop
 NLED=24
+SMILEY_HOLD=2   # wings only: hold the boot-OK smiley this long before the fill begins
 
 case "$TOTAL" in ''|*[!0-9]*|0) TOTAL=120 ;; esac
 case "$V"     in ''|*[!0-9]*)   V=50    ;; esac
+case "$SHAPE" in wings|fill) ;; *) SHAPE=wings ;; esac
 
 rm -f "$STOP" 2>/dev/null
+
+# Smiley first (boot only), so the ring reads "powered on, OK" before the wings rise.
+# The STM8's own power-on smiley already shows until now; this re-asserts it so the
+# sequence is deterministic regardless of when the bus came up.
+if [ "$SHAPE" = wings ]; then
+	"$LEDSTAGE" smiley 2>/dev/null
+	sleep "$SMILEY_HOLD"
+fi
+
 start="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
 cap=$((TOTAL * 3))
 last=-1
@@ -39,10 +56,17 @@ while [ ! -e "$STOP" ]; do
 	now="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
 	el=$((now - start)); [ "$el" -lt 0 ] && el=0
 	[ "$el" -ge "$cap" ] && break
-	# n = round(NLED * elapsed / TOTAL), clamped to a full ring.
-	n=$(( (el * NLED + TOTAL / 2) / TOTAL ))
-	[ "$n" -gt "$NLED" ] && n="$NLED"
-	[ "$n" -ne "$last" ] && { "$LEDSTAGE" fill "$n" "$V" 2>/dev/null; last="$n"; }
+	if [ "$SHAPE" = wings ]; then
+		# k = round(12 * elapsed / TOTAL): 0..12 levels of wing rising from the bottom.
+		n=$(( (el * 12 + TOTAL / 2) / TOTAL ))
+		[ "$n" -gt 12 ] && n=12
+		[ "$n" -ne "$last" ] && { "$LEDSTAGE" wings "$n" "$V" 2>/dev/null; last="$n"; }
+	else
+		# n = round(NLED * elapsed / TOTAL): one arc from 12 o'clock, clamped to full.
+		n=$(( (el * NLED + TOTAL / 2) / TOTAL ))
+		[ "$n" -gt "$NLED" ] && n="$NLED"
+		[ "$n" -ne "$last" ] && { "$LEDSTAGE" fill "$n" "$V" 2>/dev/null; last="$n"; }
+	fi
 	sleep 2
 done
 exit 0
