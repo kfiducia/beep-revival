@@ -219,15 +219,27 @@ unit-tested as a pure component — `cubic_q16` (Catmull-Rom) plus a streaming `
 resampler (feed input / pull output at a Q16.16 `step`, phase + window carried across
 calls). `--selftest` covers unity fidelity, **cross-block continuity** (strictly monotone
 → no splice → no click), and rate accuracy at a non-unity ratio. It is now **wired into
-`run_sink_alsa` behind `--resample`** (opt-in; drop/insert stays the default): the same
-schedule error drives a gentle P-controller (`~0.75` step-unit/frame, `~2 s` time constant)
-that trims `rs.step` within `±3000 ppm` — a max `0.3%` pitch shift, inaudible — instead of
-dropping/inserting samples. The ring feeds the resampler window in `256`-frame chunks and a
-full period is pulled every iteration (the DAC still paces us; we never wait mid-period and
-the near-unity ratio keeps the window from starving — the failure mode of the earlier
-attempt). The read head is tracked exactly as `played_src − (win_n − ri)`, so the servo math
-is unchanged. Remaining: tune the gain/clamp by ear on hardware and, if it holds, promote it
-to the default (and wire a UCI/init flag to pass `--resample` to the node).
+`run_sink_alsa` behind `--resample`** (opt-in; drop/insert stays the default) as a HYBRID
+servo, the way Snapcast-class engines do it. FINE errors (≤20 ms) drive a gentle
+P-controller (`~0.75` step-unit/frame, `~2 s` time constant, slew-limited) that trims
+`rs.step` within `±3000 ppm` — a max `0.3%` pitch shift — so ongoing drift is nulled
+click-free. COARSE errors (>20 ms: a deep startup prebuffer, a big network gap) snap via a
+rate-limited drop/insert, because a `±1%` resample can't reel those in fast enough; the one
+splice click lands only in the join transient. The ring feeds the window in `256`-frame
+chunks and a full period is pulled every iteration (the DAC paces us; we never wait
+mid-period and the near-unity ratio keeps the window from starving). The read head is
+`played_src − (win_n − ri)`, so the schedule math is unchanged. **PCM is S16_LE** and the
+resampler does integer math on sample values, so it reads/writes samples little-endian
+explicitly (`le16_get`/`le16_put`) — a native int16 view would be byte-swapped garbage on
+the big-endian AR9331.
+
+**Hardware status (beep-silver):** with a smooth on-device source the streamed tone is
+clean — one startup snap, then holds `±0.3 ms`, zero XRUN. A *jittery* source (a laptop
+pacing over wifi) makes the coarse snap fire repeatedly → audible dropouts + pitch wobble;
+that path stresses the jitter buffer harder than a dedicated Beep source will. Remaining:
+(1) size up the jitter buffer / smarter jitter handling for the Beep→Beep **wifi** path;
+(2) representative two-Beep test; (3) if it holds, promote `--resample` to default and wire
+a UCI/init flag to pass it to the node.
 
 `--fanout` is a first-class mode (one source → many sinks) used by the node. Its sends
 are **non-blocking**: a frame goes to a sink only when it's writable (`POLLOUT`), else
