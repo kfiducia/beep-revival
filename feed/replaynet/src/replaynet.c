@@ -1059,7 +1059,18 @@ static snd_pcm_t *alsa_open(const char *dev)
 		snd_pcm_close(pcm);
 		return NULL;
 	}
-	plog("INFO", "ALSA %s: %d Hz S16_LE %d ch, ~%lld ms buffer",
+	/* Start the DAC after just one period, not when the whole (deep) buffer is full — else it
+	 * stays silent while the buffer fills and the schedule advances, so audible starts ~BUF
+	 * behind and the servo snaps once on live audio (an audible startup tick). Starting after
+	 * a period lets audible track the schedule from t≈0; the buffer still fills behind it. */
+	{
+		snd_pcm_sw_params_t *sw;
+		snd_pcm_sw_params_alloca(&sw);
+		if (snd_pcm_sw_params_current(pcm, sw) == 0 &&
+		    snd_pcm_sw_params_set_start_threshold(pcm, sw, RN_ALSA_PERIOD_FRAMES) == 0)
+			snd_pcm_sw_params(pcm, sw);
+	}
+	plog("INFO", "ALSA %s: %d Hz S16_LE %d ch, ~%lld ms buffer, start after 1 period",
 	     dev, RN_RATE, RN_CHANNELS, (long long)(RN_ALSA_BUF_NS / 1000000));
 	return pcm;
 }
