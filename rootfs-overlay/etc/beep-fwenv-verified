@@ -1,0 +1,19 @@
+# Presence of this file ARMS the good-boot bootcount reset
+# (/usr/libexec/beep/bootcount-reset), which clears U-Boot's 3-strikes counter on
+# every healthy boot so a run of ordinary reboots/power-blips can't walk a HEALTHY
+# primary into the recovery slot ("drops to recovery for no reason").
+#
+# WHY IT IS SAFE TO SHIP ARMED (rather than hand-created per unit):
+#   The reset is NOT unconditional. bootcount-reset self-verifies at runtime before it
+#   writes anything: it runs `fw_printenv -n beep_primary` through /etc/fw_env.config and
+#   ABORTS unless it reads back exactly 0x9f050000. A correct read-back proves the
+#   env offset/size/CRC in fw_env.config are right for THIS unit — and if the read is
+#   wrong (wrong geometry, different layout, missing envtools) the guard fails closed and
+#   the reset is a silent no-op. So arming it image-wide can validate-and-run on a
+#   correctly-laid-out unit and harmlessly do nothing on anything else.
+#
+# The write is a full env-sector rewrite (fw_setenv), which returns the wear-leveled
+# bootcount region (0x8000-0xFFFF) to 0xFF = count 0. Follow-up (specced, needs a NOR
+# write helper validated on a bench): notes/bootcount-reset-v2-spec.md — a lighter
+# single-nibble advance that avoids the per-boot sector erase.
+armed
