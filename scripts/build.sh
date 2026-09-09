@@ -451,16 +451,22 @@ echo "== 5. build (this is the long one) =="
 # only ADDS to an existing root-*, never removes, so a shrunk package set would
 # otherwise still bundle the old (deselected) files.
 rm -rf "$OW"/build_dir/target-*/root-* 2>/dev/null || true
-# CRITICAL: OpenWrt keeps a stale .ipk for a /src-linked feed package even after
-# the .ko is recompiled, and silently INSTALLS the old module (this shipped the
-# no-DMA driver in the image more than once). Nuke our packages' build dirs AND
-# their .ipk files so every build installs the freshly-compiled module.
+# CRITICAL: OpenWrt keeps a stale .ipk AND a "built" stamp for a /src-linked feed
+# package on a PERSISTENT runner, so it silently ships the old artifact — or, if the
+# .ipk was deleted but the stamp survived, ships NOTHING (this dropped beepd +
+# kmod-beep-i2s from a self-hosted build entirely). The previous `rm -rf
+# build_dir/target-*/linux-*/beepd` was wrong: beepd is a USERSPACE package
+# (build_dir/target-*/beepd-*/), not a kernel module, so its stamp was never cleared.
+# Use `package/.../clean`, which wipes BOTH the build_dir/stamp and the .ipk, so every
+# build recompiles our /src-linked packages from scratch. Feed dir = beepfeed; source
+# dirs = beepd, beep-i2s, sound-soc-extra (kmod target names derive from these).
+for p in beepd beep-i2s sound-soc-extra; do
+	make "package/feeds/beepfeed/$p/clean" >/dev/null 2>&1 \
+		|| echo "   (note: clean of $p returned non-zero — continuing)"
+done
 find "$OW"/bin "$OW"/build_dir -name '*beep-i2s*.ipk' -delete 2>/dev/null || true
 find "$OW"/bin "$OW"/build_dir -name '*beepd*.ipk' -delete 2>/dev/null || true
 find "$OW"/bin "$OW"/build_dir -name '*sound-soc-extra*.ipk' -delete 2>/dev/null || true
-rm -rf "$OW"/build_dir/target-*/linux-*/beep-i2s \
-       "$OW"/build_dir/target-*/linux-*/beepd \
-       "$OW"/build_dir/target-*/linux-*/sound-soc-extra 2>/dev/null || true
 set -o pipefail   # else the pipe's exit = tee/tail, masking a make failure
 # Cap parallelism. On many-core hosts OpenWrt's recursive sub-makes (notably gcc's
 # bootstrap, and several base packages: zlib/usign/libjson-c) RACE at very high -j
@@ -471,6 +477,21 @@ echo "   building with -j$JOBS (cap avoids high-parallelism gcc/base-package rac
 make -j"$JOBS" 2>&1 | tee /build/image-build.log | tail -1
 MAKE_RC=$?
 [ "$MAKE_RC" -eq 0 ] || { echo "!! make FAILED (rc=$MAKE_RC) — see /build/image-build.log"; exit "$MAKE_RC"; }
+
+# GUARD: beepd (the STM8 knob/tap/LED daemon) and its kmod MUST be in the image. A
+# /src-linked feed package can go stale on a persistent runner and be silently DROPPED
+# — a green build that ships a daemon-less device (no ring/knob/volume). This shipped a
+# beepd-less 1.2.1 once (2026-09-09) and reached hardware. Fail loudly instead.
+BROOT="$(ls -d "$OW"/staging_dir/target-*/root-* 2>/dev/null | head -1)"
+[ -n "$BROOT" ] || { echo "!! GUARD: no staged rootfs found to verify beepd"; exit 6; }
+[ -x "$BROOT/usr/sbin/beepd" ] || {
+	echo "!! GUARD: beepd MISSING from the image rootfs ($BROOT/usr/sbin/beepd) —"
+	echo "   the beepfeed package did not build/install. Do NOT ship this image."
+	exit 6; }
+ls "$BROOT"/lib/modules/*/*beep*i2s* >/dev/null 2>&1 || {
+	echo "!! GUARD: kmod-beep-i2s MISSING from the image rootfs — I2S audio would be dead."
+	exit 6; }
+echo "   guard OK: beepd + kmod-beep-i2s present in the image rootfs"
 
 # GUARD: an AIRPLAY2 build MUST actually contain AirPlay 2. This silently regressed
 # once when a prior default build's --with-airplay-2 strip leaked into the Makefile,
