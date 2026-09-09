@@ -1733,6 +1733,21 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 			for (int i = 0; i < RN_MAX_PEERS && nm < RN_FANOUT_MAX; i++)
 				if (peers[i].used && strcmp(peers[i].d.sink, role_src) == 0)
 					snprintf(members[nm++], 64, "%s", peers[i].ip);
+			/* Order the remote members deterministically (by IP). A peer that briefly
+			 * misses a gossip under wifi contention re-registers into a different peer-
+			 * table slot; without this the member list reorders, its signature changes,
+			 * and the fan-out is needlessly restarted — which re-locks the clock + refills
+			 * the prebuffer on EVERY sink from scratch (a ~20 s reconverge = a gross,
+			 * contention-triggered dropout). Sorting makes the same set produce the same
+			 * signature. 127.0.0.1 (self) stays first; fan-out order is otherwise moot. */
+			for (int i = 2; i < nm; i++) {
+				char key[64]; snprintf(key, sizeof(key), "%s", members[i]);
+				int j = i - 1;
+				while (j >= 1 && strcmp(members[j], key) > 0) {
+					snprintf(members[j + 1], 64, "%s", members[j]); j--;
+				}
+				snprintf(members[j + 1], 64, "%s", key);
+			}
 			char sig[512] = ""; for (int i = 0; i < nm; i++) { strncat(sig, members[i], sizeof(sig)-strlen(sig)-2); strncat(sig, ",", 2); }
 			snprintf(role, sizeof(role), "SOURCE group=%s members=%d", role_src, nm);
 			if (!no_audio && (fanout == 0 || strcmp(sig, cur_members) != 0)) {
