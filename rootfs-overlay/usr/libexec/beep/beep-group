@@ -74,6 +74,45 @@ apply_member() {
 role="${1:-apply}"
 [ "$role" = apply ] && role="$(uci -q get beep.main.group_role || echo solo)"
 
+# --- multi-room ENGINE selector (default: snapcast, unchanged below) -----------------
+# beep.main.group_engine = snapcast (default) | replaynet. The replaynet engine replaces
+# snapserver+snapclient with the single `replaynet --node` daemon (consensus + fan-out;
+# docs/REPLAYNET.md). Roles map onto its control socket; shairport pipes decoded PCM to
+# the node FIFO and fires become-source/leave from its session hooks.
+ENGINE="$(uci -q get beep.main.group_engine 2>/dev/null || echo snapcast)"
+RN=/usr/sbin/replaynet
+RNFIFO=/tmp/beep-pcm
+
+sp_replaynet() {  # point shairport-sync at replaynet: pipe -> FIFO + play/stop hooks
+	[ -f "$SPCONF" ] || return 0
+	sed -i 's/output_backend = "[a-z]*";/output_backend = "pipe";/' "$SPCONF"
+	grep -q '^pipe = {' "$SPCONF" || printf '\npipe = {\n\tname = "%s";\n};\n' "$RNFIFO" >> "$SPCONF"
+	sed -i '/^pipe = {/,/^};/ s#name = "[^"]*";#name = "'"$RNFIFO"'";#' "$SPCONF"
+	grep -q '^sessioncontrol = {' "$SPCONF" || printf \
+		'\nsessioncontrol = {\n\trun_this_before_play_begins = "%s --ctl become-source";\n\trun_this_after_play_ends = "%s --ctl leave";\n};\n' \
+		"$RN" "$RN" >> "$SPCONF"
+}
+
+if [ "$ENGINE" = replaynet ]; then
+	# snapcast off; the replaynet node + shairport(pipe) up; roles -> control socket.
+	svc snapserver disable; svc snapserver stop
+	svc snapclient disable; svc snapclient stop
+	uci -q set replaynet.node.enabled=1; uci -q commit replaynet
+	svc replaynet enable; svc replaynet restart
+	sp_replaynet
+	sp_apply
+	case "$role" in
+		primary) uci -q set beep.main.group_role=primary; uci -q commit beep; "$RN" --ctl become-source >/dev/null 2>&1; echo primary ;;
+		member)  uci -q set beep.main.group_role=member;  uci -q commit beep; "$RN" --ctl join         >/dev/null 2>&1; echo member ;;
+		solo)    uci -q set beep.main.group_role=solo;    uci -q commit beep; "$RN" --ctl leave        >/dev/null 2>&1; echo solo ;;
+		toggle)  out="$("$RN" --ctl toggle 2>/dev/null)"; echo "${out:-toggled}" ;;
+		status)  "$RN" --ctl status 2>/dev/null || echo "role=? (replaynet down)" ;;
+		*) echo "usage: beep-group apply|primary|member|solo|toggle|status" >&2; exit 1 ;;
+	esac
+	exit 0
+fi
+# --- snapcast engine (default) -------------------------------------------------------
+
 case "$role" in
 	primary) uci -q set beep.main.group_role=primary; uci -q commit beep; apply_primary ;;
 	member)  uci -q set beep.main.group_role=member;  uci -q commit beep; apply_member ;;

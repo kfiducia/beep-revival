@@ -1,0 +1,8 @@
+#!/bin/sh
+# Register the replaynet multi-room engine's init script for boot. It stays DORMANT
+# (start_service returns early) until replaynet.node.enabled=1 — the current default
+# multi-room engine is still snapcast, so enabling the init here is harmless and just
+# means "ready to switch". Flipping the engine to replaynet (build flag / UCI) enables
+# the node and points shairport-sync at the /tmp/beep-pcm pipe. See docs/REPLAYNET.md.
+[ -x /etc/init.d/replaynet ] && /etc/init.d/replaynet enable 2>/dev/null
+exit 0

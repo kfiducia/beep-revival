@@ -1,0 +1,72 @@
+#!/bin/sh /etc/rc.common
+# replaynet — Beep multi-room sync engine (fresh reimplementation of stock playnet;
+# replaces snapserver+snapclient, see docs/REPLAYNET.md and docs/PLAYNET-RE.md).
+#
+# One `--node` daemon per Beep: it gossips {id,source,sink,signal,source_time} on the
+# LAN, runs the deterministic grouping consensus, keeps an always-on ALSA sink, and when
+# elected the group source fans its PCM out to every member in sample sync. The source
+# PCM comes from a FIFO that shairport-sync (classic AirPlay-1, pipe backend) writes to.
+# Triggers arrive on a UNIX control socket from the shairport session hooks (play ->
+# become-source) and the double-tap gesture (toggle) — see beep-group.
+#
+# Like squeezelite/shairport it uses `nice -12` (an audio edge on the single-core 400 MHz
+# AR9331, NOT SCHED_FIFO which risks self-deadlock), and plays through the ALSA "default"
+# softvol so the shared "Master" volume (knob / web slider / LED arc) attenuates it.
+# Opt-in via UCI — OFF by default so the current snapcast pipeline is untouched until a
+# build/UCI explicitly switches the multi-room engine to replaynet.
+
+START=98
+STOP=1
+
+USE_PROCD=1
+PROG=/usr/sbin/replaynet
+FIFO=/tmp/beep-pcm
+
+start_service() {
+	config_load replaynet
+
+	local enabled
+	config_get_bool enabled node 'enabled' 0
+	[ "$enabled" -eq 0 ] && return
+
+	local id
+	config_get id node id ''
+	# Fall back to the device hostname so the node id tracks the Beep's name everywhere.
+	[ -z "$id" ] && id="$(uci -q get system.@system[0].hostname)"
+	[ -z "$id" ] && id="Beep"
+	# A device_id may not contain a '.' (grouping constraint) — squash anything odd.
+	id="$(echo "$id" | tr -c 'A-Za-z0-9_-' '_')"
+
+	local group;  config_get group  node group ''
+	local device; config_get device node device 'default'
+	local signal; config_get signal node signal '0'
+
+	# shairport (pipe backend) writes decoded PCM here; ensure the FIFO node exists so
+	# both sides have something to open.
+	[ -p "$FIFO" ] || { rm -f "$FIFO"; mkfifo -m 666 "$FIFO"; }
+
+	procd_open_instance
+	procd_set_param command "$PROG" --node --id "$id" --alsa "$device" --pcm "$FIFO" --signal "$signal"
+	[ -n "$group" ] && procd_append_param command --group "$group"
+	# Audio-thread scheduling edge on the single-core AR9331 (matches squeezelite/shairport).
+	procd_set_param nice -12
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger replaynet
+}
+
+# Release the control socket / audio port before respawning (mirror squeezelite).
+reload_service() {
+	stop
+	sleep 1
+	start
+}
+
+restart() {
+	reload_service
+}

@@ -202,3 +202,106 @@ signal-based election, orphan culling, idempotence) and validated live:
 Package: `feed/replaynet/` (single C file, mirrors `feed/beepd`, `DEPENDS +alsa-lib`,
 built `-DRN_ALSA -lasound`). Selected in the image via `CONFIG_PACKAGE_replaynet=y`
 (built for CI coverage; not auto-started yet).
+
+## Tight-sync engine (post-step-d work, branch `feature/replaynet-pipeline`)
+
+The step-c buffer-fill servo only held each sink's *latency* near a setpoint, so under
+wifi jitter sinks drifted ~100–300 ms apart (audible flam). Replaced with an
+**absolute-schedule servo**: each sink steers so source sample `S` is audible at
+`want_local + (S − anchor_sample)/RATE`. That mapping is invariant to which frame a node
+anchored on (the anchor terms cancel to `source_time_base + S/RATE − theta + BUFFER`), so
+every node targets the *same* (source-sample, wall-clock) point and stays sample-aligned
+regardless of buffer jitter. The sink tracks source-sample position (`rx_next_src` from
+each frame's `track_samples`, `played_src` for what it has fed the DAC) and nulls the
+error by drop/insert, rate-limited, with a **ring floor** so a low-latency co-located
+sink can't drop itself into starvation/XRUN. The click-free corrector is built and
+unit-tested as a pure component — `cubic_q16` (Catmull-Rom) plus a streaming `rn_rsmp`
+resampler (feed input / pull output at a Q16.16 `step`, phase + window carried across
+calls). `--selftest` covers unity fidelity, **cross-block continuity** (strictly monotone
+→ no splice → no click), and rate accuracy at a non-unity ratio. What remains is wiring it
+into `run_sink_alsa` in place of drop/insert (map the schedule error to a small ppm on
+`step`) and tuning the ppm gain/clamp on hardware — the math is proven, so that's a small,
+low-risk change once a unit is available to listen on.
+
+`--fanout` is a first-class mode (one source → many sinks) used by the node. Its sends
+are **non-blocking**: a frame goes to a sink only when it's writable (`POLLOUT`), else
+that frame is skipped (dropped after ~13 s stuck). This fixed a fatal deadlock — a
+blocking send to a slow/locking sink stopped the fan-out answering *its* clock-sync
+pings, so it never locked, never drained, and stayed blocked, starving every other sink.
+
+**Hardware result (2 Beeps):** the local sink holds **sub-millisecond** schedule error
+(−22 µs to −3 ms) sustained; a remote sink hit **+1.3 ms** on a healthy link. Under a
+weak copper link (−72 dBm, ~1.4 Mbps raw PCM doesn't fit) the fan-out gracefully skips
+frames to copper while the other stays perfectly synced. Follow-ups: cubic resampler for
+click-free correction; FLAC/opus so weak wifi fits; per-sink gap-fill on skips.
+
+## Productionization: replacing the snapcast pipeline
+
+Today: AirPlay-1 shairport decodes → `/tmp/snapfifo` → snapserver → snapclient (per unit)
+→ ALSA `default` (softvol Master → WM8524). replaynet replaces the whole snapserver +
+snapclient sync layer with one `replaynet --node` daemon reading the shairport pipe.
+
+Wired on this branch (all reversible — the default engine is still snapcast):
+
+- **`/etc/init.d/replaynet`** (procd, mirrors squeezelite): launches
+  `replaynet --node --id <hostname> --alsa default --pcm /tmp/beep-pcm`, `nice -12`,
+  respawn. Registered at boot by **`/etc/uci-defaults/99-beep-replaynet`** but DORMANT
+  (`start_service` returns unless `replaynet.node.enabled=1`).
+- **`/etc/config/replaynet`** — UCI (`id`, `group`, `device`, `signal`, `enabled=0`).
+- **`beep-group`** gains a `group_engine` selector (`snapcast` default | `replaynet`). The
+  replaynet branch stops snapcast, enables the node, repoints shairport to a **pipe →
+  `/tmp/beep-pcm`** with **`sessioncontrol` hooks** (`run_this_before_play_begins →
+  replaynet --ctl become-source`, `..._after_play_ends → ... leave`), and maps roles to
+  the control socket. Double-tap already calls `beep-group toggle`, which routes to
+  `replaynet --ctl toggle` (join the active source, or leave) — no `beep-action` change.
+- **`scripts/build.sh`**: `MULTIROOM=replaynet ./build.sh` drops
+  snapserver/snapclient/libatomic (~5 MB + the C++ runtime) and drops a uci-default that
+  sets `group_engine=replaynet` + enables the node. Default build is unchanged (snapcast).
+
+Runtime switch on a running unit: `uci set beep.main.group_engine=replaynet;
+uci commit beep; /usr/libexec/beep/beep-group apply`.
+
+**Still to validate on hardware** (needs a build + flash): the full shairport-fed path
+end-to-end (phone → shairport → FIFO → replaynet → synced playout), the shairport hooks
+firing become-source/leave, and a soak run. Also open: real mDNS discovery (avahi
+`_beep._tcp`, libs already on the image), `beep-source`/`rpcd` status readouts still name
+snapcast, and FLAC/opus for weak links.
+
+## Bring-up / validation checklist (when we build + flash)
+
+Fastest first pass is the **runtime switch on a live unit** (no reflash): deploy the
+`replaynet` binary, flip the engine, and drive it — this is what the hardware iterations
+used.
+
+```
+# on the Beep (per unit):
+uci set beep.main.group_engine=replaynet
+uci set replaynet.node.enabled=1
+uci set replaynet.node.group=1                 # shared group so units auto-form one
+uci commit
+/usr/libexec/beep/beep-group apply             # stops snapcast, points shairport at the
+                                               # /tmp/beep-pcm pipe + hooks, starts the node
+beep-source status                             # -> multiroom engine=replaynet node=up
+replaynet --ctl status                         # -> id/sink/source
+```
+
+Then validate, in order:
+1. **Node up + fed:** `pidof replaynet`; `ls -l /tmp/beep-pcm` (a fifo); shairport conf
+   shows `output_backend = "pipe"` and a `sessioncontrol` block.
+2. **AirPlay plays (single unit):** stream from a phone → audio out the WM8524; the
+   shairport hook fires `--ctl become-source` (check `logread | grep replaynet`, role → SOURCE).
+3. **Two units in sync:** double-tap the 2nd Beep → `beep-group toggle` → it joins; both
+   play the same audio. Confirm by ear (tight, no flam) and in logs (`playout: ... sched
+   err` small on both). Stop → `--ctl leave`.
+4. **Volume parity:** the knob / web slider / LED arc still move the shared Master (replaynet
+   plays through `default` → softvol). Note: in pipe mode the phone's AirPlay volume no
+   longer pre-attenuates (same as the old snapcast-primary path).
+5. **Full image build:** `MULTIROOM=replaynet ./scripts/build.sh`, flash, confirm the
+   uci-default made replaynet the engine at first boot and the above still holds.
+6. **Soak:** run hours; watch for XRUN storms, fd/mem leaks, reconnect after a peer drop,
+   and behaviour when wifi degrades (the fan-out should skip a weak sink, not stall others).
+
+Known deltas to expect: drop/insert correction can click on a sharp drift step (cubic
+resampler is the fix); a weak-wifi sink (< ~−70 dBm) can't carry ~1.4 Mbps raw PCM and will
+glitch (FLAC/opus is the fix); `beep-source snapcast on/off` still uses the "snapcast" verb
+though it drives replaynet under the engine switch.
