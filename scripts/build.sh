@@ -279,6 +279,26 @@ echo "== 3. bake in the rootfs overlay =="
 # silently ride into a subsequent production image. Wipe first so that can't happen.
 rm -rf "$OW/files"; mkdir -p "$OW/files"
 cp -a "$SRC/rootfs-overlay/." "$OW/files/"
+
+# Stamp the running version so the web UI's "Firmware" row shows it (rpcd's version()
+# reads /etc/beep-version; index.html binds it to #s-ver). Precedence:
+#   1. explicit $VERSION env (what our deploy loop / release-style callers pass),
+#   2. a pre-stamped overlay file already copied in (release.yml writes rootfs-overlay/
+#      etc/beep-version before calling us — don't clobber it),
+#   3. `git describe` if $SRC is a real checkout (it won't be on the rsync'd build host),
+#   4. a dev fallback, so the field is never a bare OpenWrt string.
+mkdir -p "$OW/files/etc"
+if [ -n "${VERSION:-}" ]; then
+	echo "Beep Revival ${VERSION}" > "$OW/files/etc/beep-version"
+elif [ -s "$OW/files/etc/beep-version" ]; then
+	:   # keep the pre-stamped value (e.g. release.yml)
+elif V=$(cd "$SRC" && git describe --tags --always --dirty 2>/dev/null) && [ -n "$V" ]; then
+	echo "Beep Revival ${V}" > "$OW/files/etc/beep-version"
+else
+	echo "Beep Revival (dev, unstamped)" > "$OW/files/etc/beep-version"
+fi
+echo "   version stamp: $(cat "$OW/files/etc/beep-version")"
+
 # dev builds keep SSH enabled (see 99-beep-ssh); shipping builds disable it
 if [ -n "${BEEP_DEV:-}" ]; then mkdir -p "$OW/files/etc"; touch "$OW/files/etc/beep-dev"
   echo "   [DEV] BEEP_DEV set — SSH stays enabled on this image"; fi
