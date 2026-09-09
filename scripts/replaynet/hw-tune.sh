@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2086,SC2016  # dev tuning: $O is an ssh-option string meant to word-split; single-quoted strings are remote commands eval-d on the Beep, not locally
 # hw-tune.sh — reproducible two-Beep sync harness for tuning replaynet --resample.
 #
 # Loop for an agent: edit the tuning knobs in feed/replaynet/src/replaynet.c, run this,

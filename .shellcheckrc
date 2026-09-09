@@ -19,3 +19,39 @@ disable=SC2034
 # code after `exit 0` (e.g. usr/libexec/beep/bootcount-reset documents the disabled
 # fw_setenv approach below its early exit).
 disable=SC2317
+
+# ---------------------------------------------------------------------------------------
+# Below: STYLE / robustness codes that never indicate a correctness bug in THIS tree, so
+# they are pure noise here. Only codes that can't hide a real bug given our inputs go in
+# this global list; anything that *could* (unquoted expansions SC2086/SC2046, undefined
+# vars SC2154, logic SC2015, glob-as-command SC2211, ...) stays ON and is handled with a
+# per-line `# shellcheck disable=` at each verified-safe site instead — so a NEW, unvetted
+# occurrence still surfaces.
+
+# SC2012 / SC2045: "use find instead of ls" / "iterating ls is fragile." Only bites on
+# filenames with newlines/spaces; all uses here are over controlled build-host dirs
+# (/build/openwrt, /sys/...) whose names are fixed and alphanumeric.
+disable=SC2012
+disable=SC2045
+
+# SC2010: "don't use ls | grep." Same story — used over /sys/class/net (kernel iface
+# names, no odd characters).
+disable=SC2010
+
+# SC1091: "Not following: <file> was not specified as input." Informational — shellcheck
+# simply wasn't handed the sourced file (harness.sh in tests, /etc/openwrt_release). Never
+# a code defect.
+disable=SC1091
+
+# SC2018 / SC2019: "use [:lower:]/[:upper:]." Only matters for accents/foreign alphabets;
+# every `tr a-z A-Z` here operates on ASCII device codes / MACs / hostnames.
+disable=SC2018
+disable=SC2019
+
+# SC2035: "use ./*glob*." Guards against a filename that looks like an option; all globs
+# here expand controlled build outputs, not arbitrary user files.
+disable=SC2035
+
+# SC2162: "read without -r mangles backslashes." Robustness nit; the only `read` prompts
+# for a typed "YES" confirmation with no backslashes.
+disable=SC2162

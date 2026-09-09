@@ -39,13 +39,15 @@ jobs:
         run: |
           set -u
           # Collect *.sh plus any tracked file whose first line is a sh/bash/ash shebang
-          # (the overlay scripts are extensionless), de-duplicated.
+          # (the overlay scripts are extensionless), de-duplicated. Exclude notes/ — it is
+          # vendored third-party reference source (not ours, not built into the image), so
+          # its lint findings are unactionable noise.
           files="$(
             { git ls-files '*.sh'
               git ls-files | while IFS= read -r f; do
                 head -n1 "$f" 2>/dev/null | grep -qE '^#!.*/(sh|bash|ash|dash)' && printf '%s\n' "$f"
               done
-            } | sort -u
+            } | sort -u | grep -vE '^notes/'
           )"
           echo "Linting:"; printf '  %s\n' $files
           # No -s override: shellcheck reads each shebang/directive to pick the dialect.
