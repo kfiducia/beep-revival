@@ -458,15 +458,18 @@ rm -rf "$OW"/build_dir/target-*/root-* 2>/dev/null || true
 # build_dir/target-*/linux-*/beepd` was wrong: beepd is a USERSPACE package
 # (build_dir/target-*/beepd-*/), not a kernel module, so its stamp was never cleared.
 # Use `package/.../clean`, which wipes BOTH the build_dir/stamp and the .ipk, so every
-# build recompiles our /src-linked packages from scratch. Feed dir = beepfeed; source
-# dirs = beepd, beep-i2s, sound-soc-extra (kmod target names derive from these).
-for p in beepd beep-i2s sound-soc-extra; do
+# build recompiles from scratch. Derive the list from feed/ (the beepfeed src dirs) so
+# EVERY local package is covered and a newly-added one can't silently fall out of the
+# list — the hardcoded {beepd,beep-i2s,sound-soc-extra} set had already gone stale:
+# replaynet + snapcast were added to feed/ but not here, leaving them droppable too.
+for p in $(ls -1 "$SRC/feed" 2>/dev/null); do
+	[ -f "$SRC/feed/$p/Makefile" ] || continue
 	make "package/feeds/beepfeed/$p/clean" >/dev/null 2>&1 \
-		|| echo "   (note: clean of $p returned non-zero — continuing)"
+		|| echo "   (note: clean of feed pkg '$p' returned non-zero — continuing)"
+	# also nuke any stale .ipk for this package (name may differ from the src dir,
+	# e.g. kmod-*; match loosely on the src-dir name).
+	find "$OW"/bin "$OW"/build_dir -name "*${p}*.ipk" -delete 2>/dev/null || true
 done
-find "$OW"/bin "$OW"/build_dir -name '*beep-i2s*.ipk' -delete 2>/dev/null || true
-find "$OW"/bin "$OW"/build_dir -name '*beepd*.ipk' -delete 2>/dev/null || true
-find "$OW"/bin "$OW"/build_dir -name '*sound-soc-extra*.ipk' -delete 2>/dev/null || true
 set -o pipefail   # else the pipe's exit = tee/tail, masking a make failure
 # Cap parallelism. On many-core hosts OpenWrt's recursive sub-makes (notably gcc's
 # bootstrap, and several base packages: zlib/usign/libjson-c) RACE at very high -j
