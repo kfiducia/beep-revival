@@ -37,6 +37,12 @@ case "$1" in
 	upgrade)  n=24; v=90 ;;   # FLASHING — do not power off
 	failsafe) n=0;  v=30; warn=1 ;;   # alternating warning ring
 	off)      n=0;  v=0  ;;
+	# fill <n> <v> — light exactly n (0..24) LEDs at brightness v. The primitive the
+	# time-paced animator (led-boot-anim) drives frame-by-frame so the ring fills
+	# smoothly over the length of a boot / flash instead of jumping between milestones.
+	fill)     n="$2"; v="${3:-50}"
+	          case "$n" in ''|*[!0-9]*) exit 0 ;; esac
+	          [ "$n" -gt "$NLED" ] && n="$NLED" ;;
 	*)        exit 0 ;;
 esac
 

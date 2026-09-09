@@ -34,12 +34,33 @@ stages without ever blocking or breaking boot.
 | `failsafe` | alternating | failsafe boot | ✅ |
 
 Wired to OpenWrt's `set_state()` via `etc/diag.sh` (which we override because this
-board has no diag gpio-LED to drive): `preinit→early`, `preinit_regular→config`,
-`upgrade→upgrade`, `failsafe→failsafe`, `done→` (silent hand-off to beepd).
+board has no diag gpio-LED to drive).
 
-Finer app milestones (e.g. `network`, `ready`) can be added by calling
-`led-stage <stage>` directly from init scripts (e.g. `beep-netcheck`) — left as a
-follow-up so this spike stays small.
+## Time-paced fill (the animation)
+
+Rather than jump between coarse milestones, boot and flash drive a **time-paced fill**:
+the ring eases from empty to full over roughly the *duration* of the operation, so the
+dots reach the top about when it finishes. `usr/libexec/beep/led-boot-anim <secs> [v]
+[keep]` runs a background loop that maps monotonic `/proc/uptime` elapsed → `led-stage
+fill <n> <v>` (`n = round(24 · elapsed / secs)`), holding full on overshoot. It's
+deliberately **time-based, not real progress** — overshoot/spill-over is acceptable;
+being a little short just means the ring sits full for the tail.
+
+`set_state()` wiring:
+- `preinit → early` — a brief static arc while the i2c modules load.
+- `preinit_regular → led-boot-anim BOOT_ANIM_SECS` — start the boot fill (detached so it
+  survives preinit's `exec` of procd; yields the instant `beepd`/`pidof beepd` appears at
+  init `START=95`, the "boot done" hand-off).
+- `upgrade → led-boot-anim OTA_ANIM_SECS … keep` — fill over the flash (`keep` ignores the
+  `beepd` check, since services are being torn down).
+- `failsafe → led-stage failsafe` (+ stop the fill); `done →` stop the fill (beepd owns it).
+
+**Calibration:** `BOOT_ANIM_SECS` / `OTA_ANIM_SECS` in `etc/diag.sh` default to `120` /
+`60` (≈ observed boot / flash time on this unit). Tune to the real durations — measure
+boot with `cut -d. -f1 /proc/uptime` at the moment beepd starts.
+
+Finer app milestones can still be layered in by calling `led-stage <stage>`/`fill`
+directly from init scripts — left as a follow-up so this spike stays small.
 
 ## Reachability — the important caveat
 
@@ -64,5 +85,8 @@ pre-kernel window (SoC ROM → U-Boot → kernel decompress). The STM8 smiley co
    as beepd starts at `done`).
 4. With `09-beep-i2c` in place, confirm early boot is not slowed/destabilized and that
    `early`/`config` actually paint during preinit. If not clean → drop that file.
-5. Deliberately stall a boot (e.g. a bad config restore) and confirm the ring **holds a
-   partial arc** instead of advancing — the whole point.
+5. Confirm the fill **paces the boot**: the ring eases up over the boot and is roughly
+   full about when `beepd` takes over — no big jump/flicker at hand-off. Tune
+   `BOOT_ANIM_SECS` to the measured boot time if the ring finishes far early/late.
+6. Same for a web-OTA flash: the ring fills over the flash and is ~full by reboot
+   (`OTA_ANIM_SECS`). Spill-over (sits full for the tail) is acceptable.
