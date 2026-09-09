@@ -482,52 +482,69 @@ MAKE_RC=$?
 [ "$MAKE_RC" -eq 0 ] || { echo "!! make FAILED (rc=$MAKE_RC) — see /build/image-build.log"; exit "$MAKE_RC"; }
 
 # ============================================================================
-# OUTPUT TESTS — a green `make` is NOT proof the image is shippable. Verify, per
-# variant, that the built image actually contains what it should BEFORE it can be
-# signed/published. Two real regressions reached hardware and motivate these:
-#   * a stale /src-linked feed package was silently dropped -> a beepd-less image
-#     (no ring/knob/volume), 2026-09-09; and
-#   * the ap1 sysupgrade image came out with NO metadata -> on-device `sysupgrade -T`
-#     rejected it ("Image metadata not present"), same run, while replaynet was fine.
-# These checks fail the build loudly so neither can ship again.
+# OUTPUT VALIDATION — a green `make` is NOT proof the image is shippable. Validate,
+# per variant, that EVERYTHING we intend is actually IN the built image before it can
+# be signed/published, so broken firmware can't reach a device. Motivated by real
+# 2026-09-09 regressions: a dropped feed package (beepd-less image = no ring/knob/
+# volume), a missing multi-room engine, and an image with NO sysupgrade metadata
+# (device rejects the flash: "Image metadata not present"). Any failure => exit, no ship.
 # ============================================================================
 BROOT="$(ls -d "$OW"/staging_dir/target-*/root-* 2>/dev/null | head -1)"
 MANIFEST="$(ls "$OW"/bin/targets/ath79/generic/*8dev_carambola2*.manifest 2>/dev/null | head -1)"
 IMG="$(ls "$OW"/bin/targets/ath79/generic/*8dev_carambola2-squashfs-sysupgrade.bin 2>/dev/null | head -1)"
-[ -n "$BROOT" ] || { echo "!! OUTPUT-TEST: no staged rootfs found"; exit 6; }
+[ -n "$BROOT" ]    || { echo "!! VALIDATE: no staged rootfs found"; exit 6; }
+[ -n "$MANIFEST" ] || { echo "!! VALIDATE: no image manifest produced"; exit 6; }
+[ -n "$IMG" ]      || { echo "!! VALIDATE: no sysupgrade image produced"; exit 6; }
+VFAIL=0
 
-# 1) Required packages must be IN THE IMAGE (the manifest is authoritative). Core set
-# is always required; the multi-room engine is variant-specific (default = snapcast;
-# MULTIROOM=replaynet drops snapcast and ships the replaynet engine instead).
-req="beepd kmod-beep-i2s shairport-sync-mbedtls"
-if [ "${MULTIROOM:-}" = replaynet ]; then req="$req replaynet"; else req="$req snapserver snapclient"; fi
-[ -n "$MANIFEST" ] || { echo "!! OUTPUT-TEST: no image manifest found to verify packages"; exit 6; }
-for pkg in $req; do
-	grep -q "^$pkg " "$MANIFEST" || { echo "!! OUTPUT-TEST: package '$pkg' NOT in image manifest ($MANIFEST) — do NOT ship"; exit 6; }
+# (1) EVERY requested package (.config CONFIG_PACKAGE_x=y) must appear in the image
+# manifest. This catches ANY silently-dropped package automatically — no hardcoded
+# list to fall out of date (the exact class of bug that dropped beepd, then replaynet).
+pmiss=""
+for pkg in $(sed -n 's/^CONFIG_PACKAGE_\([A-Za-z0-9._+-]*\)=y$/\1/p' .config | sort -u); do
+	grep -q "^$pkg " "$MANIFEST" || pmiss="$pmiss $pkg"
 done
-echo "   output-test OK: packages present ($req)"
-# belt-and-suspenders: the beepd binary + kmod are physically in the rootfs
-[ -x "$BROOT/usr/sbin/beepd" ] || { echo "!! OUTPUT-TEST: /usr/sbin/beepd missing from rootfs — do NOT ship"; exit 6; }
-ls "$BROOT"/lib/modules/*/*beep*i2s* >/dev/null 2>&1 || { echo "!! OUTPUT-TEST: kmod-beep-i2s missing from rootfs — I2S audio dead"; exit 6; }
+[ -z "$pmiss" ] || { echo "!! VALIDATE: requested package(s) NOT in image manifest:$pmiss"; VFAIL=1; }
 
-# 2) sysupgrade METADATA must be present, or the device rejects the image with "Image
-# metadata not present". fwtool (host tool) extracts it: a non-zero rc with an empty
-# extract = definitively no metadata -> HARD fail. A missing fwtool / inconclusive
-# result only warns, so a tooling quirk can't false-fail an otherwise good build.
+# (2) EVERY file we stage into the image (files/) must be present in the image rootfs —
+# catches a dropped overlay script/config/service/pubkey. Uses the staged files/ dir
+# (already adjusted per variant), so it's variant-correct. Temp file carries the count
+# out of the pipe subshell.
+_om=/tmp/beep-ov-missing; : > "$_om"
+find "$OW"/files -type f 2>/dev/null | while IFS= read -r f; do
+	rel="${f#"$OW"/files/}"
+	[ -e "$BROOT/$rel" ] || echo "/$rel" >> "$_om"
+done
+if [ -s "$_om" ]; then echo "!! VALIDATE: staged overlay file(s) missing from image:"; sed 's/^/     /' "$_om"; VFAIL=1; fi
+
+# (3) Functional essentials, named explicitly for a human-readable failure.
+[ -x "$BROOT/usr/sbin/beepd" ]                 || { echo "!! VALIDATE: /usr/sbin/beepd missing — no ring/knob/volume"; VFAIL=1; }
+ls "$BROOT"/lib/modules/*/*beep*i2s* >/dev/null 2>&1 || { echo "!! VALIDATE: kmod-beep-i2s missing — I2S audio dead"; VFAIL=1; }
+[ -f "$BROOT/etc/beep-ota.pub" ]               || { echo "!! VALIDATE: /etc/beep-ota.pub missing — signed OTA broken"; VFAIL=1; }
+if [ "${MULTIROOM:-}" = replaynet ]; then
+	grep -q '^replaynet ' "$MANIFEST" || { echo "!! VALIDATE: replaynet engine missing (MULTIROOM=replaynet)"; VFAIL=1; }
+else
+	grep -q '^snapserver ' "$MANIFEST" || { echo "!! VALIDATE: snapserver missing (default multi-room)"; VFAIL=1; }
+fi
+
+# (4) sysupgrade METADATA must be present, or the device rejects the flash. fwtool
+# extract: non-zero rc + empty extract = definitively absent -> fail; missing tool /
+# inconclusive only warns, so a tooling quirk can't false-fail a good build.
 FWTOOL="$OW/staging_dir/host/bin/fwtool"
-if [ -x "$FWTOOL" ] && [ -n "$IMG" ]; then
+if [ -x "$FWTOOL" ]; then
 	rm -f /tmp/beep-meta.json 2>/dev/null
 	"$FWTOOL" -q -i /tmp/beep-meta.json "$IMG" 2>/dev/null; fwrc=$?
-	if [ -s /tmp/beep-meta.json ]; then
-		echo "   output-test OK: sysupgrade metadata present ($IMG)"
-	elif [ "$fwrc" -ne 0 ]; then
-		echo "!! OUTPUT-TEST: sysupgrade metadata MISSING from $IMG — on-device 'sysupgrade -T' will reject it. Do NOT ship."; exit 6
-	else
-		echo "   WARN: metadata output-test inconclusive (fwtool rc=0, empty extract) — verify manually"
-	fi
-else
-	echo "   WARN: fwtool ($FWTOOL) or image not found — skipping metadata output-test"
-fi
+	if [ -s /tmp/beep-meta.json ]; then :
+	elif [ "$fwrc" -ne 0 ]; then echo "!! VALIDATE: sysupgrade metadata MISSING from $IMG — device will reject the flash"; VFAIL=1
+	else echo "   WARN: metadata check inconclusive (fwtool rc=0, empty extract) — verify manually"; fi
+else echo "   WARN: fwtool not found ($FWTOOL) — skipping metadata check"; fi
+
+# (5) Image must FIT the firmware partition (mtd 'firmware' = 0xfa0000 on 8dev_carambola2).
+sz="$(wc -c < "$IMG" 2>/dev/null || echo 0)"; lim=16384000
+[ "$sz" -le "$lim" ] || { echo "!! VALIDATE: image $sz B exceeds firmware partition ($lim B)"; VFAIL=1; }
+
+[ "$VFAIL" -eq 0 ] || { echo "!! VALIDATE: image failed one or more output checks — REFUSING to ship"; exit 6; }
+echo "   VALIDATE OK: all $(grep -c '' "$MANIFEST") manifest pkgs incl. requested set present; overlay files present; metadata present; image ${sz}B fits ${lim}B"
 
 # GUARD: an AIRPLAY2 build MUST actually contain AirPlay 2. This silently regressed
 # once when a prior default build's --with-airplay-2 strip leaked into the Makefile,
