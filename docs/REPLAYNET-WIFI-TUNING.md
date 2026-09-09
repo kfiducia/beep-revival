@@ -1,9 +1,43 @@
 # replaynet `--resample` — wifi jitter tuning brief
 
-**Status:** multi-room *works* — two Beeps play the same tone in sync, the co-located sink
-is flawless, but the **wifi sink drops out a few times over a 25 s pure-tone test**. This
-brief hands an agent a reproducible harness and everything learned so far to drive those
-dropouts toward zero. Read it fully before changing code.
+**STATUS: mid-stream dropouts SOLVED (Sep 2026).** Two Beeps play in sync; the wifi sink is
+dropout-free during steady playback. One ~15 ms tick remains in the first ~0.2 s per stream
+(startup fine-trim convergence) — documented, minor, not yet eliminated. See RESOLUTION.
+
+## RESOLUTION — what actually fixed it (and the method lesson)
+Root cause, found by **instrumenting the real snaps** (not theorising): on the single-core
+400 MHz AR9331 the wifi stack (ath9k/wpad softirqs) **preempts the playout thread for
+150–827 ms**; the DAC buffer empties and the sink snaps to catch up = a dropout. Not network
+(ring was full), not CPU (61 % idle), not the servo.
+
+The fix (all hardware-validated with `hw-tune.sh`):
+1. **RT playout thread** — `SCHED_FIFO` prio 50 + `mlockall`. musl stubs `sched_setscheduler`
+   to ENOSYS, so call the syscall directly. This is the load-bearing fix (max `loop_dt`
+   827 ms → 0 ms; residual stalls ≤ ~230 ms).
+2. **DAC buffer 120 → 500 ms** (`RN_ALSA_BUF_NS`) — absorbs the residual ≤230 ms stalls RT
+   can't preempt (hardirqs). 800 ms was worse (delay-jitter). 500 ms is the knee.
+3. **Ring 400 ms → 2 s** (`RN_BUFFER_NS`) — absorbs network delivery jitter (measured RTT
+   3–228 ms on the jammed channel).
+4. **DAC start threshold = 1 period** — start playing immediately instead of waiting for the
+   deep buffer to fill (halved the startup tick).
+
+**What FAILED (looked great in `--simulate`, rejected by hardware):** PI control, median snap
+filter, wider clamp, continuous-theta, startup pre-drop, startup snap-grace. Every one
+targeted a *theorised* cause; the sim faithfully "confirmed" each and hardware disproved it.
+**Measurement — the SNAP-dbg instrumentation + the two-Beep harness — found the truth.**
+Ground the sim in measurements; never let it validate a theory. Also fixed on the way: silver
+was mis-running hostapd/dnsmasq/odhcpd (now station-only); the RF is a jammed channel 1.
+
+Remaining polish (optional): the startup tick is the fine trim converging from 1.0 to the
+DAC's rate offset in the first ~0.2 s. Real fixes would be seeding `rs.step` near the DAC
+offset or a brief fast-converge window — NOT a snap-grace (delays it) or a pre-drop
+(over-shoots), both tried and reverted.
+
+---
+
+## Original brief (kept for the harness + method; the dropout goal above is met)
+The wifi sink used to drop out a few times over a 25 s pure-tone test. This section hands an
+agent the reproducible harness and what was learned. Read it fully before changing code.
 
 ## The system in one paragraph
 `replaynet` is a from-scratch multi-room engine (see `REPLAYNET.md`). A **source** paces
