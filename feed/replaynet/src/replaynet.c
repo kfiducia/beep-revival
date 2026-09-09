@@ -94,10 +94,15 @@
 #define RN_CHUNK_BYTES  (RN_CHUNK_FRAMES * RN_FRAME_BYTES)
 
 /* Target playout buffer: how far behind the source clock a sink schedules audio, to
- * absorb network jitter before the DAC. Wired LANs are fine at ~80 ms, but the Beep is
- * on wifi where bursts routinely exceed that and starve/overflow a small buffer; 400 ms
- * (well under Snapcast's ~1 s default) rides wifi jitter with headroom. */
-#define RN_BUFFER_NS    (400ll * 1000000ll)
+ * absorb network jitter before the DAC. The ring sits between the network and the DAC, so
+ * arrival jitter is invisible at the DAC AS LONG AS THE RING NEVER EMPTIES — audio stays
+ * exactly on schedule regardless of when packets land. HW testing over wifi showed 400 ms
+ * is too shallow: a ~345 ms source/wifi stall drained the ring to zero, the audible sample
+ * fell off schedule, and the servo snapped (drop/insert) → audible dropouts + wobble. Every
+ * error excursion lined up with ring starvation. 1 s (Snapcast's default order) rides those
+ * stalls without the ring emptying. Multi-room stays aligned because every sink uses the
+ * same target, so they all sit the same distance behind the source. */
+#define RN_BUFFER_NS    (1000ll * 1000000ll)
 /* Split the total latency: a modest ALSA/DAC-side queue plus a larger RING working
  * buffer. The schedule servo speeds up / slows down by consuming the RING faster/slower,
  * so the ring must keep headroom both ways — if the ALSA queue swallows everything the
@@ -340,7 +345,9 @@ static int rn_rsmp_pull(struct rn_rsmp *r, int16_t *out, int want)
 /* Circular byte buffer for the playout jitter buffer (ALSA path). Holds decoded PCM
  * between the network reader and the DAC writer; drift corrections drop/insert whole
  * frames here. Sized for the 80 ms target buffer plus generous jitter headroom. */
-#define RN_RING_BYTES (256 * 1024)      /* ~1.5 s @ 44100/S16/stereo */
+#define RN_RING_BYTES (512 * 1024)      /* ~3 s @ 44100/S16/stereo — holds the 1 s target
+                                           buffer with headroom both ways (drain on a stall,
+                                           fill on a burst) without starving or overflowing */
 
 struct pcmring {
 	uint8_t buf[RN_RING_BYTES];
