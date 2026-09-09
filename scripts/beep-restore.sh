@@ -54,5 +54,6 @@ read ans; [ "$ans" = "YES" ] || { echo "aborted."; exit 1; }
 echo "[*] mtd write (erases + writes, by name)…"
 cat "$FILE" | SSH "mtd write - $NAME"
 rc=$?
+# shellcheck disable=SC2015  # middle command is echo (never fails) — safe as if/else
 [ "$rc" = 0 ] && echo "✅ wrote '$NAME'. Verify (md5sum /dev/$NUM vs your backup) and reboot." \
              || { echo "❌ mtd write failed (rc=$rc)"; exit "$rc"; }

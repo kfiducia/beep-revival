@@ -23,6 +23,7 @@ mkdir -p "$WORK"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 nap() { perl -e 'select(undef,undef,undef,$ARGV[0])' "$1"; }
 # run a paced source (blocks ~secs) with a hard alarm; $3.. = extra source args
+# shellcheck disable=SC2086  # $RUN word-splits into the runner argv
 src() { port="$1"; pcm="$2"; shift 2; perl -e 'alarm 30; exec @ARGV' $RUN --source --peer 127.0.0.1:"$port" --pcm "$pcm" "$@"; }
 
 echo "== replaynet loopback test =="
