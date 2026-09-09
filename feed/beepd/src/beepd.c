@@ -75,20 +75,18 @@
 #define PARTY_CAP          250    /* stock note: brightness >250 flickers the whole ring */
 
 /* --- LED UX state machine: boot-sequence timings + ring geometry ------------
- * Beepd owns the ring, so it renders the whole boot story itself the moment it
- * starts (a few seconds into userspace): smiley -> sweep -> live states. There's
- * no pre-Linux stage here by design (no bootloader/STM8 changes). */
-#define SMILEY_MS         1200    /* boot-OK smiley shown this long at startup */
-#define SWEEP_MS          2000    /* symmetric two-LED boot sweep after the smiley */
+ * The early-boot scripts (etc/diag.sh -> led-boot-anim/led-stage) own the ring
+ * during boot: they show the power-on smiley, then raise "wings" from the bottom
+ * to the top over ~the boot duration. beepd starts late (init START=95) and takes
+ * the ring over; it "completes the wings" with a brief full ring, then drops
+ * straight into the live states (AP-setup comet / Wi-Fi connecting spinner / idle
+ * breathe -> sleep). The smiley + rising wings live in the scripts, NOT here, so
+ * they can run for the whole boot before beepd exists. */
+#define BOOT_DONE_MS       800    /* brief full ring at startup: the "wings complete" handoff */
 #define SLEEP_AFTER_MS  120000    /* connected + idle this long -> dim to sleep pulse */
 /* Ring positions, logical index 0..23: 0 = 12 o'clock, increasing clockwise.
- * These are the on-device calibration knobs — light one LED, see where it lands,
- * nudge until the smiley/sweep/sleep sit right. */
-#define LED_TOP            0      /* 12 o'clock */
+ * On-device calibration knobs — light one LED, see where it lands, nudge to taste. */
 #define LED_BOT           12      /* 6 o'clock */
-#define EYE_L             20      /* ~10 o'clock */
-#define EYE_R              3      /* ~2 o'clock (wire 3 = 3.5 steps from the top axis,
-                                  * symmetric with EYE_L=20; wire 4 sat too low) */
 /* logical->wire rotation. BENCH-CALIBRATED on hardware: lighting wire index 0
  * lands at ~12:15 and the index runs clockwise (wire 6 ~3:15, wire 12 ~6:15),
  * i.e. the wire order already matches our logical clock convention — so logical
@@ -209,37 +207,10 @@ static void led_render_ap(int64_t frame)
 		led_target[(head - d + NLED) % NLED] = tail[d];
 }
 
-/* Boot-OK "smiley": two eyes + a bottom smile arc. 24 mono LEDs can't draw a
- * real face, but eyes-over-a-smile reads unmistakably as a happy power-on glyph. */
-static void led_render_smiley(void)
-{
-	memset(led_target, 0, sizeof led_target);
-	led_target[EYE_L] = 255;                           /* ~10 o'clock */
-	led_target[EYE_R] = 255;                           /* ~2 o'clock  */
-	/* wide smile: 8 LEDs across the bottom (~4:15..7:45, matching the stock's 8-LED
-	 * mouth), following the ring so it reads as an upturned smile. Uniform full
-	 * brightness now that output is linear (no gamma to dim the mid values). */
-	for (int i = LED_BOT - 4; i <= LED_BOT + 3; i++)
-		led_target[(i + NLED) % NLED] = 255;
-}
-
-/* Boot progress: two LEDs sweep down both sides in mirror (12->6, then back), the
- * stock "I'm booting" look. Triangle-wave position with a short trailing tail. */
-static void led_render_sweep(int64_t frame)
-{
-	static const uint8_t tail[] = { 255, 90, 25 };
-	int half = LED_BOT;                              /* 12 -> 6 is 12 steps */
-	int ph   = (int)(frame % (2 * half));            /* 0..2*half */
-	int pos  = (ph <= half) ? ph : (2 * half - ph);  /* 0..half..0 */
-	memset(led_target, 0, sizeof led_target);
-	for (int d = 0; d < (int)sizeof tail; d++) {
-		int p = pos - d; if (p < 0) p = 0;
-		int r = (LED_TOP + p) % NLED;                /* right side, clockwise */
-		int l = (LED_TOP - p + NLED) % NLED;         /* left side, mirror image */
-		if (tail[d] > led_target[r]) led_target[r] = tail[d];
-		if (tail[d] > led_target[l]) led_target[l] = tail[d];
-	}
-}
+/* NOTE: the boot-OK smiley and the rising boot "wings" are drawn by the early-boot
+ * scripts (etc/diag.sh -> led-boot-anim/led-stage), which own the ring for the whole
+ * boot before beepd exists. beepd only "completes the wings" with a brief full ring
+ * at startup (see the main loop) and then renders the live states below. */
 
 /* "Ready": the whole ring breathing gently (integer triangle wave, no libm). */
 /* Muted indicator: a slow, calm whole-ring breath at low brightness — deliberately
@@ -617,12 +588,13 @@ int main(int argc, char **argv)
 		if (playing || (t - last_vol_ms) < VOL_HOLD_MS || btn_down_at >= 0)
 			last_active_ms = t;
 
-		/* Priority, high -> low: boot story first, then AP-setup, then live
-		 * feedback (arming/volume/playing), then the idle continuum
+		/* Priority, high -> low: a brief "wings complete" handoff frame first (the
+		 * scripts drew the smiley + rising wings during boot; beepd finishes them
+		 * with a full ring), then AP-setup, then live feedback
+		 * (arming/volume/playing), then the idle continuum
 		 * (connecting spinner -> ready breathe -> sleep pulse). */
 		int64_t boot_ms = t - t0;
-		if      (boot_ms < SMILEY_MS)                 led_render_smiley();
-		else if (boot_ms < SMILEY_MS + SWEEP_MS)      led_render_sweep(f);
+		if      (boot_ms < BOOT_DONE_MS)              memset(led_target, 200, sizeof led_target);
 		else if (led_mode)                            led_render_ap(f);
 		else if (held >= ARM_SHOW_MS)                 led_render_arming(held);
 		else if (t - btn_pulse_ms < BTN_PULSE_MS)     led_render_button_pulse(t - btn_pulse_ms);

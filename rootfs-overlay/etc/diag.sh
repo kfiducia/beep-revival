@@ -15,16 +15,17 @@
 # if i2c-gpio + i2c-dev are loaded in preinit — see etc/modules-boot.d/09-beep-i2c.
 # Once boot completes, beepd (START=95) owns the ring, so `done` hands off silently.
 #
-# Instead of jumping between coarse milestones, we drive a TIME-PACED fill: at the
-# start of boot we launch led-boot-anim, which eases the ring from empty to full over
-# ~the boot duration so the dots reach the top about when boot finishes (and again,
-# over the flash duration, on `upgrade`). See usr/libexec/beep/led-boot-anim.
+# Instead of jumping between coarse milestones, we drive a TIME-PACED animation: at
+# the start of boot we launch led-boot-anim, which shows the power-on smiley and then
+# raises "wings" from the bottom to the top over ~the boot duration (dots reach the
+# top about when boot finishes). On `upgrade` it fills the dial as an arc from 12
+# o'clock over ~the flash duration. See usr/libexec/beep/led-boot-anim.
 
 LEDSTAGE=/usr/libexec/beep/led-stage
 LEDANIM=/usr/libexec/beep/led-boot-anim
 STOP=/tmp/beep-led-anim-stop
-BOOT_ANIM_SECS=120   # ~observed boot time on this unit; tune to taste (spill-over is fine)
-OTA_ANIM_SECS=60     # ~observed flash time; spill-over is fine
+BOOT_ANIM_SECS=120   # ~observed boot time; the wings rise over this window (spill-over is fine)
+OTA_ANIM_SECS=300    # 5 min; the dial fills over the flash (spill-over is fine)
 
 # Launch the animator detached so it survives preinit's exec of procd and runs through
 # the whole boot. setsid if available (full detach); a plain background child is also
@@ -40,10 +41,10 @@ get_status_led() { status_led=""; }
 
 set_state() {
 	case "$1" in
-		preinit)         "$LEDSTAGE" early ;;                          # brief static arc while modules load
-		preinit_regular) rm -f "$STOP" 2>/dev/null; _anim "$BOOT_ANIM_SECS" 50 ;;  # begin the timed boot fill
-		failsafe)        : > "$STOP"; "$LEDSTAGE" failsafe ;;          # stop the fill; alternating warning ring
-		upgrade)         : > "$STOP"; _anim "$OTA_ANIM_SECS" 90 keep ;; # fill over the flash (ignore beepd teardown)
+		preinit)         "$LEDSTAGE" smiley ;;                         # power-on smiley as soon as the bus is up
+		preinit_regular) rm -f "$STOP" 2>/dev/null; _anim "$BOOT_ANIM_SECS" wings 50 ;;  # smiley -> rising wings
+		failsafe)        : > "$STOP"; "$LEDSTAGE" failsafe ;;          # stop the anim; alternating warning ring
+		upgrade)         : > "$STOP"; _anim "$OTA_ANIM_SECS" fill 90 keep ;; # fill from 12 over the flash (ignore beepd teardown)
 		done)            : > "$STOP" ;;                               # boot complete — stop fill; beepd owns the ring
 		*)               : ;;
 	esac
