@@ -155,6 +155,20 @@ summary::-webkit-details-marker{display:none}
       <p class="mut">System output level. Over AirPlay, your phone controls volume.</p>
     </div>
 
+    <!-- AirPlay mode (converged image: runtime AP1/AP2) -->
+    <div class="card" id="ap-card">
+      <h2>📡 AirPlay mode</h2>
+      <p class="mut">How this Beep receives AirPlay. <b>AirPlay 1</b> is lossless and light, and
+        enables Beep&rsquo;s own multi-room grouping below. <b>AirPlay 2</b> adds Apple Home and
+        native AirPlay-2 grouping, but uses more CPU (AAC) and can glitch under load — grouping is
+        then handled by Apple (the Beep multi-room controls below don&rsquo;t apply).</p>
+      <div class="seg" role="group" aria-label="AirPlay mode" style="margin-top:10px">
+        <button id="ap-1" aria-pressed="true"  onclick="setAirplay('ap1')">AirPlay 1 · lossless</button>
+        <button id="ap-2" aria-pressed="false" onclick="setAirplay('ap2')">AirPlay 2 · Home</button>
+      </div>
+      <p class="mut" id="ap-status" style="margin-top:10px"></p>
+    </div>
+
     <!-- system -->
     <div class="card">
       <h2>🔊 Multi-room <span class="mut" style="font-size:.7em;font-weight:400">experimental</span></h2>
@@ -282,6 +296,7 @@ function refresh(){return call("status").then(function(s){
   el("s-up").textContent=fmtUp(s.uptime);
   if(!el("nm").matches(":focus"))el("nm").value=s.name||"";
   if(s.volume!=null && !el("vol")._live){el("vol").value=s.volume;el("volpct").textContent=s.volume+"%";}
+  setAirplayUI(s);
   setGroupUI(s);
   setLmsUI(s);
   setSshUI(s);
@@ -289,6 +304,28 @@ function refresh(){return call("status").then(function(s){
 }).catch(function(e){ // status failed -> needs login
   el("app").classList.add("hide"); el("login").classList.remove("hide");
 });}
+
+// AirPlay 1/2 mode (converged image). Reflects status.airplay_mode; switching restarts
+// shairport-sync and (for AP2) starts nqptp — beep-airplay-mode enforces "AP2 => replaynet OFF".
+function setAirplayUI(s){
+  var m=(s&&s.airplay_mode)||"ap1";
+  var b1=el("ap-1"),b2=el("ap-2");
+  if(b1)b1.setAttribute("aria-pressed",m==="ap1");
+  if(b2)b2.setAttribute("aria-pressed",m==="ap2");
+  var st=el("ap-status");
+  if(st)st.textContent=(m==="ap2")
+    ? "AirPlay 2 (AAC) — Apple Home & native grouping. Higher CPU; the Beep multi-room controls below don't apply."
+    : "AirPlay 1 (ALAC, lossless) — low CPU. Beep multi-room grouping below is active.";
+  var card=el("ap-card"), grp=el("grp-intro");
+  // Dim the Beep multi-room card in AP2 (grouping is Apple's job then).
+  var gc=grp&&grp.parentNode; if(gc&&gc.classList&&gc.classList.contains("card")) gc.style.opacity=(m==="ap2")?".55":"";
+}
+function setAirplay(mode){
+  var st=el("ap-status");
+  if(st)st.textContent=(mode==="ap2"?"Switching to AirPlay 2…":"Switching to AirPlay 1…")+" (restarts AirPlay, ~10s)";
+  call("set_airplay_mode",{mode:mode}).then(function(){setTimeout(refresh,2500);})
+    .catch(function(e){toast(e.message,true);});
+}
 
 function doLogin(){var pw=el("pw").value;login(pw).then(function(ok){
   if(ok){el("loginerr").textContent="";refresh();}

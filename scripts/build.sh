@@ -145,6 +145,17 @@ CFG
   exit 0
 fi
 
+# Beep CONVERGED image: ONE image, runtime-selectable AirPlay 1/2, replaynet multi-room,
+# and NO snapcast. It reuses the AP2 shairport build (AIRPLAY2) + the replaynet engine
+# (MULTIROOM=replaynet), adds the service_type backport (050 patch, applied in the AIRPLAY2
+# block) and the airplay_mode UCI toggle (98-beep-converged uci-default, below). The user
+# picks AP1 (classic, lossless, replaynet multi-room) or AP2 (native grouping) at runtime.
+if [ -n "${CONVERGED:-}" ]; then
+  echo "== [CONVERGED] single image: AP2-capable shairport + replaynet + runtime airplay_mode; snapcast dropped =="
+  AIRPLAY2=1
+  MULTIROOM=replaynet
+fi
+
 echo "== 1b. AirPlay build mode (default: classic AirPlay-1 for Snapcast; AIRPLAY2=1: buffered AAC) =="
 # The AR9331 (400MHz, no SIMD) CANNOT decode AirPlay-2 buffered AAC in real time —
 # measured 0% idle + instant PCM XRUN the moment playback starts (see BUILD-STATUS).
@@ -209,6 +220,11 @@ if [ -n "${AIRPLAY2:-}" ]; then
   # Fixed-point AAC decode: select ffmpeg's aac_fixed (integer S32P) instead of the
   # float decoder so AAC-LC decode fits the 400MHz no-FPU core. See docs/DEV-NOTES.md §1.
   cp "$SRC/scripts/patches/020-aac-fixed-decode.patch" "$SPP/" 2>/dev/null || true
+  # Beep converged image: backport shairport 5.1's service_type onto 4.3.2 so this
+  # AirPlay-2 build can advertise classic AirPlay 1 (RAOP) ONLY at runtime when
+  # general.service_type="classic" (no _airplay._tcp, no nqptp). Lets one image switch
+  # AP1<->AP2 without a rebuild — see beep-group airplay_mode. Harmless if unused.
+  cp "$SRC/scripts/patches/050-service-type-classic.patch" "$SPP/" 2>/dev/null || true
   # nqptp PTP timing (BIG-ENDIAN): fix ntoh64() transposing the 64-bit PTP
   # correctionField on BE (nqptp's hand-rolled swap is LE-only). Latent on a flat
   # single-switch subnet (correctionField is 0 there) but a real BE correctness bug
@@ -485,6 +501,22 @@ UCI
 exit 0
 RNDEF
   chmod +x "$OW/files/etc/uci-defaults/98-beep-multiroom-replaynet"
+
+  # CONVERGED image: ONE image whose AirPlay 1/2 is runtime-selectable. Default to AirPlay 1
+  # (classic RAOP — lossless, replaynet multi-room, CPU headroom). 99 runs after 98 and is the
+  # single source of truth for the AP1/AP2 posture on first boot; the web UI / beep-airplay-mode
+  # switch it later. beep-airplay-mode owns group_engine + shairport service_type + nqptp and
+  # enforces the invariant "AP2 => replaynet OFF".
+  if [ -n "${CONVERGED:-}" ]; then
+    cat > "$OW/files/etc/uci-defaults/99-beep-converged" <<'CVDEF'
+#!/bin/sh
+uci -q get beep.main.airplay_mode >/dev/null 2>&1 || uci -q set beep.main.airplay_mode=ap1
+uci -q commit beep
+[ -x /usr/libexec/beep/beep-airplay-mode ] && /usr/libexec/beep/beep-airplay-mode apply >/dev/null 2>&1
+exit 0
+CVDEF
+    chmod +x "$OW/files/etc/uci-defaults/99-beep-converged"
+  fi
 fi
 
 make defconfig >/dev/null

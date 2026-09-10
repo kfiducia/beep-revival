@@ -1,0 +1,62 @@
+#!/bin/sh
+# beep-airplay-mode — switch this Beep between AirPlay 1 and AirPlay 2 at RUNTIME on the
+# converged image (one image ships both; docs/CONVERGED-IMAGE-DESIGN.md). The AP1/AP2
+# choice is shairport-sync's service_type (backported from 5.1, patch 050):
+#   "classic"  -> advertise only _raop (AirPlay 1, lossless ALAC, no nqptp) + replaynet multi-room
+#   "airplay2" -> advertise AirPlay 2 (AAC, native Apple-Home grouping, nqptp) + NO local engine
+#
+#   ap1    -> AirPlay 1 + replaynet multi-room   (default; lossless, has CPU headroom)
+#   ap2    -> AirPlay 2, native grouping, replaynet OFF (AAC; CPU-marginal on this silicon)
+#   apply  -> (re)apply the persisted beep.main.airplay_mode (used at boot)
+#   status
+#
+# INVARIANT (why this script exists): AP2 must NEVER be routed through replaynet's
+# source/sink — the 400 MHz AR9331 cannot decode AAC and fan out a group at the same
+# time. Selecting ap2 ACTIVELY tears replaynet down (leave + stop + enabled=0) via the
+# beep-group "none" engine and points shairport straight at ALSA; selecting ap1 brings
+# the replaynet engine back. So "AP1 + replaynet" and "AP2 + no replaynet" are the only
+# two states, enforced here + in beep-group — never both.
+
+SPCONF=/etc/shairport-sync.conf
+GROUP=/usr/libexec/beep/beep-group
+log() { logger -t beep-airplay-mode "$*"; }
+svc() { /etc/init.d/"$1" "$2" >/dev/null 2>&1; }
+
+# Set shairport's general.service_type (add if absent, replace if present) — mirrors how
+# beep-group edits output_backend / the volume hook in the same file.
+sp_service_type() {
+	[ -f "$SPCONF" ] || return 0
+	sed -i '/^[[:space:]]*service_type = /d' "$SPCONF"
+	sed -i '/^general = {/a\	service_type = "'"$1"'";' "$SPCONF"
+}
+
+mode="${1:-apply}"
+[ "$mode" = apply ] && mode="$(uci -q get beep.main.airplay_mode 2>/dev/null || echo ap1)"
+
+case "$mode" in
+	ap1)
+		log "AirPlay 1 (classic RAOP) + replaynet multi-room"
+		uci -q set beep.main.airplay_mode=ap1
+		uci -q set beep.main.group_engine=replaynet
+		uci -q commit beep
+		sp_service_type classic
+		svc nqptp disable; svc nqptp stop            # classic RAOP has no PTP timing
+		"$GROUP" apply >/dev/null 2>&1               # replaynet engine restarts shairport (now classic)
+		echo ap1 ;;
+	ap2)
+		log "AirPlay 2 (native grouping); replaynet disabled"
+		uci -q set beep.main.airplay_mode=ap2
+		uci -q set beep.main.group_engine=none
+		uci -q commit beep
+		sp_service_type airplay2
+		svc nqptp enable; svc nqptp start            # AP2 timing daemon must be up before shairport
+		"$GROUP" apply >/dev/null 2>&1               # "none" engine: replaynet down, shairport -> ALSA, restart (AP2)
+		echo ap2 ;;
+	status)
+		printf 'airplay_mode=%s service_type=%s nqptp=%s\n' \
+			"$(uci -q get beep.main.airplay_mode 2>/dev/null || echo ap1)" \
+			"$(sed -n 's/^[[:space:]]*service_type = "\([a-z0-9]*\)";.*/\1/p' "$SPCONF" 2>/dev/null | head -1)" \
+			"$(pidof nqptp >/dev/null 2>&1 && echo up || echo down)" ;;
+	*) echo "usage: beep-airplay-mode ap1|ap2|apply|status" >&2; exit 1 ;;
+esac
+exit 0

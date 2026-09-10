@@ -1,0 +1,87 @@
+Beep: backport service_type = "classic" onto shairport-sync 4.3.2
+
+Lets an AirPlay-2 build advertise ONLY classic AirPlay 1 (RAOP) at runtime,
+selected by 'general.service_type = "classic";' in the config file:
+  - do not advertise the _airplay._tcp (AirPlay 2) mDNS service (regtype2 stays NULL),
+  - skip the nqptp requirement (classic RAOP has no PTP), so it starts without nqptp.
+Any other value keeps the default AirPlay 2 behaviour. Mirrors upstream 5.1's option
+so a future version bump is a no-op. See docs/CONVERGED-IMAGE-DESIGN.md.
+
+--- a/shairport.c
++++ b/shairport.c
+@@ -341,6 +341,12 @@
+   }
+ #endif
+ }
++
++/* Beep: set from the config file's `general.service_type = "classic";`. Makes an
++ * AirPlay-2 build advertise ONLY classic AirPlay 1 (RAOP) at runtime — no
++ * _airplay._tcp service, no nqptp requirement — so one image can switch AP1/AP2
++ * without a rebuild. Backport of upstream 5.1's service_type onto 4.3.2. */
++static int config_service_type_classic = 0;
+ 
+ int parse_options(int argc, char **argv) {
+   // there are potential memory leaks here -- it's called a second time, previously allocated
+@@ -945,6 +951,13 @@
+       if (config_lookup_string(config.cfg, "general.regtype", &str))
+         config.regtype = strdup(str);
+ 
++      /* Beep: general.service_type = "classic" forces classic AirPlay 1 at runtime
++       * (see config_service_type_classic). Any other value keeps the default AirPlay 2. */
++      if (config_lookup_string(config.cfg, "general.service_type", &str)) {
++        if (strcasecmp(str, "classic") == 0)
++          config_service_type_classic = 1;
++      }
++
+       /* Get the volume range, in dB, that should be used If not set, it means you just use the
+        * range set by the mixer. */
+       if (config_lookup_int(config.cfg, "general.volume_range_db", &value)) {
+@@ -1480,7 +1493,9 @@
+   if (config.regtype == NULL)
+     config.regtype = strdup("_raop._tcp");
+ #ifdef CONFIG_AIRPLAY_2
+-  if (config.regtype2 == NULL)
++  /* Beep: in classic mode leave regtype2 unset so the _airplay._tcp (AirPlay 2)
++   * service is never advertised — clients then negotiate classic RAOP (AirPlay 1). */
++  if (config.regtype2 == NULL && !config_service_type_classic)
+     config.regtype2 = strdup("_airplay._tcp");
+ #endif
+ 
+@@ -2603,6 +2618,9 @@
+ #endif
+ 
+ #ifdef CONFIG_AIRPLAY_2
++  /* Beep: classic service (AirPlay 1 only) doesn't use PTP timing, so skip the whole
++   * nqptp handshake — otherwise an AirPlay-2 build die()s here when nqptp is absent. */
++  if (!config_service_type_classic) {
+   ptp_send_control_message_string(
+       "T"); // send this message to get nqptp to create the named shm interface
+   uint64_t nqptp_start_waiting_time = get_absolute_time_in_ns();
+@@ -2648,6 +2666,7 @@
+     debug(1, "NQPTP is online.");
+   else
+     debug(1, "NQPTP came online after %.3f milliseconds.", 0.000001 * time_spent_waiting);
++  } // Beep: end classic-mode nqptp skip
+ #endif
+ 
+ #ifdef CONFIG_METADATA
+--- a/mdns_avahi.c
++++ b/mdns_avahi.c
+@@ -256,7 +256,7 @@
+       selected_interface = config.interface_index;
+     else
+       selected_interface = AVAHI_IF_UNSPEC;
+-    if (ap2_text_record_string_list) {
++    if (config.regtype2 && ap2_text_record_string_list) {  // Beep: skip AP2 service in classic mode (regtype2 == NULL)
+       ret = avahi_entry_group_add_service_strlst(group, selected_interface, AVAHI_PROTO_UNSPEC, 0,
+                                                  ap2_service_name, config.regtype2, NULL, NULL,
+                                                  port, ap2_text_record_string_list);
+@@ -374,7 +374,7 @@
+       debug(1, "avahi_update error updating primary txt records.");
+   }
+ 
+-  if (secondary_txt_records != NULL) {
++  if (config.regtype2 && secondary_txt_records != NULL) {  // Beep: no AP2 txt update in classic mode
+     if (ap2_text_record_string_list)
+       avahi_string_list_free(ap2_text_record_string_list);
+     ap2_text_record_string_list =
