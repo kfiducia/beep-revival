@@ -625,6 +625,37 @@ static int connect_peer(const char *host, uint16_t port)
 	return fd;
 }
 
+/* Non-blocking connect with a bounded timeout. Unlike connect_peer (blocking, no timeout),
+ * this NEVER stalls the caller on an unreachable / mid-respawn member — essential for adding a
+ * member to a LIVE fan-out without hiccuping the source's real-time audio. Returns a BLOCKING
+ * fd on success (the send path uses blocking write_full), or -1. Quiet on failure (a refused
+ * connect is expected while a member's sink player is still coming up; the caller retries). */
+static int connect_peer_timeout(const char *host, uint16_t port, int timeout_ms)
+{
+	struct sockaddr_in sa;
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+	set_big_bufs(fd);
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(port);
+	if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) { close(fd); return -1; }
+	int fl = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	int cr = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+	if (cr < 0 && errno != EINPROGRESS) { close(fd); return -1; }
+	if (cr < 0) {                                   /* in progress -> wait (bounded) for writable */
+		struct pollfd wp = { .fd = fd, .events = POLLOUT };
+		if (poll(&wp, 1, timeout_ms) <= 0 || !(wp.revents & POLLOUT)) { close(fd); return -1; }
+		int err = 0; socklen_t el = sizeof(err);
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) < 0 || err != 0) { close(fd); return -1; }
+	}
+	fcntl(fd, F_SETFL, fl);                          /* restore blocking for the send path */
+	int one = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	return fd;
+}
+
 /* Answer a pending clock PING (already know a message is readable). Returns 0 ok,
  * -1 on error, 1 if the peer closed. */
 static int source_answer_ping(int sock)
@@ -865,8 +896,63 @@ static int run_source(const char *pcm_path, const char *host, uint16_t port)
  * the whole group is in sync. Paced to real time like run_source; clock PINGs from any
  * sink are answered promptly during the pacing wait to keep every sink's offset tight. */
 #define RN_FANOUT_MAX 16
+#define RN_FANOUT_ADD_MS   150        /* bounded connect attempt when adding a live member */
+#define RN_FANOUT_RETRY_NS (1000ll * 1000000ll)   /* re-attempt a pending member ~1/s */
+#define RN_FANOUT_GIVEUP_NS (8ll * 1000000000ll)  /* stop retrying a member after ~8s */
 
-static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16_t port)
+/* Fan-out membership is now INCREMENTAL: the node adds/removes one member at a time over a
+ * control pipe instead of killing+respawning the whole fan-out (which used to tear down the
+ * source's own 127.0.0.1 loopback playout as collateral whenever any remote member flapped).
+ * These helpers own the parallel sock[]/sock_ip[]/skips[] arrays. */
+
+/* Connect a member and occupy a fan-out slot. Returns 1 if present/added, 0 if it should be
+ * (re)queued for retry. Bounded connect (RN_FANOUT_ADD_MS) so a LIVE fan-out never stalls. */
+static int fanout_try_add(int sock[], char sock_ip[][64], int skips[], int *nsock,
+                          const char *ip, uint16_t port)
+{
+	for (int i = 0; i < *nsock; i++)
+		if (sock[i] >= 0 && strcmp(sock_ip[i], ip) == 0) return 1;   /* already a member */
+	int fd = connect_peer_timeout(ip, port, RN_FANOUT_ADD_MS);
+	if (fd < 0) return 0;
+	int slot = -1;
+	for (int i = 0; i < *nsock; i++) if (sock[i] < 0) { slot = i; break; }   /* reuse a dead slot */
+	if (slot < 0) {
+		if (*nsock >= RN_FANOUT_MAX) { plog("WARN", "fan-out full — dropping %s", ip); close(fd); return 1; }
+		slot = (*nsock)++;
+	}
+	sock[slot] = fd; snprintf(sock_ip[slot], 64, "%s", ip); skips[slot] = 0;
+	plog("INFO", "fan-out: +member %s (slot %d)", ip, slot);
+	return 1;
+}
+
+/* Drop a member's socket in place (loopback is never asked to be removed). */
+static void fanout_remove(int sock[], char sock_ip[][64], int nsock, const char *ip)
+{
+	for (int i = 0; i < nsock; i++)
+		if (sock[i] >= 0 && strcmp(sock_ip[i], ip) == 0) {
+			plog("INFO", "fan-out: -member %s (slot %d)", ip, i);
+			close(sock[i]); sock[i] = -1;
+		}
+}
+
+/* Pure set-diff for incremental fan-out membership: add[] = members in `want` not in `have`;
+ * del[] = members in `have` not in `want`, EXCLUDING 127.0.0.1 (the loopback / source's own
+ * playout is never removed). Order-independent. Exercised by --selftest. */
+static void member_diff(char have[][64], int nhave, char want[][64], int nwant,
+                        char add[][64], int *nadd, char del[][64], int *ndel)
+{
+	*nadd = 0; *ndel = 0;
+	for (int i = 0; i < nwant; i++) {
+		int found = 0; for (int j = 0; j < nhave; j++) if (!strcmp(have[j], want[i])) found = 1;
+		if (!found) snprintf(add[(*nadd)++], 64, "%s", want[i]);
+	}
+	for (int j = 0; j < nhave; j++) {
+		int found = 0; for (int i = 0; i < nwant; i++) if (!strcmp(want[i], have[j])) found = 1;
+		if (!found && strcmp(have[j], "127.0.0.1") != 0) snprintf(del[(*ndel)++], 64, "%s", have[j]);
+	}
+}
+
+static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16_t port, int ctrl_fd)
 {
 	int use_stdin = (!pcm_path || strcmp(pcm_path, "-") == 0);
 	int in = STDIN_FILENO;
@@ -878,14 +964,26 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 		src_is_fifo = (fstat(in, &st) == 0 && S_ISFIFO(st.st_mode));
 	}
 	int sock[RN_FANOUT_MAX];
+	char sock_ip[RN_FANOUT_MAX][64];    /* member IP per slot, so removes/dupes can be matched */
 	int skips[RN_FANOUT_MAX] = { 0 };   /* consecutive skipped frames per lagging sink */
 	int nsock = 0;
-	for (int i = 0; i < npeers && nsock < RN_FANOUT_MAX; i++) {
-		int s = connect_peer(peers[i], port);
-		if (s >= 0) sock[nsock++] = s;      /* skip peers we can't reach */
+	for (int i = 0; i < RN_FANOUT_MAX; i++) { sock[i] = -1; sock_ip[i][0] = '\0'; }
+	/* members that refused at connect time (e.g. sink player mid-respawn): retried in-loop,
+	 * never by blocking-sleep, so the source's audio is undisturbed. */
+	struct { char ip[64]; int64_t next_try, give_up; } pend[RN_FANOUT_MAX]; int npend = 0;
+
+	for (int i = 0; i < npeers && i < RN_FANOUT_MAX; i++) {
+		if (!fanout_try_add(sock, sock_ip, skips, &nsock, peers[i], port) && npend < RN_FANOUT_MAX) {
+			snprintf(pend[npend].ip, 64, "%s", peers[i]);
+			pend[npend].next_try = real_now_ns() + RN_FANOUT_RETRY_NS;
+			pend[npend].give_up  = real_now_ns() + RN_FANOUT_GIVEUP_NS;
+			npend++;
+		}
 	}
-	if (nsock == 0) { plog("ERROR", "no sinks reachable"); if (in != STDIN_FILENO) close(in); return 1; }
-	plog("INFO", "fan-out to %d sink(s)", nsock);
+	if (nsock == 0 && npend == 0) { plog("ERROR", "no sinks reachable"); if (in != STDIN_FILENO) close(in); return 1; }
+	plog("INFO", "fan-out to %d sink(s)%s", nsock, npend ? " (+retrying)" : "");
+	char ctrl_buf[256]; int ctrl_len = 0; int ctrl_eof = 0;
+	if (ctrl_fd >= 0) fcntl(ctrl_fd, F_SETFL, fcntl(ctrl_fd, F_GETFL, 0) | O_NONBLOCK);
 
 	uint8_t frame[RN_HDR_SIZE + RN_AUDIO_FIXED + RN_MAX_PAYLOAD];
 	uint8_t *payload = frame + RN_HDR_SIZE + RN_AUDIO_FIXED;   /* raw PCM or FLAC bytes */
@@ -900,6 +998,48 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 	struct rn_codec_ctl cc; rn_codec_ctl_init(&cc);   /* adaptive skip-rate / hysteresis state */
 
 	while (!g_stop) {
+		/* --- incremental membership: apply +ip/-ip from the node, retry pending members ---
+		 * Runs once per chunk (~26 ms) while audio flows. Every connect is bounded/non-blocking
+		 * (fanout_try_add), so a member joining/leaving/flapping never stalls or restarts the
+		 * source's real-time playout. The loopback (127.0.0.1) is added once at spawn and is
+		 * never sent as a '-' by the node, so the source's own audio is untouchable here. */
+		if (ctrl_fd >= 0 && !ctrl_eof) {
+			struct pollfd cp = { .fd = ctrl_fd, .events = POLLIN };
+			while (poll(&cp, 1, 0) > 0 && (cp.revents & POLLIN)) {
+				int r = read(ctrl_fd, ctrl_buf + ctrl_len, sizeof(ctrl_buf) - 1 - ctrl_len);
+				if (r <= 0) { ctrl_eof = 1; break; }
+				ctrl_len += r; ctrl_buf[ctrl_len] = '\0';
+				char *nl;
+				while ((nl = memchr(ctrl_buf, '\n', ctrl_len)) != NULL) {
+					*nl = '\0';
+					char op = ctrl_buf[0]; const char *ip = ctrl_buf + 1;
+					if (op == '+' && ip[0]) {
+						int dup = 0; for (int i = 0; i < npend; i++) if (!strcmp(pend[i].ip, ip)) dup = 1;
+						if (!fanout_try_add(sock, sock_ip, skips, &nsock, ip, port) && !dup && npend < RN_FANOUT_MAX) {
+							snprintf(pend[npend].ip, 64, "%s", ip);
+							pend[npend].next_try = real_now_ns() + RN_FANOUT_RETRY_NS;
+							pend[npend].give_up  = real_now_ns() + RN_FANOUT_GIVEUP_NS; npend++;
+						}
+					} else if (op == '-' && ip[0]) {
+						fanout_remove(sock, sock_ip, nsock, ip);
+						for (int i = 0; i < npend; i++) if (!strcmp(pend[i].ip, ip)) { pend[i] = pend[--npend]; break; }
+					}
+					int rest = ctrl_len - (int)(nl + 1 - ctrl_buf);
+					memmove(ctrl_buf, nl + 1, rest); ctrl_len = rest; ctrl_buf[ctrl_len] = '\0';
+				}
+			}
+		}
+		if (ctrl_eof) { plog("INFO", "fan-out: control pipe closed — exiting"); break; }
+		if (npend) {                                     /* retry not-yet-listening members */
+			int64_t now = real_now_ns();
+			for (int i = 0; i < npend; ) {
+				if (now < pend[i].next_try) { i++; continue; }
+				if (fanout_try_add(sock, sock_ip, skips, &nsock, pend[i].ip, port)) pend[i] = pend[--npend];
+				else if (now > pend[i].give_up) { plog("WARN", "fan-out: gave up connecting %s", pend[i].ip); pend[i] = pend[--npend]; }
+				else { pend[i].next_try = now + RN_FANOUT_RETRY_NS; i++; }
+			}
+		}
+
 		if (pace_start == 0) pace_start = real_now_ns();
 		int64_t target = pace_start + (int64_t)(track_samples * 1000000000ull / RN_RATE);
 		/* pace while promptly answering any sink's PING */
@@ -985,7 +1125,7 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 					alive++; skipped_now++;               /* temporarily lagging, keep it */
 				}
 			}
-			if (alive == 0) { plog("INFO", "all sinks gone"); break; }
+			if (alive == 0 && npend == 0) { plog("INFO", "all sinks gone"); break; }
 			track_samples += nframes;
 			seq++;
 			/* fold this chunk's skips in and choose the codec for the NEXT chunk */
@@ -1781,6 +1921,12 @@ done:
 #define RN_GOSSIP_GROUP "239.7.42.99"
 #define RN_MAX_PEERS 32
 #define RN_PEER_TTL_NS (6ll * 1000000000ll)
+/* Membership hysteresis: keep a member in the fan-out for a grace period after its gossip goes
+ * silent (wifi contention drops multicast), rather than dropping it the instant the 6s peer TTL
+ * lapses. A clean double-tap LEAVE is still immediate (the peer gossips sink!=our-group, so it's
+ * excluded at once) — this grace only rides transient gossip GAPS, so a flapping member doesn't
+ * churn the fan-out. */
+#define RN_GROUP_GRACE_NS (15ll * 1000000000ll)
 
 struct rn_peer { struct rn_dev d; char ip[64]; int64_t last_seen; int used; };
 
@@ -1853,12 +1999,23 @@ static pid_t spawn_player(const char *dev, uint16_t port, int no_audio)
 	_exit(rc);
 }
 
-static pid_t spawn_fanout(const char *pcm, char peers[][64], int npeers, uint16_t port)
+/* Spawn the fan-out child with a parent->child control pipe. The write end is returned via
+ * *ctrl_w so the node can send incremental +ip/-ip membership updates; the child reads its end
+ * in run_fanout. Returns the child pid (and -1 in *ctrl_w on pipe failure). */
+static pid_t spawn_fanout(const char *pcm, char peers[][64], int npeers, uint16_t port, int *ctrl_w)
 {
+	int pfd[2];
+	if (pipe(pfd) < 0) { plog("ERROR", "fanout ctrl pipe: %s", strerror(errno)); *ctrl_w = -1; pfd[0] = -1; }
 	pid_t p = fork();
-	if (p != 0) return p;
+	if (p != 0) {                                   /* parent: keep write end, close read end */
+		if (pfd[0] >= 0) close(pfd[0]);
+		*ctrl_w = (p < 0) ? -1 : pfd[1];
+		if (p < 0 && pfd[1] >= 0) close(pfd[1]);
+		return p;
+	}
+	if (pfd[1] >= 0) close(pfd[1]);                 /* child: keep read end */
 	signal(SIGINT, SIG_DFL); signal(SIGTERM, SIG_DFL);
-	_exit(run_fanout(pcm, peers, npeers, port));
+	_exit(run_fanout(pcm, peers, npeers, port, pfd[0]));
 }
 
 static void node_apply_ctl(struct rn_dev *self, const char *cmd, int64_t now_ms, char *reply, size_t rlen)
@@ -1912,7 +2069,8 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 
 	pid_t player = no_audio ? 0 : spawn_player(dev, audio_port, no_audio);
 	pid_t fanout = 0;
-	char cur_members[512] = "";
+	int fanout_ctrl = -1;                 /* write end of the fan-out control pipe (+ip/-ip) */
+	char cur_ips[RN_FANOUT_MAX][64]; int cur_n = 0;   /* member IPs the fan-out currently has */
 	char last_role[128] = "";
 	int64_t last_gossip = 0, last_consensus = 0;
 
@@ -1924,6 +2082,8 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 			if (d == fanout) {
 				plog("INFO", "fanout %d exited (status %d)", (int)d, ex);
 				fanout = 0;
+				if (fanout_ctrl >= 0) { close(fanout_ctrl); fanout_ctrl = -1; }
+				cur_n = 0;                 /* respawn fresh with the current member set next round */
 			} else if (d == player && !no_audio) {
 				/* Every respawn restarts the sink's clock-lock + prebuffer from zero, so
 				 * frequent respawns here are the churn that keeps ALSA from ever opening. */
@@ -2035,7 +2195,12 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 			char members[RN_FANOUT_MAX][64]; int nm = 0;
 			snprintf(members[nm++], 64, "127.0.0.1");
 			for (int i = 0; i < RN_MAX_PEERS && nm < RN_FANOUT_MAX; i++)
-				if (peers[i].used && strcmp(peers[i].d.sink, role_src) == 0)
+				/* hysteresis: keep a member whose gossip briefly lapsed (used just expired) for a
+				 * grace window, so a transient wifi gossip gap doesn't churn the fan-out. A real
+				 * leave gossips sink!=role_src and is excluded here immediately. */
+				if ((peers[i].used ||
+				     (peers[i].d.id[0] && now - peers[i].last_seen < RN_GROUP_GRACE_NS)) &&
+				    strcmp(peers[i].d.sink, role_src) == 0)
 					snprintf(members[nm++], 64, "%s", peers[i].ip);
 			/* Order the remote members deterministically (by IP). A peer that briefly
 			 * misses a gossip under wifi contention re-registers into a different peer-
@@ -2052,15 +2217,24 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 				}
 				snprintf(members[j + 1], 64, "%s", key);
 			}
-			char sig[512] = ""; for (int i = 0; i < nm; i++) { strncat(sig, members[i], sizeof(sig)-strlen(sig)-2); strncat(sig, ",", 2); }
 			snprintf(role, sizeof(role), "SOURCE group=%s members=%d", role_src, nm);
-			if (!no_audio && (fanout == 0 || strcmp(sig, cur_members) != 0)) {
-				if (fanout) { kill(fanout, SIGTERM); waitpid(fanout, NULL, 0); }
-				fanout = spawn_fanout(pcm, members, nm, audio_port);
-				snprintf(cur_members, sizeof(cur_members), "%s", sig);
+			if (!no_audio && fanout == 0) {
+				/* first time sourcing: spawn the long-lived fan-out once (with its ctrl pipe) */
+				fanout = spawn_fanout(pcm, members, nm, audio_port, &fanout_ctrl);
+				cur_n = 0; for (int i = 0; i < nm && cur_n < RN_FANOUT_MAX; i++) snprintf(cur_ips[cur_n++], 64, "%s", members[i]);
+			} else if (!no_audio && fanout_ctrl >= 0) {
+				/* INCREMENTAL membership: +ip for joiners, -ip for departed — NEVER restart the
+				 * fan-out, so the source's own 127.0.0.1 loopback and the other rooms keep
+				 * streaming untouched when any member joins/leaves/flaps. */
+				char add[RN_FANOUT_MAX][64], del[RN_FANOUT_MAX][64]; int na, nd;
+				member_diff(cur_ips, cur_n, members, nm, add, &na, del, &nd);
+				for (int i = 0; i < na; i++) { char m[80]; int L = snprintf(m, sizeof m, "+%s\n", add[i]); write(fanout_ctrl, m, (size_t)L); }
+				for (int i = 0; i < nd; i++) { char m[80]; int L = snprintf(m, sizeof m, "-%s\n", del[i]); write(fanout_ctrl, m, (size_t)L); }
+				cur_n = 0; for (int i = 0; i < nm && cur_n < RN_FANOUT_MAX; i++) snprintf(cur_ips[cur_n++], 64, "%s", members[i]);
 			}
 		} else {
-			if (fanout) { kill(fanout, SIGTERM); waitpid(fanout, NULL, 0); fanout = 0; cur_members[0] = '\0'; }
+			if (fanout) { kill(fanout, SIGTERM); waitpid(fanout, NULL, 0); fanout = 0;
+			              if (fanout_ctrl >= 0) { close(fanout_ctrl); fanout_ctrl = -1; } cur_n = 0; }
 			/* who does consensus say sources my group? (may be a voluntary or elected peer) */
 			const char *src_of = "none";
 			for (int i = 1; i < n; i++)
@@ -2070,6 +2244,7 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 		if (strcmp(role, last_role) != 0) { plog("INFO", "role: %s", role); snprintf(last_role, sizeof(last_role), "%s", role); }
 	}
 
+	if (fanout_ctrl >= 0) close(fanout_ctrl);
 	if (fanout) { kill(fanout, SIGTERM); waitpid(fanout, NULL, 0); }
 	if (player) { kill(player, SIGTERM); waitpid(player, NULL, 0); }
 	unlink(ctl_path); close(ctl); close(mc);
@@ -2151,6 +2326,35 @@ static int selftest(void)
 		be64_put(ab + RN_AB_EPOCH, 0xABCDEF01u);
 		CHECK((uint32_t)be64_get(ab + RN_AB_EPOCH) == 0xABCDEF01u);
 		CHECK(RN_AB_EPOCH + 8 <= RN_AUDIO_FIXED);
+	}
+
+	/* incremental fan-out membership diff: correct +/-, and 127.0.0.1 is NEVER removed. */
+	{
+		char add[RN_FANOUT_MAX][64], del[RN_FANOUT_MAX][64]; int na, nd;
+		char have1[][64] = { "127.0.0.1", "10.0.0.5" };
+		char want1[][64] = { "127.0.0.1", "10.0.0.5", "10.0.0.6" };
+		member_diff(have1, 2, want1, 3, add, &na, del, &nd);
+		CHECK(na == 1 && strcmp(add[0], "10.0.0.6") == 0);   /* one joiner */
+		CHECK(nd == 0);                                       /* nobody left */
+
+		char have2[][64] = { "127.0.0.1", "10.0.0.5", "10.0.0.6" };
+		char want2[][64] = { "127.0.0.1", "10.0.0.6" };
+		member_diff(have2, 3, want2, 2, add, &na, del, &nd);
+		CHECK(na == 0);
+		CHECK(nd == 1 && strcmp(del[0], "10.0.0.5") == 0);   /* one leaver, loopback kept */
+
+		/* loopback dropped from `want` (should never happen, but must NEVER be emitted as -) */
+		char have3[][64] = { "127.0.0.1", "10.0.0.5" };
+		char want3[][64] = { "10.0.0.5" };
+		member_diff(have3, 2, want3, 1, add, &na, del, &nd);
+		CHECK(na == 0 && nd == 0);                            /* 127.0.0.1 never removed */
+
+		/* IP change = del old + add new */
+		char have4[][64] = { "127.0.0.1", "10.0.0.5" };
+		char want4[][64] = { "127.0.0.1", "10.0.0.9" };
+		member_diff(have4, 2, want4, 2, add, &na, del, &nd);
+		CHECK(na == 1 && strcmp(add[0], "10.0.0.9") == 0);
+		CHECK(nd == 1 && strcmp(del[0], "10.0.0.5") == 0);
 	}
 
 	/* NTP offset math: symmetric delay d, true offset theta_true recovered exactly */
@@ -2637,7 +2841,7 @@ int main(int argc, char **argv)
 		for (char *t = strtok(csv, ","); t && np < RN_FANOUT_MAX; t = strtok(NULL, ","))
 			snprintf(peers[np++], 64, "%s", t);
 		g_role = "replaynet-fanout";
-		return run_fanout(pcm_path, peers, np, port);
+		return run_fanout(pcm_path, peers, np, port, -1);   /* standalone: no incremental ctrl pipe */
 	}
 
 	if (mode == MODE_NONE || port == 0) { usage(argv[0]); return 2; }
