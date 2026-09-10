@@ -158,7 +158,7 @@ summary::-webkit-details-marker{display:none}
     <!-- system -->
     <div class="card">
       <h2>🔊 Multi-room <span class="mut" style="font-size:.7em;font-weight:400">experimental</span></h2>
-      <p class="mut">Play the same audio in sync across your Beeps. Make one the
+      <p class="mut" id="grp-intro">Play the same audio in sync across your Beeps. Make one the
         <b>Group primary</b> (AirPlay to that one) and the others <b>Members</b>.
         <b>Solo</b> is a standalone speaker.</p>
       <p class="mut" style="margin-top:6px"><b>Heads up:</b> multi-room is still being
@@ -340,6 +340,35 @@ function volInput(v){el("volpct").textContent=v+"%";var r=el("vol");r._live=true
 
 function setGroupUI(s){
   var r=(s&&s.group_role)||"solo";
+  var engine=(s&&s.group_engine)||"snapcast";
+  var bPrim=el("grp-primary"), bMem=el("grp-member"), bSolo=el("grp-solo");
+  if(engine==="replaynet"){
+    // replaynet (always-pipe): sourcing is automatic — whichever Beep you AirPlay to
+    // becomes the source — so there's no manual "primary". Collapse to Grouped / Solo.
+    // "member" (join the active source) and any legacy "primary" both read as Grouped.
+    bPrim.classList.add("hide");
+    bMem.textContent="Grouped";
+    bSolo.textContent="Solo";
+    el("grp-srvwrap").classList.add("hide");
+    el("grp-intro").innerHTML="Play the same audio in sync across your Beeps. AirPlay to any "+
+      "Beep to make it the source, then set the others to <b>Grouped</b> to sync with it. "+
+      "<b>Solo</b> keeps a Beep independent.";
+    var grouped=(r!=="solo");
+    bMem.setAttribute("aria-pressed",grouped);
+    bSolo.setAttribute("aria-pressed",!grouped);
+    bPrim.setAttribute("aria-pressed","false");
+    if(grouped) el("grp-status").textContent=(s&&s.replaynet)
+      ? "Grouped — syncs with the Beep you AirPlay to."
+      : "Grouped — starting the multi-room engine…";
+    else el("grp-status").textContent="Solo — standalone speaker. AirPlay directly to this Beep.";
+    return;
+  }
+  // snapcast (default engine): original Solo / Group primary / Member roles.
+  bPrim.classList.remove("hide"); bPrim.textContent="Group primary";
+  bMem.textContent="Member"; bSolo.textContent="Solo";
+  el("grp-intro").innerHTML="Play the same audio in sync across your Beeps. Make one the "+
+    "<b>Group primary</b> (AirPlay to that one) and the others <b>Members</b>. "+
+    "<b>Solo</b> is a standalone speaker.";
   ["solo","primary","member"].forEach(function(x){
     var b=el("grp-"+x); if(b)b.setAttribute("aria-pressed",x===r);
   });
