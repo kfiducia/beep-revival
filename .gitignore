@@ -12,3 +12,6 @@ prebuilt/
 *.sec
 beep-ota-signing/
 .secrets/
+
+# Operator secrets notebook — private, never commit (repo is public)
+AGENTS.local.md
