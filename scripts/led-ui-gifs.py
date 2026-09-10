@@ -130,6 +130,21 @@ def comet(f):
     for d, t in enumerate(tail): b[(head-d) % NLED] = t
     return b
 
+def joining(f):                              # multi-room join: converge + flash
+    converge, flash = NLED//2, 10
+    ph = f % (converge + flash)
+    b = [0]*NLED
+    if ph < converge:
+        tail = [255, 110, 40]
+        a, c = ph % NLED, (NLED-ph) % NLED
+        for d, t in enumerate(tail):
+            b[(a-d) % NLED] = t              # clockwise head, tail behind
+            b[(c+d) % NLED] = t              # counter-cw head, mirrored
+    else:
+        fp = ph - converge
+        b = [255 - fp*255//flash]*NLED       # whole-ring "linked" flash, fading
+    return b
+
 def breathe(f):
     lvl = 4 + tri(f % 84, 84)
     b = [0]*NLED; b[LED_BOT] = lvl; b[(LED_BOT-1) % NLED] = lvl
@@ -206,6 +221,8 @@ ota += hold(fill(NLED), 12)
 # 3. Wi-Fi setup comet / 4. connecting spinner — one clean revolution each
 comet_f = [comet(f) for f in range(NLED)]
 conn_f  = [connecting(f) for f in range(NLED)]
+# 4b. multi-room joining: two full converge+flash cycles for a legible loop
+join_f  = [joining(f) for f in range(2*(NLED//2 + 10))]
 
 # 5. idle breathe (step 2 → half the frames, double duration = same real speed)
 breathe_f = [breathe(f) for f in range(0, 84, 2)]
@@ -239,6 +256,7 @@ jobs = [
     (boot,     "boot.gif",            "Boot: smiley -> wings rise -> ready"),
     (comet_f,  "wifi-setup.gif",      "Wi-Fi setup mode (reconfigure me)"),
     (conn_f,   "wifi-connecting.gif", "Wi-Fi connecting"),
+    (join_f,   "joining.gif",         "Joining multi-room group"),
     (breathe_f,"idle.gif",            "Idle (on, nothing playing)"),
     (sleep_f,  "sleep.gif",           "Sleep (deep idle)"),
     (vol,      "volume.gif",          "Volume (turning the knob)"),

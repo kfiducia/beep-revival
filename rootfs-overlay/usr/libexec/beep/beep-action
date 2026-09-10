@@ -76,15 +76,22 @@ case "$GESTURE" in
 		fi
 		;;
 	double_tap)
-		# Toggle multi-room membership. beep-group owns the services and does the work:
-		#   solo   -> member (stop local AirPlay receive, start snapclient, mDNS-discover
-		#             the primary and play its sample-synced stream)
+		# Toggle multi-room membership. beep-group owns the engine (snapcast or
+		# replaynet) and does the work:
+		#   solo   -> member (stop solo AirPlay receive, bring the group engine up,
+		#             discover the active source and play its sample-synced stream)
 		#   member -> solo   (leave the group, resume solo AirPlay)
-		# The old version fired a Group.SetClients JSON-RPC directly, which silently
-		# no-op'd on a solo Beep: snapclient wasn't running yet, and beep-group is what
-		# starts it. With a single stream the snapclient auto-plays the primary's only
-		# stream, so no explicit group assignment is needed here.
+		# Joining is SLOW and silent for ~5s (engine bring-up + clock-lock + prebuffer),
+		# so kick off the ring "joining" animation up front — beepd renders it until
+		# playback actually starts (PCM RUNNING) or this deadline lapses (a backstop if
+		# the join fails). Deadline = an absolute /proc/uptime second, matching beepd's
+		# refresh_connecting(). If the toggle turns out to be a LEAVE, cancel it at once.
+		mkdir -p "$BEEP_RUN"
+		echo "$(( $(cut -d. -f1 /proc/uptime) + 10 ))" > "$BEEP_RUN/connecting" 2>/dev/null
 		new="$(/usr/libexec/beep/beep-group toggle 2>/dev/null | tail -1)"
+		case "$new" in
+			solo|"") rm -f "$BEEP_RUN/connecting" 2>/dev/null ;;
+		esac
 		log "double_tap: multi-room now ${new:-toggled}"
 		;;
 	hold)

@@ -195,6 +195,35 @@ static void refresh_net_state(void)
 	net_connected = (n >= 9 && strncmp(b, "connected", 9) == 0);
 }
 
+/* --- multi-room join --------------------------------------------------------
+ * beep-action (double-tap) writes an absolute /proc/uptime-second DEADLINE here
+ * when a JOIN starts; the ring shows the "joining" converge/flash until playback
+ * actually begins (the `playing` party pattern outranks it in the ladder) or the
+ * deadline lapses (a hard backstop if the join never produces audio). Same
+ * deadline-file idiom as /var/run/beep/joining used by the net scripts. */
+#define CONNECTING_FILE "/var/run/beep/connecting"
+static int connecting = 0;
+
+static void refresh_connecting(void)
+{
+	int fd = open(CONNECTING_FILE, O_RDONLY);
+	if (fd < 0) { connecting = 0; return; }
+	char b[16] = {0};
+	int n = read(fd, b, sizeof b - 1);
+	close(fd);
+	if (n <= 0) { connecting = 0; return; }
+	long deadline = atol(b);
+
+	long up = 0;
+	int uf = open("/proc/uptime", O_RDONLY);
+	if (uf >= 0) {
+		char u[32] = {0};
+		if (read(uf, u, sizeof u - 1) > 0) up = atol(u);
+		close(uf);
+	}
+	connecting = (up > 0 && up < deadline);
+}
+
 /* Rotating comet (bright head + fading tail) — the "come reconfigure me" signal.
  * ~1 rev/sec at the 24 Hz poll. Ring is single-brightness per LED, so this reads
  * as a distinct chasing pattern vs. any steady volume/gesture feedback. */
@@ -246,6 +275,34 @@ static void led_render_connecting(int64_t frame)
 	memset(led_target, 10, sizeof led_target);       /* dim "working" track */
 	led_target[head] = 255;
 	led_target[(head - 1 + NLED) % NLED] = 70;
+}
+
+/* Multi-room "joining a group": two heads leave the top together, sweep down
+ * both sides, meet at the bottom — then the whole ring flashes once ("linked!")
+ * and it repeats (~0.9s/cycle). Runs from the double-tap until playback starts
+ * (the `playing` party pattern outranks it below) or the join deadline lapses.
+ * Deliberately unlike the single-dot Wi-Fi spinner and the AP-setup comet: the
+ * PAIRED converge + a full-ring flash reads as "two devices coming together",
+ * so it can't be mistaken for "connecting to Wi-Fi" or "setup mode". */
+static void led_render_joining(int64_t frame)
+{
+	const int converge = NLED / 2;                 /* 12 frames: top -> bottom     */
+	const int flash    = 10;                        /* ~0.4s bright "linked" flash  */
+	int ph = (int)(frame % (converge + flash));
+	memset(led_target, 0, sizeof led_target);
+	if (ph < converge) {
+		static const uint8_t tail[] = { 255, 110, 40 };
+		int a = ph % NLED;                             /* clockwise, down the right */
+		int b = (NLED - ph) % NLED;                    /* counter-cw, down the left */
+		for (int d = 0; d < (int)(sizeof tail); d++) {
+			led_target[(a - d + NLED) % NLED] = tail[d];  /* tail trails behind each */
+			led_target[(b + d) % NLED]        = tail[d];  /* head, mirrored on both  */
+		}
+	} else {
+		int fp = ph - converge;                       /* 0..flash-1: fade the flash */
+		uint8_t level = (uint8_t)(255 - (fp * 255) / flash);
+		memset(led_target, level, sizeof led_target);
+	}
 }
 
 /* "Sleep": the bottom two LEDs pulsing slowly and softly — on, idle, at rest. */
@@ -555,6 +612,7 @@ int main(int argc, char **argv)
 		if ((loops   % 12) == 0) refresh_led_mode();
 		if ((loops   % 12) == 3) refresh_net_state();
 		if ((loops   % 12) == 6) refresh_muted();
+		if ((loops   % 12) == 9) refresh_connecting();
 		if ((loops++ %  6) == 0) playing = pcm_running();
 		/* Reflect ANY volume change on the arc — knob, web, OR the AirPlay sender
 		 * (shairport drives the same "Master"). Cheap in-process read, no fork; a
@@ -603,6 +661,7 @@ int main(int argc, char **argv)
 		                                              led_render_volume(sv < 0 ? vol : sv); }
 		else if (muted)                               led_render_muted(f);
 		else if (playing)                             led_render_party();
+		else if (connecting)                          led_render_joining(f);
 		else if (!net_connected)                      led_render_connecting(f);
 		else if (t - last_active_ms < SLEEP_AFTER_MS) led_render_breathe(f);
 		else                                          led_render_sleep(f);
