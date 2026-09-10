@@ -83,7 +83,7 @@
 /* ------------------------------------------------------------------ wire */
 
 #define RN_MAGIC        0x52504C59u   /* "RPLY" */
-#define RN_WIRE_VERSION 3             /* v3: AUDIO body carries a codec tag + decoded n_frames */
+#define RN_WIRE_VERSION 4             /* v4: AUDIO body off-8 carries a discontinuity EPOCH (sink re-anchor); v3 added a codec tag + decoded n_frames */
 
 #define RN_MSG_AUDIO 1
 #define RN_MSG_PING  2
@@ -92,7 +92,8 @@
 #define RN_HDR_SIZE       16
 /* AUDIO body (before the payload), all big-endian:
  *   off 0  u64 track_samples       head-sample index @ 44100
- *   off 8  u64 discarded_samples   source-side cumulative drop/pad (step d)
+ *   off 8  u64 epoch               discontinuity counter; ++ on each source FIFO-gap reopen so
+ *                                  sinks re-anchor their schedule in lockstep (was discarded_samples)
  *   off 16 u64 source_time_ns      source monotonic clock when track_samples is emitted
  *   off 24 u32 n_frames            DECODED PCM frames this message represents (codec-independent)
  *   off 28 u32 payload_len         bytes of payload following (raw S16_LE PCM, or FLAC)
@@ -100,7 +101,7 @@
  * n_frames (not payload_len) drives sample math, so compression doesn't perturb the schedule. */
 #define RN_AUDIO_FIXED    36
 #define RN_AB_TRACK    0
-#define RN_AB_DISCARD  8
+#define RN_AB_EPOCH    8            /* discontinuity epoch (was discarded_samples; unused, now repurposed) */
 #define RN_AB_STIME   16
 #define RN_AB_NFRAMES 24
 #define RN_AB_PLEN    28
@@ -831,7 +832,7 @@ static int run_source(const char *pcm_path, const char *host, uint16_t port)
 		int64_t src_t = now_ns();
 		hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)(RN_AUDIO_FIXED + send_bytes));
 		be64_put(frame + RN_HDR_SIZE + RN_AB_TRACK,   track_samples);
-		be64_put(frame + RN_HDR_SIZE + RN_AB_DISCARD, 0);       /* discarded_samples: step d */
+		be64_put(frame + RN_HDR_SIZE + RN_AB_EPOCH,   0);       /* standalone --source: no gap reopen, epoch stays 0 */
 		be64_put(frame + RN_HDR_SIZE + RN_AB_STIME,   (uint64_t)src_t);
 		be32_put(frame + RN_HDR_SIZE + RN_AB_NFRAMES, (uint32_t)(send_bytes / RN_FRAME_BYTES));
 		be32_put(frame + RN_HDR_SIZE + RN_AB_PLEN,    (uint32_t)send_bytes);
@@ -891,6 +892,8 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 	uint8_t pcm[RN_CHUNK_BYTES];                               /* one source chunk (host->LE) */
 	uint64_t track_samples = 0;
 	uint32_t seq = 0;
+	uint32_t epoch = 0;                       /* ++ on each FIFO-gap reopen; stamped on every frame so
+	                                             all sinks re-anchor their schedule in lockstep */
 	int64_t pace_start = 0;
 	int rc = 0;
 	int group_codec = RN_CODEC_RAW;          /* codec in force for the group right now */
@@ -949,7 +952,7 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 			if (!use_flac) memcpy(payload, pcm, send_bytes);   /* raw, or FLAC that didn't help */
 			hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)RN_AUDIO_FIXED + plen);
 			be64_put(frame + RN_HDR_SIZE + RN_AB_TRACK,   track_samples);
-			be64_put(frame + RN_HDR_SIZE + RN_AB_DISCARD, 0);
+			be64_put(frame + RN_HDR_SIZE + RN_AB_EPOCH,   epoch);
 			be64_put(frame + RN_HDR_SIZE + RN_AB_STIME,   (uint64_t)now_ns());
 			be32_put(frame + RN_HDR_SIZE + RN_AB_NFRAMES, nframes);
 			be32_put(frame + RN_HDR_SIZE + RN_AB_PLEN,    plen);
@@ -1012,6 +1015,11 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 			 * seconds; not re-anchoring at all would make target land in the past and blast
 			 * a burst of frames (sink ring overrun). This keeps the resume seamless at 1x. */
 			pace_start = real_now_ns() - (int64_t)(track_samples * 1000000000ull / RN_RATE);
+			/* A pipe gap stalled the sinks' audio while their schedule kept racing wall-clock,
+			 * so their sched err has grown by the gap. Bump the epoch: the next frame carries it,
+			 * and every sink re-anchors to this resumed position together (see run_sink_alsa). */
+			epoch++;
+			plog("INFO", "fan-out: discontinuity epoch=%u after gap — sinks will re-anchor", epoch);
 		}
 	}
 	for (int i = 0; i < nsock; i++) if (sock[i] >= 0) close(sock[i]);
@@ -1362,7 +1370,8 @@ static int alsa_write(snd_pcm_t *pcm, const uint8_t *p, snd_pcm_uframes_t frames
 /* read one wire message: pushes AUDIO PCM into the ring and returns 1; folds a PONG
  * into the clock estimate and returns 2; returns 0 on clean close, -1 on error. */
 static int alsa_read_msg(int sock, struct clock_est *ce, struct pcmring *ring,
-                         uint64_t *track_samples, int64_t *source_time_ns, uint64_t *rx_next_src)
+                         uint64_t *track_samples, int64_t *source_time_ns, uint64_t *rx_next_src,
+                         uint32_t *epoch)
 {
 	uint8_t hb[RN_HDR_SIZE];
 	ssize_t r = read_full(sock, hb, sizeof(hb));
@@ -1383,6 +1392,7 @@ static int alsa_read_msg(int sock, struct clock_est *ce, struct pcmring *ring,
 	    read_full(sock, afix, RN_AUDIO_FIXED) != RN_AUDIO_FIXED) return -1;
 	*track_samples = be64_get(afix + RN_AB_TRACK);
 	*source_time_ns = (int64_t)be64_get(afix + RN_AB_STIME);
+	if (epoch) *epoch = (uint32_t)be64_get(afix + RN_AB_EPOCH);
 	uint32_t n_frames    = be32_get(afix + RN_AB_NFRAMES);
 	uint32_t payload_len = be32_get(afix + RN_AB_PLEN);
 	int codec = afix[RN_AB_CODEC];
@@ -1421,6 +1431,23 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 {
 	int sock = sink_accept(port);
 	if (sock < 0) return 1;
+
+	/* The loopback sink (source on 127.0.0.1 — the source's OWN room, and the only sink when
+	 * solo) has ~0 clock offset and no network jitter, so the constant per-sample cubic
+	 * resampler buys nothing there; use the near-idle drop/insert servo instead. This keeps a
+	 * solo / always-pipe unit off the resampler's constant CPU cost (the AR9331 has little to
+	 * spare while also decoding AirPlay + fanning out). Remote members (real wifi jitter) keep
+	 * the click-free resampler. Decided once per connection, so the servo mode never switches
+	 * mid-stream. */
+	int use_resample = g_resample;
+	{
+		struct sockaddr_in pa; socklen_t pl = sizeof(pa);
+		if (getpeername(sock, (struct sockaddr *)&pa, &pl) == 0 &&
+		    pa.sin_family == AF_INET && pa.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) {
+			use_resample = 0;
+			plog("INFO", "loopback sink — drop/insert servo (resampler skipped, low CPU)");
+		}
+	}
 	struct clock_est ce = { .inflight_t1 = -1 };
 	struct pcmring ring; rb_init(&ring);
 
@@ -1429,6 +1456,7 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 	int64_t phase1_start = now_ns(), last_hb = phase1_start;
 	uint64_t anchor_sample = 0, track_samples = 0, rx_next_src = 0;
 	int64_t source_time_ns = 0;
+	uint32_t epoch = 0, anchor_epoch = 0;   /* re-anchor when the source's epoch advances (gap) */
 
 	plog("INFO", "prebuffering: locking clock (%d pongs) + filling %lld ms buffer before ALSA open",
 	     RN_LOCK_MIN_SAMPLES, (long long)(RN_BUFFER_NS / 1000000));
@@ -1447,13 +1475,14 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 		int pr = poll(&pfd, 1, 20);
 		if (pr < 0) { if (errno == EINTR) continue; rc = 1; break; }
 		if (pr > 0) {
-			int m = alsa_read_msg(sock, &ce, &ring, &track_samples, &source_time_ns, &rx_next_src);
+			int m = alsa_read_msg(sock, &ce, &ring, &track_samples, &source_time_ns, &rx_next_src, &epoch);
 			if (m == 0) { plog("INFO", "source closed before playout"); goto done; }
 			if (m < 0) { rc = 1; goto done; }
 			if (m == 1 && ce.have && ce.samples >= RN_LOCK_MIN_SAMPLES && !have_anchor) {
 				have_anchor = 1; ce.locked = 1;
 				want_local = source_time_ns - ce.theta + RN_BUFFER_NS;
 				anchor_sample = track_samples;
+				anchor_epoch = epoch;              /* frames at this epoch use this anchor */
 				/* Distrust a wildly-out-of-band startup wait (bad theta lock — see
 				 * RN_STARTUP_SLOP_NS) and start on our own clock rather than stalling
 				 * for the whole uptime gap. */
@@ -1550,10 +1579,33 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 		for (;;) {
 			struct pollfd pfd = { .fd = sock, .events = POLLIN };
 			if (poll(&pfd, 1, 0) <= 0) break;
-			int m = alsa_read_msg(sock, &ce, &ring, &track_samples, &source_time_ns, &rx_next_src);
+			int m = alsa_read_msg(sock, &ce, &ring, &track_samples, &source_time_ns, &rx_next_src, &epoch);
 			if (m == 0) { eof = 1; break; }
 			if (m < 0) { rc = 1; goto drainclose; }
 		}
+
+		/* Re-anchor on a source discontinuity. A FIFO gap on the source (pause / track change)
+		 * stalled our audio while the schedule kept racing wall-clock, so `err` has grown by the
+		 * gap. The source bumped its epoch on resume; when the newest frame carries a new epoch,
+		 * reset the (sample -> wall-clock) anchor to the resumed position and clear the servo so
+		 * `err` snaps back toward 0 instead of accumulating. ALSA stays open (no re-prebuffer),
+		 * and every sink sees the same epoch on the same frame, so all rooms re-align together. */
+		if (epoch != anchor_epoch) {
+			int64_t new_want = source_time_ns - ce.theta + RN_BUFFER_NS;
+			int64_t wait = new_want - now_ns();      /* guard a bad value (suspect theta), as Phase 1 does */
+			if (wait > RN_BUFFER_NS + RN_STARTUP_SLOP_NS || wait < -RN_STARTUP_SLOP_NS)
+				new_want = now_ns() + RN_BUFFER_NS;
+			plog("INFO", "re-anchor: epoch %u -> %u, err was %+" PRId64 " ms — resetting schedule",
+			     anchor_epoch, epoch, err * 1000 / RN_RATE);
+			want_local = new_want;
+			anchor_sample = track_samples;           /* newest frame's head sample */
+			anchor_epoch = epoch;
+			have_played = 0; err = 0; cum = 0; last_corr = 0; rs.step = 65536;   /* clear the servo */
+			size_t maxf = (size_t)(RN_BUFFER_NS * RN_RATE / 1000000000ll);       /* don't start seconds deep */
+			size_t availf = rb_avail(&ring) / RN_FRAME_BYTES;
+			if (availf > maxf) rb_drop(&ring, (availf - maxf) * RN_FRAME_BYTES);
+		}
+
 		if (!have_played && rb_avail(&ring) >= RN_FRAME_BYTES) {
 			played_src = rx_next_src - rb_avail(&ring) / RN_FRAME_BYTES;   /* source sample at ring head */
 			have_played = 1;
@@ -1562,7 +1614,7 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 		snd_pcm_sframes_t queued = 0;
 		if (snd_pcm_delay(pcm, &queued) < 0 || queued < 0) queued = 0;
 
-		if (!g_resample) {
+		if (!use_resample) {
 			/* DEFAULT — absolute-schedule servo: align the sample leaving the DAC to the
 			 * shared schedule by dropping (behind) or inserting silence (ahead), rate-limited. */
 			if (have_played) {
@@ -1689,7 +1741,7 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 
 		if (++frames_since_log >= 100) {                                 /* ~1 s */
 			frames_since_log = 0;
-			if (g_resample)
+			if (use_resample)
 				plog("INFO", "playout: %" PRIu64 " out, sched err %+" PRId64 " frames (%+" PRId64
 				     " us), trim %+" PRId64 " ppm, snap %+" PRId64 " fr, ring %zu ms",
 				     out_frames, err, err * 1000000 / RN_RATE,
@@ -2063,6 +2115,15 @@ static int selftest(void)
 		size_t sp = rb_space(&r);
 		CHECK(rb_push(&r, big, RN_RING_BYTES) == sp);   /* clamped to free space */
 		CHECK(rb_space(&r) == 0);
+	}
+
+	/* wire v4: the discontinuity epoch round-trips at its body offset (repurposed
+	 * discarded_samples slot) and stays within the fixed audio body. */
+	{
+		uint8_t ab[RN_AUDIO_FIXED] = {0};
+		be64_put(ab + RN_AB_EPOCH, 0xABCDEF01u);
+		CHECK((uint32_t)be64_get(ab + RN_AB_EPOCH) == 0xABCDEF01u);
+		CHECK(RN_AB_EPOCH + 8 <= RN_AUDIO_FIXED);
 	}
 
 	/* NTP offset math: symmetric delay d, true offset theta_true recovered exactly */

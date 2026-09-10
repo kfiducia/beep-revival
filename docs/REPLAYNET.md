@@ -64,7 +64,15 @@ the request/response delay stays symmetric and theta is accurate to well under a
 millisecond on LAN. A source sample stamped `source_time_ns` is scheduled for local
 presentation at `source_time_ns - theta + RN_BUFFER_NS` (80 ms jitter buffer).
 
-_(A long-running daemon should periodically re-lock and re-anchor; that is future work.)_
+theta stays frozen for the connection's life, but the **schedule anchor re-anchors on a
+source discontinuity**: the source stamps a monotonic **epoch** (AUDIO body off-8, wire v4)
+and bumps it on each FIFO-gap reopen; a sink that sees a new epoch resets
+`want_local`/`anchor_sample` to the resumed position and clears the servo, so `sched err`
+snaps back toward 0 instead of accumulating by the gap length. Every sink sees the same
+epoch on the same frame, so all rooms re-align together.
+
+_(Periodic theta re-lock is still future work; the discontinuity re-anchor above covers the
+gap-drift case that mattered for multi-room.)_
 
 ## Drift correction (step b)
 
@@ -266,24 +274,34 @@ Wired on this branch (all reversible — the default engine is still snapcast):
   respawn. Registered at boot by **`/etc/uci-defaults/99-beep-replaynet`** but DORMANT
   (`start_service` returns unless `replaynet.node.enabled=1`).
 - **`/etc/config/replaynet`** — UCI (`id`, `group`, `device`, `signal`, `enabled=0`).
-- **`beep-group`** gains a `group_engine` selector (`snapcast` default | `replaynet`). The
-  replaynet branch stops snapcast, enables the node, repoints shairport to a **pipe →
-  `/tmp/beep-pcm`** with **`sessioncontrol` hooks** (`run_this_before_play_begins →
-  replaynet --ctl become-source`, `..._after_play_ends → ... leave`), and maps roles to
-  the control socket. Double-tap already calls `beep-group toggle`, which routes to
-  `replaynet --ctl toggle` (join the active source, or leave) — no `beep-action` change.
+- **`beep-group`** gains a `group_engine` selector (`snapcast` default | `replaynet`), and
+  under replaynet runs **ALWAYS-PIPE**: the node + shairport-pipe engine stay up whenever
+  replaynet is selected — even solo — so forming/joining/leaving a group is a pure
+  control-plane `--ctl` message with **no shairport restart and no output-backend flip**
+  (the old solo↔group flip restarted shairport = a gap in the source's live AirPlay). Solo
+  self-sources over `127.0.0.1` via the `run_this_before_play_begins → become-source` hook;
+  a double-tap (`beep-group toggle`) just sends `--ctl join`/`leave`. `rn_engine_ensure` is
+  idempotent — it restarts shairport only when it actually changes the config, so a
+  double-tap on the running engine is seamless. All sinks sit the same fixed `RN_BUFFER_NS`
+  behind the source, so the source's own room and the members stay sample-aligned with no
+  buffer change on join.
 - **`scripts/build.sh`**: `MULTIROOM=replaynet ./build.sh` drops
   snapserver/snapclient/libatomic (~5 MB + the C++ runtime) and drops a uci-default that
-  sets `group_engine=replaynet` + enables the node. Default build is unchanged (snapcast).
+  sets `group_engine=replaynet` + **enables the node** (always-pipe from first boot).
+  Default build is unchanged (snapcast).
 
 Runtime switch on a running unit: `uci set beep.main.group_engine=replaynet;
 uci commit beep; /usr/libexec/beep/beep-group apply`.
 
-**Still to validate on hardware** (needs a build + flash): the full shairport-fed path
-end-to-end (phone → shairport → FIFO → replaynet → synced playout), the shairport hooks
-firing become-source/leave, and a soak run. Also open: real mDNS discovery (avahi
-`_beep._tcp`, libs already on the image), `beep-source`/`rpcd` status readouts still name
-snapcast, and FLAC/opus for weak links.
+**CPU note:** the loopback sink (the source's own room, and the only sink when solo) uses the
+cheap drop/insert servo, not the constant cubic resampler — remote members keep the
+click-free resampler. Measured always-pipe solo overhead ≈ 8% CPU on the AR9331 (~60% idle
+while playing).
+
+**Validated on hardware:** seamless join/leave (no shairport restart, source audio
+continuous), two-unit sample sync (~1 ms), and epoch re-anchor. **Still open:** real mDNS
+discovery (avahi `_beep._tcp`, libs already on the image), `beep-source`/`rpcd` status
+readouts still name snapcast, a long soak, and periodic theta re-lock.
 
 ## Bring-up / validation checklist (when we build + flash)
 

@@ -469,13 +469,14 @@ if [ "${MULTIROOM:-snapcast}" = replaynet ]; then
 #!/bin/sh
 # Select replaynet as the multi-room engine (image built with MULTIROOM=replaynet) and
 # default it to the shared group so Beeps that DO group auto-form one synced group.
-# The unit still SHIPS SOLO/DIRECT: `beep-group apply` runs the solo case below, which
-# keeps the node engine OFF and plays shairport->ALSA directly, so a fresh single unit
-# has working AirPlay out of the box. The pipe engine is opt-in — a double-tap forms/
-# joins a group and flips shairport onto the /tmp/beep-pcm pipe + starts the node.
-# beep-group owns replaynet.node.enabled (on when grouped, off when solo).
+# ALWAYS-PIPE: the node engine ships ENABLED and shairport feeds the /tmp/beep-pcm pipe
+# even when solo, so forming/joining a group is a pure control-plane message with no
+# shairport restart / no audio gap (see beep-group). A fresh single unit plays its own
+# AirPlay through the pipe (self-source via loopback) at the group buffer latency (~2 s).
+# `beep-group apply` (below) puts shairport on the pipe at first boot.
 uci -q batch <<UCI
 set beep.main.group_engine=replaynet
+set replaynet.node.enabled=1
 set replaynet.node.group=1
 commit beep
 commit replaynet
