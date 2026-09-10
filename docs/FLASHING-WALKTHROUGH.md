@@ -1,6 +1,6 @@
 # Installing Beep Revival — the complete flashing & update guide
 
-Turn a stock, cloud-orphaned **Beep "Dial"** into an open-firmware AirPlay speaker.
+Turn a stock, cloud-orphaned **Beep "Dial"** into an open-firmware AirPlay audio streamer.
 Written for someone who has never touched this board. This is the **single canonical
 guide**: the one-time UART first-flash (Steps 0–11) *and* how you update from then on
 (["staying updated"](#after-the-first-flash--staying-updated-no-cable) — just a signed
@@ -30,10 +30,11 @@ stand:
 
 ## Is this your device?
 
-This procedure is **only** for the **Beep "Dial"** — the round wireless speaker with the
-LED ring — built on the **8devices Carambola 2** module (**Atheros AR9331**, **64 MB** RAM,
-**16 MB** SPI-NOR flash). Beep Networks folded around 2016 and shut down the cloud the app
-depended on, which is why the speaker went dark. **If your board is anything else, stop** —
+This procedure is **only** for the **Beep "Dial"** — the round wireless **audio streamer**
+with the LED ring (it feeds **line-out** to your own powered speakers/amp — it is *not* a
+speaker itself) — built on the **8devices Carambola 2** module (**Atheros AR9331**, **64 MB**
+RAM, **16 MB** SPI-NOR flash). Beep Networks folded around 2016 and shut down the cloud the
+app depended on, which is why it went dark. **If your board is anything else, stop** —
 the flash addresses and device tree here are specific to this hardware.
 
 ## What you need
@@ -312,9 +313,11 @@ on the very first boot is normal, not a brick.
 
 ## Step 10 — First boot, and confirm the MAC/wifi
 
-**What:** let it boot; if it has no wifi yet it starts a **`Beep-Setup-XXXX`** WPA2
-network (password = the setup code derived from the MAC). Join it, and the captive
-portal sets wifi + a name. Then confirm the wifi identity is the real one from `art`:
+**What:** let it boot; if it has no wifi yet it starts a **`BeepRevival-Setup-XXXXXX`** WPA2
+network (password = the setup code derived from the MAC). Join it and browse to
+**`http://192.168.60.1`** (the setup IP) to pick your wifi and set a name — there is **no
+captive portal yet**, so you open that address yourself. Then confirm the wifi identity is
+the real one from `art`:
 ```
 # on the device (serial or, once SSH is enabled, over the network)
 iw dev  ||  ip link show phy0-sta0
@@ -351,14 +354,14 @@ event into one that forces you back to the UART cable if skipped.
 - [ ] **Full backup exists** (Step 5) — you can restore `firmware` over the network.
 
 Only when all of the above hold is the unit genuinely "network-update safe." Then it's a
-normal AirPlay speaker; updates are signed uploads in the web UI (SSH stays off by default).
+normal AirPlay streamer; updates are signed uploads in the web UI (SSH stays off by default).
 
 ---
 
 ## After the first flash — staying updated (no cable)
 
 The UART flash above is a **one-time** bootstrap. Once Beep Revival is on, the unit is a
-normal AirPlay speaker and **every future update is a signed upload in the web UI** — no
+normal AirPlay streamer and **every future update is a signed upload in the web UI** — no
 serial, no hand-run `sysupgrade`:
 
 1. Download the latest **signed** image — `beep-revival-<version>-sysupgrade.signed.bin` —
