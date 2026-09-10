@@ -3,6 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Defense-in-depth for the persisted session token: even if some content were injected,
+     connect-src 'self' blocks exfiltrating it off-device, frame-ancestors 'none' blocks
+     clickjacking, object-src 'none' blocks plugins. 'unsafe-inline' is required because the
+     SPA is a single inline script + inline handlers (self-contained, no external origins). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'">
 <title>Beep Revival</title>
 <style>
 :root{
@@ -155,6 +160,21 @@ summary::-webkit-details-marker{display:none}
       <p class="mut">System output level. Over AirPlay, your phone controls volume.</p>
     </div>
 
+    <!-- Audio source: AirPlay OR a Music Server (LMS) — mutually exclusive (one owns the
+         single speaker output). The master toggle switches source via set_lms (0=AirPlay,1=LMS). -->
+    <div class="card">
+      <h2>🎚️ Audio source</h2>
+      <p class="mut">What this Beep plays — <b>AirPlay</b> from your phone/Mac, or a
+        <b>Music Server</b> (Lyrion / LMS) on your network. One at a time.</p>
+      <div class="seg" role="group" aria-label="Audio source" style="margin-top:10px">
+        <button id="src-ap"  aria-pressed="true"  onclick="setSource('airplay')">AirPlay</button>
+        <button id="src-lms" aria-pressed="false" onclick="setSource('lms')">Music Server</button>
+      </div>
+      <p class="mut" id="src-status" style="margin-top:10px"></p>
+    </div>
+
+    <!-- shown when source = AirPlay -->
+    <div id="ap-section">
     <!-- AirPlay mode (converged image: runtime AP1/AP2) -->
     <div class="card" id="ap-card">
       <h2>📡 AirPlay mode</h2>
@@ -189,21 +209,22 @@ summary::-webkit-details-marker{display:none}
       </div>
       <p class="mut" id="grp-status" style="margin-top:10px"></p>
     </div>
+    </div><!-- /ap-section -->
 
+    <!-- shown when source = Music Server (LMS) -->
+    <div id="lms-section" class="hide">
     <div class="card">
       <h2>🎵 Lyrion Music Server</h2>
-      <p class="mut">Play from a Lyrion Music Server (LMS / Squeezebox) on your network.
-        This Beep appears as a player named after its hostname.</p>
-      <div class="seg" role="group" aria-label="LMS player" style="margin-top:10px">
-        <button id="lms-off" aria-pressed="true"  onclick="setLms(0)">Off</button>
-        <button id="lms-on"  aria-pressed="false" onclick="setLms(1)">On</button>
-      </div>
+      <p class="mut">This Beep plays from a Lyrion Music Server (LMS / Squeezebox) on your
+        network and appears as a player named after its hostname.</p>
       <div style="margin-top:12px">
         <label for="lms-srv">Server address <span class="mut">(blank = auto-discover; pin the IP if the server is wired and the Beep is on Wi-Fi)</span></label>
         <input id="lms-srv" type="text" placeholder="auto (broadcast)">
       </div>
+      <button class="btn sec" style="margin-top:12px" onclick="saveLms()">Save server</button>
       <p class="mut" id="lms-status" style="margin-top:10px"></p>
     </div>
+    </div><!-- /lms-section -->
 
     <div class="card">
       <h2>System</h2>
@@ -252,7 +273,15 @@ summary::-webkit-details-marker{display:none}
 
 <script>
 "use strict";
-var UBUS="/ubus", NULLSESS="00000000000000000000000000000000", sess=NULLSESS;
+// Restore a saved rpcd session so a page refresh doesn't re-prompt for the password
+// (persisted in login() with a 24h ubus timeout; cleared on auth failure). SECURITY:
+// only persist/restore over HTTPS — never leave a bearer token in localStorage on a
+// plaintext HTTP origin (the setup/captive-portal listener), where it could be sniffed
+// or read back. Over HTTP we behave as before (a fresh login each page load). The token
+// travels in the request BODY (not a cookie), so this stays CSRF-safe.
+var UBUS="/ubus", NULLSESS="00000000000000000000000000000000";
+var SECURE=(location.protocol==="https:");
+var sess=(SECURE&&localStorage.getItem("beep_sess"))||NULLSESS;
 var selEnc=false;
 
 function el(id){return document.getElementById(id);}
@@ -263,8 +292,9 @@ function rpc(body){return fetch(UBUS,{method:"POST",headers:{"Content-Type":"app
   body:JSON.stringify(body)}).then(function(r){return r.json();});}
 
 function login(pw){return rpc({jsonrpc:"2.0",id:1,method:"call",
-  params:[NULLSESS,"session","login",{username:"root",password:pw||""}]})
-  .then(function(j){if(j.result&&j.result[0]===0){sess=j.result[1].ubus_rpc_session;return true;}return false;});}
+  params:[NULLSESS,"session","login",{username:"root",password:pw||"",timeout:86400}]})
+  .then(function(j){if(j.result&&j.result[0]===0){sess=j.result[1].ubus_rpc_session;
+    if(SECURE){try{localStorage.setItem("beep_sess",sess);}catch(e){}} return true;}return false;});}
 
 function call(method,params){return rpc({jsonrpc:"2.0",id:1,method:"call",
   params:[sess,"beep",method,params||{}]}).then(function(j){
@@ -296,12 +326,14 @@ function refresh(){return call("status").then(function(s){
   el("s-up").textContent=fmtUp(s.uptime);
   if(!el("nm").matches(":focus"))el("nm").value=s.name||"";
   if(s.volume!=null && !el("vol")._live){el("vol").value=s.volume;el("volpct").textContent=s.volume+"%";}
+  setSourceUI(s);
   setAirplayUI(s);
   setGroupUI(s);
   setLmsUI(s);
   setSshUI(s);
   el("foot").textContent="Beep Revival — open firmware · "+(s.name||"");
-}).catch(function(e){ // status failed -> needs login
+}).catch(function(e){ // status failed -> session invalid/expired, needs login
+  sess=NULLSESS; try{localStorage.removeItem("beep_sess");}catch(_){}
   el("app").classList.add("hide"); el("login").classList.remove("hide");
 });}
 
@@ -422,21 +454,42 @@ function setGroup(r){
   call("set_group",body).then(function(){setTimeout(refresh,1200);})
     .catch(function(e){el("grp-status").textContent="Failed: "+(e&&e.message||e);});
 }
-function setLmsUI(s){
-  var en=(s&&s.lms_enabled)?1:0;
-  el("lms-off").setAttribute("aria-pressed",en===0);
-  el("lms-on").setAttribute("aria-pressed",en===1);
-  if(document.activeElement!==el("lms-srv")) el("lms-srv").value=(s&&s.lms_server)||"";
-  var msg;
-  if(en) msg=(s&&s.lms_running)?"On — look for this Beep as a player in your LMS.":"On — starting…";
-  else msg="Off. Turn on to appear as a player in a Lyrion Music Server.";
-  el("lms-status").textContent=msg;
+// Master audio-source selector: AirPlay <-> Music Server (LMS). They are mutually
+// exclusive (one owns the single speaker), so this just drives set_lms and shows the
+// matching sub-section (AirPlay 1/2 + Multi-room, or the LMS server config).
+function setSourceUI(s){
+  var lms=!!(s&&s.lms_enabled);
+  var a=el("src-ap"), l=el("src-lms");
+  if(a)a.setAttribute("aria-pressed",!lms);
+  if(l)l.setAttribute("aria-pressed",lms);
+  var aps=el("ap-section"), lmss=el("lms-section");
+  if(aps)aps.classList.toggle("hide",lms);
+  if(lmss)lmss.classList.toggle("hide",!lms);
+  var st=el("src-status");
+  if(st)st.textContent=lms
+    ? "Playing from a Music Server — AirPlay is off while this is on."
+    : "Receiving AirPlay. Switch to a Music Server to play from LMS instead.";
 }
-function setLms(en){
-  var body={enabled:en,server:el("lms-srv").value.trim()};
-  el("lms-status").textContent="Applying…";
-  call("set_lms",body).then(function(){setTimeout(refresh,1200);})
+function setSource(src){
+  var lms=(src==="lms"), st=el("src-status");
+  if(st)st.textContent=lms?"Switching to Music Server…":"Switching to AirPlay…";
+  setLms(lms?1:0);
+}
+function setLmsUI(s){ // Off/On is the master Audio-source toggle now; keep server + status synced.
+  if(document.activeElement!==el("lms-srv")) el("lms-srv").value=(s&&s.lms_server)||"";
+  var st=el("lms-status"); if(!st) return;
+  st.textContent=(s&&s.lms_enabled)
+    ? ((s&&s.lms_running)?"Playing — look for this Beep as a player in your LMS.":"Starting the LMS player…")
+    : "";
+}
+function saveLms(){ // re-apply LMS as the source with the entered server address
+  el("lms-status").textContent="Saving…";
+  call("set_lms",{enabled:1,server:el("lms-srv").value.trim()}).then(function(){setTimeout(refresh,1200);})
     .catch(function(e){el("lms-status").textContent="Failed: "+(e&&e.message||e);});
+}
+function setLms(en){ // underlying source switch (0=AirPlay, 1=LMS) used by setSource()
+  call("set_lms",{enabled:en,server:el("lms-srv").value.trim()}).then(function(){setTimeout(refresh,1500);})
+    .catch(function(e){toast(e&&e.message||e,true);});
 }
 function savePw(){var p=el("np").value;if(p.length<6){toast("Min 6 characters",true);return;}
   call("set_password",{password:p}).then(function(){el("np").value="";toast("Password set");})

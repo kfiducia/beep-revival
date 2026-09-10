@@ -49,6 +49,9 @@ uci -q get "firewall.${LZ}.network" | grep -qw beepap || uci -q add_list "firewa
 uci -q commit firewall
 
 mkdir -p /var/run/beep; echo ap > /var/run/beep/led-mode   # ring -> AP comet
+# Back to the setup AP: drop the HTTPS redirect so the captive-portal mini-browser (which
+# can't accept a self-signed cert) reaches the setup page over plain HTTP on the WPA2 AP.
+uci -q set uhttpd.main.redirect_https=0; uci -q commit uhttpd; /etc/init.d/uhttpd reload >/dev/null 2>&1
 wifi reload
 # `wifi reload` is ASYNC — the AP (beepap / phy0-ap0) interface comes up a moment later.
 # If we restart dnsmasq before it has its 192.168.60.1, dnsmasq generates its config with

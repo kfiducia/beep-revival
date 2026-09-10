@@ -33,6 +33,12 @@ sp_service_type() {
 mode="${1:-apply}"
 [ "$mode" = apply ] && mode="$(uci -q get beep.main.airplay_mode 2>/dev/null || echo ap1)"
 
+# LMS (squeezelite) and AirPlay can't share the single ALSA output, and running LMS
+# alongside AP2's AAC decode overloads/hangs the 400 MHz AR9331. So whenever we bring
+# AirPlay UP (ap1 or ap2) turn the LMS player OFF first. set_lms does the inverse (LMS on
+# => AirPlay off), so exactly one of {AirPlay, LMS} owns the speaker at any time.
+case "$mode" in ap1|ap2) svc squeezelite disable 2>/dev/null; svc squeezelite stop 2>/dev/null;; esac
+
 case "$mode" in
 	ap1)
 		log "AirPlay 1 (classic RAOP) + replaynet multi-room"

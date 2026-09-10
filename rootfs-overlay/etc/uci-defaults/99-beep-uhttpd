@@ -20,6 +20,16 @@ uci -q set uhttpd.main.script_timeout=120
 if [ -f /etc/beep-uhttpd.crt ] && [ -f /etc/beep-uhttpd.key ]; then
 	uci -q set uhttpd.main.cert=/etc/beep-uhttpd.crt
 	uci -q set uhttpd.main.key=/etc/beep-uhttpd.key
+	# Force HTTPS for the admin app once a per-device cert exists — so the persisted admin
+	# session token is never carried over plaintext HTTP. EXCEPTION: while the setup AP is
+	# up, keep plain HTTP — the captive-portal mini-browser can't accept a self-signed cert,
+	# and that link is already WPA2-encrypted. set_wifi flips the redirect on when the unit
+	# joins a real network (wireless.setup.disabled=1 => setup AP off => client mode).
+	if [ "$(uci -q get wireless.setup.disabled)" = 1 ]; then
+		uci -q set uhttpd.main.redirect_https=1
+	else
+		uci -q set uhttpd.main.redirect_https=0
+	fi
 fi
 uci -q commit uhttpd
 exit 0
