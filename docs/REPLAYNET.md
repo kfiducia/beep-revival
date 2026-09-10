@@ -131,6 +131,15 @@ node:
   group it forks a **fan-out** that streams one identically-timestamped feed to every
   member — including itself via `127.0.0.1` — so the whole group (source included) plays
   in sync off the step (b) clock sync + step (c) servo.
+- **Membership is INCREMENTAL**: the fan-out is spawned once and members are added/removed a
+  single socket at a time over a node→child control pipe (`+ip`/`-ip`), never by kill+respawn.
+  So a member joining/leaving/flapping (or a DHCP IP change) never disrupts the source's own
+  `127.0.0.1` loopback playout or the other rooms — the loopback is added once and never
+  removed. A member that isn't listening yet (sink mid-respawn) is retried non-blocking, and a
+  member is kept across a brief gossip gap (`RN_GROUP_GRACE_NS` hysteresis) so transient wifi
+  loss doesn't churn the group. (Before this, any member-set change tore down the whole fan-out
+  and re-prebuffered every room including the source — the source went silent when a member
+  flapped.)
 
 **Triggers** arrive as one-line commands on a UNIX control socket, so the firmware's
 existing hooks drive it with no code coupling:
