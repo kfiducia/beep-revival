@@ -1,7 +1,10 @@
-# Flashing a Beep — step-by-step walkthrough
+# Installing Beep Revival — the complete flashing & update guide
 
 Turn a stock, cloud-orphaned **Beep "Dial"** into an open-firmware AirPlay speaker.
-Written for someone who has never touched this board.
+Written for someone who has never touched this board. This is the **single canonical
+guide**: the one-time UART first-flash (Steps 0–11) *and* how you update from then on
+(["staying updated"](#after-the-first-flash--staying-updated-no-cable) — just a signed
+upload in the web UI, no cable).
 
 **How to read this guide.** Every step has three parts, so you always know where you
 stand:
@@ -25,12 +28,76 @@ stand:
 4. **Verify every checksum** before flashing; back up before you write.
 5. **Phases 1–2a write nothing.** Only the single `sysupgrade` commits.
 
+## Is this your device?
+
+This procedure is **only** for the **Beep "Dial"** — the round wireless speaker with the
+LED ring — built on the **8devices Carambola 2** module (**Atheros AR9331**, **64 MB** RAM,
+**16 MB** SPI-NOR flash). Beep Networks folded around 2016 and shut down the cloud the app
+depended on, which is why the speaker went dark. **If your board is anything else, stop** —
+the flash addresses and device tree here are specific to this hardware.
+
 ## What you need
 
-- A **3.3 V** USB-to-UART adapter (FTDI/CP2102/CH340) + 3 jumper wires (TX/RX/GND).
+**Hardware**
+- A **3.3 V** USB-to-UART (TTL) adapter — FTDI / CP2102 / CH340. **It MUST be 3.3 V logic;
+  a 5 V adapter will kill the AR9331.** If it has a voltage jumper, set it to 3.3 V first.
+- 3 jumper wires (female Dupont) for **TX / RX / GND**, and a way onto the **P2 6-pin
+  console header** — most units are 0.1″/2.54 mm pitch; measure yours before buying a
+  connector.
+- A small screwdriver / spudger to open the enclosure.
+
+**Software (on your Mac)**
 - A serial terminal (`tio`, `picocom`, `screen`), plus `lrzsz` and `sshpass`
   (`brew install lrzsz sshpass`).
-- This repo (for the images in `images/` and the scripts in `scripts/`).
+- The **helper `scripts/`** and the **lean RAM-boot image** — both ship in this repo, so a
+  `git clone` is all you need for them (Step 0). The firmware you actually flash is a
+  **signed release download** (Step 0). **You do not build anything.**
+
+---
+
+## Step 0 — Get the tools and the firmware image (no building required)
+
+You need two things on your computer, and **you build nothing**. Run everything below
+**from the repo root** so the `scripts/…` and `images/…` paths resolve.
+
+**(a) This repo** — it carries the helper `scripts/` *and* the **lean RAM-boot image**
+(`images/lean-initramfs-kernel.bin`), the small audio-only initramfs you boot from RAM in
+Phase 1. Clone it and confirm the lean image is intact:
+```
+git clone https://github.com/kfiducia/beep-revival && cd beep-revival
+shasum -a 256 images/lean-initramfs-kernel.bin
+# expect: 87030fe4542af25df66056c2fcdf5191c40b3adba49f2504268101c0a4af60ec
+```
+
+**(b) The signed firmware image** — the **sysupgrade** you actually flash in Phase 2, from
+the [Releases page](https://github.com/kfiducia/beep-revival/releases). Download it into
+the repo root and verify it:
+```
+export VER=v1.4.2          # ← set to the latest release tag on the Releases page
+gh release download "$VER" --repo kfiducia/beep-revival \
+  -p "beep-revival-$VER-sysupgrade.bin" -p SHA256SUMS
+#   (no gh? download those two files from the Releases page in a browser)
+grep 'sysupgrade.bin$' SHA256SUMS | grep -v signed | shasum -a 256 -c -
+# expect: beep-revival-$VER-sysupgrade.bin: OK
+```
+
+**Why they're different (and why the lean image exists):** the **lean image** is a stripped,
+audio-only initramfs whose only job is to give you a root shell **in RAM** so you can
+transfer and flash the real image — it's a versionless **tool**, so it lives in the repo.
+The **sysupgrade** is the actual firmware written to flash; it's versioned and
+`usign`-**signed**, so it ships as a GitHub Release. **Do not RAM-boot the release's
+`…-initramfs-kernel.bin`** — the *full* initramfs (~10 MB) **OOM-panics on this 64 MB
+board** (`Kernel panic - System is deadlocked on memory`); RAM-booting the **lean** one is
+the whole point (Step 6). Verifying both checksums catches a corrupt download **before** it
+can cause a bad flash.
+
+**✓ Check:** the lean image's `shasum` equals `87030fe4…`, and the release check prints
+`beep-revival-$VER-sysupgrade.bin: OK`. You now have, in the repo root:
+`images/lean-initramfs-kernel.bin` (Phase 1 RAM-boot) and
+`beep-revival-$VER-sysupgrade.bin` (Phase 2 flash).
+
+> Set `export VER=v1.4.2` **once** in the shell you run the scripts from (or just
+> substitute the real filename in the commands below).
 
 ---
 
@@ -182,7 +249,7 @@ and (c) `art` is byte-for-byte intact (its md5 still matches your backup).
 
 **What (a) — send the image** (quit tio first, `pkill tio`):
 ```
-scripts/serial-send.sh /dev/cu.usbserial-XXXX images/beep-sysupgrade.bin
+scripts/serial-send.sh /dev/cu.usbserial-XXXX beep-revival-*-sysupgrade.bin
 ```
 > **⏱ The transfer is SILENT on the console and takes ~15–20 minutes. Do NOT
 > interrupt it.** `tio` is detached while `serial-send.sh` owns the port, so the
@@ -201,9 +268,9 @@ The image is now in **RAM** (`/tmp`). We check it there, then commit — the
 `sysupgrade` below is the **only** step that writes flash (it's quick and *does*
 print progress to the console before it reboots):
 ```
-sha256sum /tmp/beep-sysupgrade.bin        # compare to the sha printed by your build
-sysupgrade -T /tmp/beep-sysupgrade.bin    # image sanity ("will be flashed")
-sysupgrade -n /tmp/beep-sysupgrade.bin    # writes 'firmware' ONLY; art + u-boot untouched
+sha256sum /tmp/beep-revival-*-sysupgrade.bin     # must equal its SHA256SUMS line from Step 0
+sysupgrade -T /tmp/beep-revival-*-sysupgrade.bin # image sanity ("will be flashed")
+sysupgrade -n /tmp/beep-revival-*-sysupgrade.bin # writes 'firmware' ONLY; art + u-boot untouched
 ```
 **Why:** a serial transfer can corrupt bytes, so we **check the sha before writing** —
 this is the difference between a clean flash and a brick. `sysupgrade` writes only the
@@ -231,10 +298,12 @@ on the very first boot is normal, not a brick.
 > ⚠️ **You MUST also set `beep_recovery` (this is not optional).** `bootb` is a
 > **3-strikes** failsafe: after 3 consecutive boots that don't get reset, the 4th boots
 > `beep_recovery`. On a stock unit `beep_recovery` still points at `0x9f550000` — which,
-> once primary is our kernel, is **garbage (mid-rootfs) → a UART-only brick.** There is no
-> real recovery slot yet, so we point `beep_recovery` at the **primary** too: a 3-strikes
-> trip then simply re-boots the primary (harmless) instead of bricking. (When a real
-> recovery slot exists, this becomes its address instead — see `docs/RECOVERY-DESIGN.md`.)
+> once primary is our kernel, is **garbage (mid-rootfs)**: the 4th boot fails and drops you
+> back to `ar7240>`, so you'd have to **reconnect UART and re-point / `saveenv`** to recover.
+> Not a permanent brick (`u-boot` + `art` are intact), but it defeats going cable-free.
+> There is no real recovery slot yet, so we point `beep_recovery` at the **primary** too: a
+> 3-strikes trip then simply re-boots the primary (harmless). (When a real recovery slot
+> exists, this becomes its address instead — see `docs/RECOVERY-DESIGN.md`.)
 
 **✓ Check:** our firmware boots to a login / the light ring animates, **and**
 `fw_printenv beep_recovery` (or `printenv` at `ar7240>`) reads back `0x9f050000`.
@@ -263,11 +332,12 @@ your unit's `art` MAC.
 
 Disconnecting UART and calling the unit "safe to network-update" is a real commitment:
 without a working recovery slot, UART is still the only backstop for a bad boot. **Do not
-remove it until every box is checked** — these are the things that turn a recoverable
-event into a UART-only brick if skipped.
+remove it until every box is checked** — these are the things that turn a self-recoverable
+event into one that forces you back to the UART cable if skipped.
 
 - [ ] **`beep_recovery` is repointed** — `fw_printenv beep_recovery` → `0x9f050000` (Step 9).
-      *Without this, a 3-strikes trip boots garbage = brick.*
+      *Without this, a 3-strikes trip boots garbage — not a permanent brick, but it drops to
+      `ar7240>` and you'd need UART again to re-point / `saveenv`.*
 - [ ] **`fw_env.config` round-trips** — `fw_printenv beep_primary` → `0x9f050000`, and
       `fw_setenv beep_probe 1 && fw_printenv beep_probe` returns `1`. Proves userspace can
       read/write the env safely (needed before any good-boot bootcount reset is enabled).
@@ -282,6 +352,30 @@ event into a UART-only brick if skipped.
 
 Only when all of the above hold is the unit genuinely "network-update safe." Then it's a
 normal AirPlay speaker; updates are signed uploads in the web UI (SSH stays off by default).
+
+---
+
+## After the first flash — staying updated (no cable)
+
+The UART flash above is a **one-time** bootstrap. Once Beep Revival is on, the unit is a
+normal AirPlay speaker and **every future update is a signed upload in the web UI** — no
+serial, no hand-run `sysupgrade`:
+
+1. Download the latest **signed** image — `beep-revival-<version>-sysupgrade.signed.bin` —
+   from the [Releases page](https://github.com/kfiducia/beep-revival/releases) and verify
+   it against `SHA256SUMS` (optionally the signature against `beep-ota.pub`).
+2. Open the device's admin UI (`https://<its-ip>/`, prefer HTTPS on 443) and log in.
+3. In the **firmware update** section, upload the one `.signed.bin` — the signature travels
+   with the image, so there's nothing else to select.
+4. The device **verifies the `usign` signature**, writes only the `firmware` partition, and
+   reboots into the new version. **Your Wi-Fi, name, and admin password are preserved;**
+   `art` and `u-boot` are never touched.
+
+Two independent gates protect this path: an **authenticated admin session** *and* a **valid
+signature**. An unsigned image is refused outright (installing unsigned firmware
+deliberately takes a physical triple-tap on the device — not something a remote attacker
+can do). If an update ever fails to boot, you still have the UART backstop above (redo
+Phase 1/2) and the full backup from Step 5.
 
 ---
 
