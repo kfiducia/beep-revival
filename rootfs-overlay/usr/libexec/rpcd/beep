@@ -60,9 +60,10 @@ volume() {
 }
 
 status() {
-	local name role apm up ip ssid sig ver vol utime smode sexp grole
+	local name role apm up ip ssid sig ver vol utime smode sexp grole gengine
 	smode="$(uget beep.main.ssh_mode)"; [ -n "$smode" ] || smode=off
 	grole="$(uget beep.main.group_role)"; [ -n "$grole" ] || grole=solo
+	gengine="$(uget beep.main.group_engine)"; [ -n "$gengine" ] || gengine=snapcast
 	sexp="$(uget beep.main.ssh_expires)"; case "$sexp" in ''|*[!0-9]*) sexp=null;; esac
 	name="$(jesc "$(uget system.@system[0].hostname)")"
 	role="$(jesc "$(uget beep.main.role)")"
@@ -77,9 +78,15 @@ status() {
 	printf '{"name":"%s","airplay_name":"%s","role":"%s","ap_mode":%s,' "$name" "$name" "$role" "$apm"
 	printf '"connected":%s,"ssid":"%s","ip":"%s","signal":%s,' "$up" "$ssid" "$ip" "$sig"
 	printf '"volume":%s,"version":"%s","uptime":%s,"ssh":%s,"ssh_mode":"%s","ssh_expires":%s,' "$vol" "$ver" "$utime" "$(ssh_on)" "$smode" "$sexp"
-	printf '"group_role":"%s","snapserver":%s,"snapclient":%s,' "$grole" \
+	# group_engine tells the UI which multi-room control set to render (snapcast: the
+	# Solo/Primary/Member roles; replaynet: a Grouped/Solo toggle — sourcing is automatic
+	# on play, so there's no manual "primary"). "replaynet" is the node daemon liveness
+	# (always up under the always-pipe engine) — the UI uses it instead of "snapserver"
+	# (which never runs on a replaynet image) so the status line reflects real state.
+	printf '"group_role":"%s","group_engine":"%s","snapserver":%s,"snapclient":%s,"replaynet":%s,' "$grole" "$gengine" \
 		"$(pidof snapserver >/dev/null 2>&1 && echo true || echo false)" \
-		"$(pidof snapclient >/dev/null 2>&1 && echo true || echo false)"
+		"$(pidof snapclient >/dev/null 2>&1 && echo true || echo false)" \
+		"$(pidof replaynet >/dev/null 2>&1 && echo true || echo false)"
 	# Lyrion / LMS player (squeezelite) state
 	local lmsen lmssrv
 	lmsen="$(uget squeezelite.options.enabled)"; case "$lmsen" in 0|1) ;; *) lmsen=0;; esac
