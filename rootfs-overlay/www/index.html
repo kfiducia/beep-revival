@@ -461,12 +461,18 @@ function pollPhys(){
 }
 
 function setSshUI(s){
-  el("ssh-run").textContent = s.ssh ? "running" : "stopped";
-  el("ssh-off").setAttribute("aria-pressed", s.ssh_mode==="off");
+  var running = !!s.ssh;
+  // A 'temp' window is only active while dropbear is actually running. After a
+  // reboot ssh_mode can still read 'temp' (temp is deliberately not restored on
+  // boot; the device reconciles it on the next netcheck pass) even though SSH is
+  // down -- don't paint that as an active window. Show it as Off until reconciled.
+  var tempActive = s.ssh_mode==="temp" && running;
+  el("ssh-run").textContent = running ? "running" : "stopped";
+  el("ssh-off").setAttribute("aria-pressed", s.ssh_mode==="off" || (s.ssh_mode==="temp" && !running));
   el("ssh-on").setAttribute("aria-pressed", s.ssh_mode==="on");
-  el("ssh-temp").setAttribute("aria-pressed", s.ssh_mode==="temp");
+  el("ssh-temp").setAttribute("aria-pressed", tempActive);
   var u="";
-  if(s.ssh_mode==="temp" && s.ssh_expires){
+  if(tempActive && s.ssh_expires){
     var d=new Date(s.ssh_expires*1000);
     u=" · on until "+d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
   }

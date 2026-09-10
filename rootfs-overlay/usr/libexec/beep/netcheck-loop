@@ -65,13 +65,26 @@ ensure_radio         # cold-boot guarantee: start the radio if netifd's racy boo
 sleep 25       # let wifi + DHCP settle after boot before judging
 fails=0
 while :; do
-	# SSH temporary-mode fail-secure: disable dropbear once the window lapses
+	# SSH temporary-mode fail-secure. A temp window ends two ways:
+	#  (a) it lapses while dropbear is still up -> disable+stop it (the expiry branch).
+	#  (b) a reboot killed dropbear -- temp is deliberately never re-enabled on boot, so
+	#      it never restarts -- yet ssh_mode=temp + ssh_expires persist in UCI. The
+	#      uci-defaults collapse (99-beep-ssh) only runs on first boot/sysupgrade, NOT a
+	#      plain reboot, so without this the admin panel keeps showing "temp / on until
+	#      HH:MM" for a session that isn't actually running. This loop runs on every boot
+	#      under procd, so reconcile here: temp means "started for a window", hence temp
+	#      with no dropbear is a void window -> collapse to off.
 	if [ "$(uci -q get beep.main.ssh_mode)" = temp ]; then
-		exp="$(uci -q get beep.main.ssh_expires)"
-		case "$exp" in [0-9]*) [ "$(date +%s)" -ge "$exp" ] && {
-			/etc/init.d/dropbear disable 2>/dev/null; /etc/init.d/dropbear stop 2>/dev/null
+		if ! pidof dropbear >/dev/null 2>&1; then
 			uci -q set beep.main.ssh_mode=off; uci -q delete beep.main.ssh_expires; uci -q commit beep
-			logger -t beep "ssh: temporary window expired -> disabled"; };; esac
+			logger -t beep "ssh: temp mode but dropbear not running (post-reboot?) -> off"
+		else
+			exp="$(uci -q get beep.main.ssh_expires)"
+			case "$exp" in [0-9]*) [ "$(date +%s)" -ge "$exp" ] && {
+				/etc/init.d/dropbear disable 2>/dev/null; /etc/init.d/dropbear stop 2>/dev/null
+				uci -q set beep.main.ssh_mode=off; uci -q delete beep.main.ssh_expires; uci -q commit beep
+				logger -t beep "ssh: temporary window expired -> disabled"; };; esac
+		fi
 	fi
 	ensure_radio   # keep the radio up: re-start it if a cold-boot race (or a later drop) left it down
 	# "Provisioned" == a real client STA. set_wifi (the portal join) sets iface[0]
