@@ -1699,6 +1699,16 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 	uint64_t out_frames = 0;
 	int64_t err = 0, cum = 0, last_corr = 0, dbg_last = 0;   /* dbg_last: prev loop time (stall detect) */
 	int frames_since_log = 0, eof = 0;
+	/* Phase 1 may lock the clock during a startup feed trickle (anchor_sample near 0) just
+	 * before a burst — the always-pipe FIFO flush / AirPlay's ~2 s startup buffer — fills the
+	 * ring. That leaves the schedule anchored to an old sample while playout begins ~BUFFER of
+	 * freshly-burst audio ahead of it: a large "ahead" error the drop/insert servo can only bleed
+	 * off by inserting silence at ~1 period / 250 ms (~40 ms/s), so the SOURCE's own room (the
+	 * loopback sink) settles seconds behind the remote members. Re-anchor once when real playout
+	 * begins — same logic as the epoch re-anchor — so the first audible sample lands on the shared
+	 * schedule (err ~= 0) regardless of the startup burst. Remote members anchor during steady 1x
+	 * flow and are already clean, so this is a no-op for them. */
+	int start_reanchor = 1;
 
 	/* --resample state: the window is fed from the ring and pulled at a servo-trimmed
 	 * ratio. rsbuf is a properly-typed (int16) output buffer for one period. */
@@ -1730,13 +1740,15 @@ static int run_sink_alsa(const char *dev, uint16_t port)
 		 * reset the (sample -> wall-clock) anchor to the resumed position and clear the servo so
 		 * `err` snaps back toward 0 instead of accumulating. ALSA stays open (no re-prebuffer),
 		 * and every sink sees the same epoch on the same frame, so all rooms re-align together. */
-		if (epoch != anchor_epoch) {
+		if (epoch != anchor_epoch || start_reanchor) {
 			int64_t new_want = source_time_ns - ce.theta + RN_BUFFER_NS;
 			int64_t wait = new_want - now_ns();      /* guard a bad value (suspect theta), as Phase 1 does */
 			if (wait > RN_BUFFER_NS + RN_STARTUP_SLOP_NS || wait < -RN_STARTUP_SLOP_NS)
 				new_want = now_ns() + RN_BUFFER_NS;
-			plog("INFO", "re-anchor: epoch %u -> %u, err was %+" PRId64 " ms — resetting schedule",
+			plog("INFO", "re-anchor (%s): epoch %u -> %u, err was %+" PRId64 " ms — resetting schedule",
+			     start_reanchor ? "playout start" : "discontinuity",
 			     anchor_epoch, epoch, err * 1000 / RN_RATE);
+			start_reanchor = 0;
 			want_local = new_want;
 			anchor_sample = track_samples;           /* newest frame's head sample */
 			anchor_epoch = epoch;
