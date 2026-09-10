@@ -124,20 +124,28 @@ trade-offs, disclosed openly rather than papered over.
 
 **If I upgrade to this firmware, am I locked in because you enforce signing?**
 
-No. Signing is a safety gate against *remote* attacks, not a lock on *you*. You can
-always load your own firmware: build (or download) an image, upload it through the
-web admin UI exactly like a normal update — but because it isn't signed with our
-key, you must **be physically present and triple-tap the Beep button** to authorize
-it. That physical tap opens a 60-second window that unlocks the "install unsigned
-image" option in the UI.
+No. Signing is an **integrity check on the web-update path**, not a lock on *you*.
+Its job is to prove that an image is a genuine, un-corrupted Beep release before the
+web UI will flash it — so a modified, truncated, or otherwise broken binary can't be
+pushed over the network and brick the device. It is not DRM and it does not bind the
+device to us; you can always load your own firmware.
 
-The reason it works this way: a valid `usign` signature lets a genuine release flash
-over the network (convenient, and safe because a stolen admin session still can't
-forge the signature). An *unsigned* image can't be flashed remotely at all — no
-remote attacker can press the button on your device — so the only way to install one
-is to walk up to the hardware and triple-tap. Physical possession is the master key,
-which is exactly what "it's your device" should mean. See the Security section above
-and [`rootfs-overlay/www/cgi-bin/beep-ota`](rootfs-overlay/www/cgi-bin/beep-ota).
+Two ways to do that:
+
+- **Web UI** — upload your image like a normal update, but because it isn't signed
+  with our key, **be physically present and triple-tap the Beep button** first. That
+  opens a 60-second window that unlocks the "install unsigned image" option in the
+  UI. (Requiring a physical tap for unsigned images is also what stops a
+  remotely-compromised device from being flashed with hostile firmware — no remote
+  actor can press the button.)
+- **SSH** — if you turn SSH on (it's off by default) and log in, you have root, so
+  you can run `sysupgrade` on any image directly. The signature check lives only in
+  the web endpoint, so a shell bypasses it entirely.
+
+Either way, physical possession — the button, or the admin/SSH credentials you
+control — is the master key, which is exactly what "it's your device" should mean.
+See the Security section above and
+[`rootfs-overlay/www/cgi-bin/beep-ota`](rootfs-overlay/www/cgi-bin/beep-ota).
 
 ## License
 GPL-2.0-or-later. This firmware is built on and derived from GPL-licensed Linux
