@@ -64,6 +64,7 @@ status() {
 	smode="$(uget beep.main.ssh_mode)"; [ -n "$smode" ] || smode=off
 	grole="$(uget beep.main.group_role)"; [ -n "$grole" ] || grole=solo
 	gengine="$(uget beep.main.group_engine)"; [ -n "$gengine" ] || gengine=snapcast
+	local apmode; apmode="$(uget beep.main.airplay_mode)"; [ -n "$apmode" ] || apmode=ap1
 	sexp="$(uget beep.main.ssh_expires)"; case "$sexp" in ''|*[!0-9]*) sexp=null;; esac
 	name="$(jesc "$(uget system.@system[0].hostname)")"
 	role="$(jesc "$(uget beep.main.role)")"
@@ -91,8 +92,8 @@ status() {
 	local lmsen lmssrv
 	lmsen="$(uget squeezelite.options.enabled)"; case "$lmsen" in 0|1) ;; *) lmsen=0;; esac
 	lmssrv="$(jesc "$(uget squeezelite.options.server_addr)")"
-	printf '"lms_enabled":%s,"lms_server":"%s","lms_running":%s}\n' "$lmsen" "$lmssrv" \
-		"$(pidof squeezelite >/dev/null 2>&1 && echo true || echo false)"
+	printf '"lms_enabled":%s,"lms_server":"%s","lms_running":%s,"airplay_mode":"%s"}\n' "$lmsen" "$lmssrv" \
+		"$(pidof squeezelite >/dev/null 2>&1 && echo true || echo false)" "$apmode"
 }
 
 scan() {
@@ -186,6 +187,17 @@ set_group() {
 	echo "{\"ok\":true,\"role\":\"$role\"}"
 }
 
+set_airplay_mode() {
+	# Converged image: switch AirPlay 1 <-> AirPlay 2 at runtime. beep-airplay-mode owns
+	# shairport's service_type + the multi-room engine (replaynet for ap1, none for ap2)
+	# and enforces the invariant "AP2 => replaynet OFF". mode = ap1 | ap2.
+	local mode; mode="$(jf '@.mode')"
+	case "$mode" in ap1|ap2) ;; *) echo '{"error":"mode ap1|ap2"}'; return;; esac
+	[ -x /usr/libexec/beep/beep-airplay-mode ] || { echo '{"error":"airplay mode switch not in this image"}'; return; }
+	/usr/libexec/beep/beep-airplay-mode "$mode" >/dev/null 2>&1
+	echo "{\"ok\":true,\"airplay_mode\":\"$mode\"}"
+}
+
 set_lms() {
 	# Lyrion / LMS player (squeezelite). enabled 0|1; server = LMS host/IP. A blank
 	# server means auto-discover via SlimProto UDP broadcast — which only reaches a
@@ -246,7 +258,7 @@ reboot_dev() { (sleep 1; reboot) >/dev/null 2>&1 & echo '{"ok":true}'; }
 
 case "$1" in
   list)
-    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_group":{"role":"str","server":"str"}, "set_lms":{"enabled":0,"server":"str"}, "set_password":{"password":"str"}, "set_ssh":{"mode":"str","hours":0}, "reboot":{} }'
+    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_group":{"role":"str","server":"str"}, "set_airplay_mode":{"mode":"str"}, "set_lms":{"enabled":0,"server":"str"}, "set_password":{"password":"str"}, "set_ssh":{"mode":"str","hours":0}, "reboot":{} }'
     ;;
   call)
     method="$2"; INPUT="$(cat)"
@@ -257,6 +269,7 @@ case "$1" in
       set_name)     set_name ;;
       set_volume)   set_volume ;;
       set_group)    set_group ;;
+      set_airplay_mode) set_airplay_mode ;;
       set_lms)      set_lms ;;
       set_password) set_password ;;
       set_ssh)      set_ssh ;;

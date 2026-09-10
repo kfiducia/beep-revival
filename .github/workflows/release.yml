@@ -174,16 +174,14 @@ jobs:
           make -j"$(nproc)" tools/install toolchain/install
 
   # ===========================================================================
-  # build — matrix: compile AP1 and AP2 IN PARALLEL, restoring the warm caches.
+  # build — the single CONVERGED image: AirPlay 1/2 runtime-selectable + replaynet
+  # multi-room, no Snapcast. Replaces the old ap1/ap2/replaynet matrix — one firmware
+  # now covers all three (protocol + engine chosen at runtime). docs/CONVERGED-IMAGE-DESIGN.md.
   # ===========================================================================
   build:
     needs: prepare
     runs-on: ${{ vars.RELEASE_RUNNER && fromJSON(vars.RELEASE_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 240   # one full image build; toolchain is warm from `prepare`
-    strategy:
-      fail-fast: false     # a flake in one variant shouldn't cancel the other's build
-      matrix:
-        variant: [ap1, ap2, replaynet]
     env:
       CCACHE_DIR: /build/ccache   # pinned outside staging_dir; matches CONFIG_CCACHE_DIR
     steps:
@@ -231,18 +229,16 @@ jobs:
           restore-keys: |
             openwrt-v24.10.0-ath79-
 
-      # Per-variant ccache with a rolling key (github.run_id). Each variant restores
-      # its OWN previous ccache (then any ccache, incl. prepare's seed) and saves a
-      # fresh entry at job end. Scoping by variant avoids the two matrix jobs colliding
-      # on one key; ap1/ap2 also build different package sets, so separate is a better fit.
-      - name: Cache ccache (${{ matrix.variant }})
+      # ccache with a rolling key (github.run_id): restore the newest prior ccache
+      # (incl. prepare's toolchain seed) and save a fresh entry at job end.
+      - name: Cache ccache
         if: ${{ runner.environment == 'github-hosted' }}   # persistent /build/ccache on the CT
         uses: actions/cache@v4
         with:
           path: /build/ccache
-          key: ccache-${{ matrix.variant }}-${{ github.run_id }}
+          key: ccache-converged-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ matrix.variant }}-
+            ccache-converged-
             ccache-
 
       - name: Set up OpenWrt (toolchain warm from cache — near-no-op)
@@ -281,41 +277,29 @@ jobs:
       - name: Stamp firmware version
         run: echo "Beep Revival ${{ needs.prepare.outputs.version }}" > rootfs-overlay/etc/beep-version
 
-      - name: Build image (${{ matrix.variant }})
+      - name: Build the converged image
         run: |
           set -e
           export OW=/build/openwrt SRC="$GITHUB_WORKSPACE"
           OUT=/build/openwrt/bin/targets/ath79/generic
           V="${{ needs.prepare.outputs.version }}"
-          mkdir -p /tmp/collected
-          # build.sh writes a FRESH .config and restores the shairport/ffmpeg Makefiles
-          # to pristine on every run, so the two variant builds never leak into each other.
-          if [ "${{ matrix.variant }}" = "ap2" ]; then
-            echo "::group::AP2 build (AirPlay-2, no Snapcast)"
-            AIRPLAY2=1 bash "$SRC/scripts/build.sh"
-            echo "::endgroup::"
-          elif [ "${{ matrix.variant }}" = "replaynet" ]; then
-            echo "::group::replaynet build (AirPlay-1 + replaynet multi-room, no Snapcast)"
-            MULTIROOM=replaynet bash "$SRC/scripts/build.sh"
-            echo "::endgroup::"
-          else
-            echo "::group::AP1 build (AirPlay-1 + Snapcast, SSH OFF — no BEEP_DEV)"
-            bash "$SRC/scripts/build.sh"
-            echo "::endgroup::"
-          fi
+          # Fresh scratch each run — the self-hosted runner is PERSISTENT, so a stale
+          # /tmp/collected would otherwise pile a previous run's images into this artifact.
+          rm -rf /tmp/collected; mkdir -p /tmp/collected
+          echo "::group::CONVERGED build (AirPlay 1/2 runtime toggle + replaynet, no Snapcast, SSH OFF)"
+          CONVERGED=1 bash "$SRC/scripts/build.sh"
+          echo "::endgroup::"
           cp "$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)" \
-             "/tmp/collected/beep-revival-${V}-${{ matrix.variant }}-sysupgrade.bin"
-          # ship one initramfs (from the default/AP1 build) for the first-time UART RAM-boot
-          if [ "${{ matrix.variant }}" = "ap1" ]; then
-            cp "$(ls "$OUT"/*8dev_carambola2-initramfs-kernel.bin)" \
-               "/tmp/collected/beep-revival-${V}-initramfs-kernel.bin"
-          fi
+             "/tmp/collected/beep-revival-${V}-sysupgrade.bin"
+          # initramfs for the first-time UART RAM-boot
+          cp "$(ls "$OUT"/*8dev_carambola2-initramfs-kernel.bin)" \
+             "/tmp/collected/beep-revival-${V}-initramfs-kernel.bin"
           ls -la /tmp/collected/
 
-      - name: Upload image artifacts (${{ matrix.variant }})
+      - name: Upload image artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: images-${{ matrix.variant }}
+          name: images
           path: /tmp/collected/beep-revival-*
           if-no-files-found: error
           retention-days: 1
@@ -339,13 +323,10 @@ jobs:
       - name: Clean persistent-runner /tmp scratch
         run: rm -rf /tmp/usign /tmp/collected
 
-      # Pull both variants' artifacts back into /tmp/collected with their original
-      # filenames (merge-multiple flattens images-ap1 + images-ap2 into one dir).
       - name: Download image artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: images-*
-          merge-multiple: true
+          name: images
           path: /tmp/collected
 
       - name: List collected images
@@ -358,23 +339,21 @@ jobs:
           make -C /tmp/usign/build >/dev/null
           /tmp/usign/build/usign -h 2>&1 | head -1 || true
 
-      - name: Sign all sysupgrade images
+      - name: Sign the sysupgrade image
         env:
           BEEP_OTA_SEC: ${{ secrets.BEEP_OTA_SEC }}
         run: |
           [ -n "$BEEP_OTA_SEC" ] || { echo "::error::secret BEEP_OTA_SEC is not set"; exit 1; }
           umask 077; printf '%s\n' "$BEEP_OTA_SEC" > /tmp/beep-ota.sec
           V="${{ needs.prepare.outputs.version }}"
-          for variant in ap1 ap2 replaynet; do
-            RAW="/tmp/collected/beep-revival-${V}-${variant}-sysupgrade.bin"
-            SIGNED="/tmp/collected/beep-revival-${V}-${variant}-sysupgrade.signed.bin"
-            USIGN=/tmp/usign/build/usign bash scripts/sign-release.sh "$RAW" /tmp/beep-ota.sec "$SIGNED"
-            # verify our own signature against the public key baked into the image
-            /tmp/usign/build/usign -V -m "$RAW" \
-              -p rootfs-overlay/etc/beep-ota.pub \
-              -x <(head -2 "$SIGNED") \
-              && echo "$variant: signature verifies against baked-in pubkey"
-          done
+          RAW="/tmp/collected/beep-revival-${V}-sysupgrade.bin"
+          SIGNED="/tmp/collected/beep-revival-${V}-sysupgrade.signed.bin"
+          USIGN=/tmp/usign/build/usign bash scripts/sign-release.sh "$RAW" /tmp/beep-ota.sec "$SIGNED"
+          # verify our own signature against the public key baked into the image
+          /tmp/usign/build/usign -V -m "$RAW" \
+            -p rootfs-overlay/etc/beep-ota.pub \
+            -x <(head -2 "$SIGNED") \
+            && echo "signature verifies against baked-in pubkey"
           shred -u /tmp/beep-ota.sec
 
       - name: Assemble release assets + checksums
@@ -382,13 +361,9 @@ jobs:
         run: |
           V="${{ needs.prepare.outputs.version }}"
           mkdir -p release
-          cp /tmp/collected/beep-revival-${V}-ap1-sysupgrade.bin        release/
-          cp /tmp/collected/beep-revival-${V}-ap1-sysupgrade.signed.bin release/
-          cp /tmp/collected/beep-revival-${V}-ap2-sysupgrade.bin        release/
-          cp /tmp/collected/beep-revival-${V}-ap2-sysupgrade.signed.bin release/
-          cp /tmp/collected/beep-revival-${V}-replaynet-sysupgrade.bin        release/
-          cp /tmp/collected/beep-revival-${V}-replaynet-sysupgrade.signed.bin release/
-          cp /tmp/collected/beep-revival-${V}-initramfs-kernel.bin      release/
+          cp /tmp/collected/beep-revival-${V}-sysupgrade.bin        release/
+          cp /tmp/collected/beep-revival-${V}-sysupgrade.signed.bin release/
+          cp /tmp/collected/beep-revival-${V}-initramfs-kernel.bin  release/
           cp rootfs-overlay/etc/beep-ota.pub release/beep-ota.pub
           ( cd release && sha256sum * > SHA256SUMS )
           ls -la release/
@@ -406,42 +381,35 @@ jobs:
 
             Open OpenWrt-based firmware for the orphaned Beep "Dial" speaker (AR9331 / Carambola 2).
 
-            ### Pick your image — AP1 (default) or AP2
-            Two flavors ship each release; both accept an iPhone and both are signed.
-            Switch flavors any time by flashing the other image — no re-provisioning.
+            ### One image — AirPlay 1 or 2, chosen in the app
+            This is now a **single firmware** (no more separate ap1/ap2/replaynet images).
+            Flash **`*-sysupgrade.signed.bin`** and pick your AirPlay mode any time in the web
+            admin → **AirPlay mode** — no reflash:
 
-            | Feature | `*-ap1-*` (default) | `*-ap2-*` |
+            | | **AirPlay 1** (default) | **AirPlay 2** |
             |---|---|---|
             | AirPlay from iPhone / iPad / Mac | ✅ | ✅ |
-            | AirPlay protocol | AirPlay-1 (RAOP) | AirPlay-2 (also accepts AirPlay-1 senders) |
             | Audio codec | ALAC — **lossless** | AAC 256k — lossy |
-            | **Snapcast** synced multi-room | ✅ (our multi-room) | ❌ (dropped for size) |
-            | Native AirPlay-2 multi-room grouping | ❌ | ✅ (CPU-marginal) |
-            | Apple **Home** app (tiles, Siri, automations, stereo-pair) | ❌ | ✅ |
+            | Multi-room | **replaynet** (Beep's own, sample-synced) | native AirPlay-2 grouping (Apple Home) |
+            | Apple **Home** app | ❌ | ✅ |
             | CPU headroom on the AR9331 | comfortable | **thin** — can glitch under load |
-            | Knob / web volume, Wi-Fi setup AP, signed OTA, recovery | ✅ | ✅ |
-            | Recommended for | **most users** | only if you want Home-app integration |
 
-            **Recommendation:** flash **`*-ap1-sysupgrade.signed.bin`** unless you specifically
-            need the Apple Home app — AP1 is lossless, lighter, and keeps Snapcast multi-room.
+            **Default is AirPlay 1** — lossless, lighter, with Beep multi-room. Switch to AirPlay 2
+            in the app if you want Apple Home / native AirPlay-2 grouping.
 
-            ### Experimental: `*-replaynet-*` (new multi-room engine)
-            AirPlay-1 + **`replaynet`**, a from-scratch multi-room sync engine that replaces
-            Snapcast with one small daemon (no C++/boost). Sub-ms sync and dropout-free
-            steady-state validated on hardware (real-time playout thread + click-free
-            resampler); the full double-tap → group → AirPlay path is wired but not yet fully
-            soak-tested. **TRL 3 — for testing.** Flash `*-replaynet-sysupgrade.signed.bin` to
-            try it; flash an `ap1`/`ap2` image to go back.
+            > **Snapcast has been retired** — `replaynet` (a small from-scratch sync engine, no
+            > C++/boost) is now the multi-room engine for AirPlay 1. **TRL 4 — multi-room is still
+            > being tuned;** expect occasional rough edges.
 
             ### Install (already on Beep Revival)
-            In the device's web admin → **Update firmware**, upload your chosen
+            In the device's web admin → **Update firmware**, upload
             **`*-sysupgrade.signed.bin`**. The device verifies the usign signature
             against its baked-in key before flashing. No unsigned bypass without the
             physical triple-tap.
 
             ### First-time flash (still on stock/cloud firmware)
             You need a 3.3 V USB-UART adapter. Follow **[docs/FLASHING-WALKTHROUGH.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/FLASHING-WALKTHROUGH.md)**.
-            RAM-boot the `*-initramfs-kernel.bin`, then sysupgrade the `*-ap1-sysupgrade.bin` (or ap2).
+            RAM-boot the `*-initramfs-kernel.bin`, then sysupgrade the `*-sysupgrade.bin`.
 
             ### Verify a download
             `usign -V -m <image> -p beep-ota.pub -x <(head -2 *.signed.bin)` — or check `SHA256SUMS`.

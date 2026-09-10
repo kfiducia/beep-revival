@@ -41,35 +41,9 @@ sp_apply() {
 	fi
 }
 
-apply_solo() {
-	log "role=solo"
-	sp_backend alsa
-	svc snapclient disable; svc snapclient stop
-	svc snapserver disable; svc snapserver stop
-	sp_apply
-	rm -f "$RUNDIR/group" 2>/dev/null
-}
-
-apply_primary() {
-	log "role=primary"
-	mkdir -p "$RUNDIR"
-	[ -p "$FIFO" ] || { rm -f "$FIFO"; mkfifo -m 666 "$FIFO"; }
-	sp_backend pipe
-	svc snapserver enable;  svc snapserver restart
-	svc snapclient enable;  svc snapclient restart
-	sp_apply
-	echo primary > "$RUNDIR/group"
-}
-
-apply_member() {
-	log "role=member server=$(uci -q get beep.main.group_server || echo mDNS)"
-	mkdir -p "$RUNDIR"
-	sp_backend alsa
-	svc shairport-sync disable; svc shairport-sync stop   # members don't receive AirPlay; the primary does
-	svc snapserver disable; svc snapserver stop
-	svc snapclient enable;  svc snapclient restart
-	echo member > "$RUNDIR/group"
-}
+# NOTE: the Snapcast engine (apply_solo/apply_primary/apply_member) has been RETIRED —
+# replaynet fully replaces it and snapcast is no longer built into the image. The engine
+# selector below is now `replaynet` (AirPlay 1 multi-room) or `none` (AirPlay 2 native).
 
 role="${1:-apply}"
 [ "$role" = apply ] && role="$(uci -q get beep.main.group_role || echo solo)"
@@ -79,7 +53,7 @@ role="${1:-apply}"
 # snapserver+snapclient with the single `replaynet --node` daemon (consensus + fan-out;
 # docs/REPLAYNET.md). Roles map onto its control socket; shairport pipes decoded PCM to
 # the node FIFO and fires become-source/leave from its session hooks.
-ENGINE="$(uci -q get beep.main.group_engine 2>/dev/null || echo snapcast)"
+ENGINE="$(uci -q get beep.main.group_engine 2>/dev/null || echo replaynet)"
 RN=/usr/sbin/replaynet
 RNFIFO=/tmp/beep-pcm
 AVOL=/usr/libexec/beep/beep-airplay-volume
@@ -168,25 +142,33 @@ if [ "$ENGINE" = replaynet ]; then
 	esac
 	exit 0
 fi
-# --- snapcast engine (default) -------------------------------------------------------
+# --- ENGINE = none : AirPlay-2-native (converged AP2 mode) + safe default ------------
+# In AirPlay-2 mode shairport does its OWN multi-room grouping (Apple Home, PTP-synced)
+# and plays straight to ALSA — there is NO local multi-room engine, and the AR9331 has
+# no CPU headroom to run one alongside AAC decode. So: make sure replaynet is fully
+# DOWN and out of the audio path, keep shairport direct-to-ALSA, and make the grouping
+# gestures inert (AP2 grouping is driven from the phone, not the knob). This branch also
+# serves as the safe default for any unrecognised engine. Snapcast has been retired
+# (dropped from the image); its services are stopped defensively if ever present.
+# beep-airplay-mode owns the shairport service_type / nqptp; here we only guarantee the
+# local-engine posture. See beep-airplay-mode and docs/CONVERGED-IMAGE-DESIGN.md.
+if [ "$(uci -q get replaynet.node.enabled 2>/dev/null)" = 1 ]; then
+	"$RN" --ctl leave >/dev/null 2>&1
+	uci -q set replaynet.node.enabled=0; uci -q commit replaynet
+fi
+svc replaynet disable; svc replaynet stop
+svc snapserver disable 2>/dev/null; svc snapserver stop 2>/dev/null   # legacy: snapcast retired
+svc snapclient disable 2>/dev/null; svc snapclient stop 2>/dev/null
+sp_backend alsa            # shairport -> ALSA directly (AirPlay-2 native playback)
+sp_airplay_vol_hook off    # the alsa backend drives Master via the mixer natively
+# Strip any replaynet session hooks (become-source/leave) left over from AP1 mode, so an
+# AP2 stream doesn't fire them at a now-dead replaynet control socket on every play.
+[ -f "$SPCONF" ] && sed -i '/^sessioncontrol = {/,/^};/d' "$SPCONF"
+rm -f "$RUNDIR/group" 2>/dev/null
 
 case "$role" in
-	primary) uci -q set beep.main.group_role=primary; uci -q commit beep; apply_primary ;;
-	member)  uci -q set beep.main.group_role=member;  uci -q commit beep; apply_member ;;
-	solo)    uci -q set beep.main.group_role=solo;    uci -q commit beep; apply_solo ;;
-	toggle)  # double-tap: leave the group if in it, else (re)join as member.
-		# Persist the role (so it survives reboot, like the explicit cases above) and
-		# echo it on the last line so callers (beep-action / LED feedback) can tell
-		# join from leave.
-		if [ -f "$RUNDIR/group" ]; then
-			uci -q set beep.main.group_role=solo;   uci -q commit beep; apply_solo;   echo solo
-		else
-			uci -q set beep.main.group_role=member; uci -q commit beep; apply_member; echo member
-		fi ;;
-	status)
-		printf 'role=%s snapserver=%s snapclient=%s\n' \
-			"$(uci -q get beep.main.group_role || echo solo)" \
-			"$(pidof snapserver >/dev/null && echo up || echo down)" \
-			"$(pidof snapclient >/dev/null && echo up || echo down)" ;;
-	*) echo "usage: beep-group apply|primary|member|solo|toggle|status" >&2; exit 1 ;;
+	toggle)  log "double-tap ignored in AirPlay-2 mode — grouping is controlled from the phone (Apple Home)"; echo ap2 ;;
+	status)  echo "engine=ap2-native (shairport AirPlay-2, no local multi-room engine)" ;;
+	*)       sp_apply; echo ap2 ;;   # ensure the AirPlay-2 receiver is up
 esac
+exit 0
