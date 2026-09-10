@@ -1732,6 +1732,23 @@ done:
 
 struct rn_peer { struct rn_dev d; char ip[64]; int64_t last_seen; int used; };
 
+/* Join the gossip multicast group on the default interface. Returns 0 when the
+ * membership is in place — freshly joined, or already joined (EADDRINUSE, e.g. on a
+ * periodic refresh) — and -1 only while no usable interface exists yet. The join is
+ * split out of socket creation and RETRIED by the caller: at boot the daemon can come
+ * up before wifi has associated, when IP_ADD_MEMBERSHIP fails with ENODEV. A one-shot
+ * join there left gossip discovery — and thus multi-room grouping — dead until a
+ * manual restart. Retrying also re-establishes membership after a wifi re-association
+ * drops it. */
+static int mc_join(int fd)
+{
+	struct ip_mreq mr; memset(&mr, 0, sizeof(mr));
+	mr.imr_multiaddr.s_addr = inet_addr(RN_GOSSIP_GROUP);
+	mr.imr_interface.s_addr = htonl(INADDR_ANY);
+	if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr)) == 0) return 0;
+	return errno == EADDRINUSE ? 0 : -1;
+}
+
 static int mc_socket(uint16_t port)
 {
 	int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1741,13 +1758,9 @@ static int mc_socket(uint16_t port)
 	struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
 	sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY); sa.sin_port = htons(port);
 	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { plog("ERROR","gossip bind: %s",strerror(errno)); close(fd); return -1; }
-	struct ip_mreq mr; memset(&mr, 0, sizeof(mr));
-	mr.imr_multiaddr.s_addr = inet_addr(RN_GOSSIP_GROUP);
-	mr.imr_interface.s_addr = htonl(INADDR_ANY);
-	if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr)) < 0)
-		plog("WARN", "multicast join: %s (LAN gossip may not work)", strerror(errno));
 	unsigned char ttl = 1;
 	setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+	/* Multicast membership is joined (and retried) by the caller — see mc_join(). */
 	return fd;
 }
 
@@ -1832,6 +1845,8 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 
 	int mc = mc_socket(gossip_port);
 	if (mc < 0) return 1;
+	int mc_joined = 0;           /* gossip multicast membership state (retried below) */
+	int64_t last_mc_join = 0;
 
 	int ctl = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un un; memset(&un, 0, sizeof(un));
@@ -1867,6 +1882,18 @@ static int run_node(const char *id, const char *group, int signal_lvl, uint16_t 
 		}
 
 		int64_t now = now_ns();
+		/* (Re)join the gossip multicast group, retrying until it takes. The daemon can
+		 * start before wifi has associated (IP_ADD_MEMBERSHIP -> ENODEV); without this,
+		 * gossip discovery — and therefore multi-room grouping — stayed dead until a
+		 * manual replaynet restart. Fast retry (1s) until the first success, then a slow
+		 * refresh (10s) that also restores membership after a wifi re-association. */
+		if (now - last_mc_join >= (mc_joined ? 10000000000ll : 1000000000ll)) {
+			last_mc_join = now;
+			int ok = (mc_join(mc) == 0);
+			if (ok && !mc_joined)       plog("INFO", "gossip multicast joined");
+			else if (!ok && mc_joined)  plog("WARN", "gossip multicast membership lost — retrying");
+			mc_joined = ok;
+		}
 		if (now - last_gossip >= 1000000000ll) { gossip_send(mc, &self, gossip_port); last_gossip = now; }
 
 		struct pollfd pfd[2] = { { mc, POLLIN, 0 }, { ctl, POLLIN, 0 } };
