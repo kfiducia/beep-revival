@@ -1,9 +1,14 @@
 # Build artifacts / large binaries — reproducible via scripts/ (see README).
-images/
+images/*
 prebuilt/
 *.ko
 *.wav
 *.bin
+
+# ...EXCEPT the lean RAM-boot image: it's a first-flash TOOL (audio-only initramfs
+# you boot from RAM to bootstrap the real flash), not a rebuildable release artifact,
+# so it is tracked and referenced by docs/FLASHING-WALKTHROUGH.md. See its sha256 there.
+!images/lean-initramfs-kernel.bin
 
 # macOS / editor cruft
 .DS_Store
