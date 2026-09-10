@@ -345,6 +345,25 @@ CONFIG_PACKAGE_beepd=y
 # DORMANT under the default snapcast engine. MULTIROOM=replaynet (below) drops snapcast
 # and makes replaynet the active engine.
 CONFIG_PACKAGE_replaynet=y
+# Lyrion Music Server (LMS / Squeezebox) player. Independent of the AirPlay mode, so it
+# lives in the COMMON set (it used to be AP1-only, which silently dropped it from the
+# converged / AirPlay-2 image). The "custom" variant compiles ONLY codecs the 400MHz
+# no-FPU AR9331 handles in real time — FLAC (fixed-point), MP3 (libmpg123), Opus
+# (fixed-point) — not AAC/WMA/ALAC/soxr (LMS transcodes to FLAC server-side). Beep ships
+# its own init+config in the rootfs overlay to bind volume to the "Master" softvol.
+CONFIG_PACKAGE_squeezelite-custom=y
+CONFIG_SQUEEZELITE_FLAC=y
+CONFIG_SQUEEZELITE_MP3_MPG123=y
+CONFIG_SQUEEZELITE_OPUS=y
+# Explicitly OFF (defaults are n; pinned for clarity + to document the CPU rationale):
+# CONFIG_SQUEEZELITE_AAC is not set
+# CONFIG_SQUEEZELITE_MP3_MAD is not set
+# CONFIG_SQUEEZELITE_VORBIS is not set
+# CONFIG_SQUEEZELITE_VORBIS_TREMOR is not set
+# CONFIG_SQUEEZELITE_WMA_ALAC is not set
+# CONFIG_SQUEEZELITE_RESAMPLE is not set
+# CONFIG_SQUEEZELITE_DSD is not set
+# CONFIG_SQUEEZELITE_SSL is not set
 CONFIG_PACKAGE_kmod-beep-i2s=y
 # audio: codec + machine glue + ALSA
 CONFIG_PACKAGE_kmod-sound-core=y
@@ -423,25 +442,8 @@ cat >> .config <<'CFG'
 CONFIG_PACKAGE_snapserver=y
 CONFIG_PACKAGE_snapclient=y
 CONFIG_PACKAGE_libatomic=y
-# Lyrion Music Server (LMS / Squeezebox) player. The "custom" variant compiles ONLY
-# the codecs the 400MHz no-FPU AR9331 can handle in real time — FLAC (fixed-point
-# decoder), MP3 (libmpg123, integer), Opus (fixed-point) — and leaves out the
-# CPU-killers: AAC/HE-AAC (faad), WMA/ALAC (ffmpeg), and soxr resampling. LMS
-# transcodes anything else to FLAC on the server side. Beep ships its own
-# init+config in the rootfs overlay to bind volume to the "Master" softvol.
-CONFIG_PACKAGE_squeezelite-custom=y
-CONFIG_SQUEEZELITE_FLAC=y
-CONFIG_SQUEEZELITE_MP3_MPG123=y
-CONFIG_SQUEEZELITE_OPUS=y
-# Explicitly OFF (defaults are n; pinned for clarity + to document the CPU rationale):
-# CONFIG_SQUEEZELITE_AAC is not set
-# CONFIG_SQUEEZELITE_MP3_MAD is not set
-# CONFIG_SQUEEZELITE_VORBIS is not set
-# CONFIG_SQUEEZELITE_VORBIS_TREMOR is not set
-# CONFIG_SQUEEZELITE_WMA_ALAC is not set
-# CONFIG_SQUEEZELITE_RESAMPLE is not set
-# CONFIG_SQUEEZELITE_DSD is not set
-# CONFIG_SQUEEZELITE_SSL is not set
+# (LMS player squeezelite-custom is selected in the COMMON package set above — it is
+# independent of the AirPlay mode, so both AP1 and the converged image ship it.)
 # CONFIG_PACKAGE_libffmpeg-full is not set
 # CONFIG_PACKAGE_libffmpeg-audio-dec is not set
 CFG

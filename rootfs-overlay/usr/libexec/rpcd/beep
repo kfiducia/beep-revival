@@ -50,7 +50,13 @@ ap_mode() { [ "$(uget wireless.setup.disabled)" = "0" ] && echo true || echo fal
 ssh_on()  { pidof dropbear >/dev/null 2>&1 && echo 1 || echo 0; }   # actual running state, not a pref
 
 version() {
-	[ -f /etc/beep-version ] && { cat /etc/beep-version; return; }
+	# /etc is an overlay: if a stale overlay whiteout hides the baked stamp, fall back to
+	# the pristine squashfs copy (/rom), which can't be overlay-deleted. Use -s (non-empty)
+	# so a 0-byte file can't shadow a good copy. Last resort: the OpenWrt release string.
+	local f
+	for f in /etc/beep-version /rom/etc/beep-version; do
+		[ -s "$f" ] && { cat "$f"; return; }
+	done
 	. /etc/openwrt_release 2>/dev/null; printf '%s' "${DISTRIB_DESCRIPTION:-unknown}"
 }
 
