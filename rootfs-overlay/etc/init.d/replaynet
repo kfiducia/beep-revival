@@ -40,6 +40,7 @@ start_service() {
 	local group;  config_get group  node group ''
 	local device; config_get device node device 'default'
 	local signal; config_get signal node signal '0'
+	local codec;  config_get codec  node codec 'off'
 
 	# shairport (pipe backend) writes decoded PCM here; ensure the FIFO node exists so
 	# both sides have something to open.
@@ -50,6 +51,9 @@ start_service() {
 	# self-pins SCHED_FIFO + mlockall so the wifi stack can't preempt playout into a dropout.
 	procd_set_param command "$PROG" --node --id "$id" --alsa "$device" --pcm "$FIFO" --signal "$signal" --resample
 	[ -n "$group" ] && procd_append_param command --group "$group"
+	# --codec (off|adaptive|flac): adaptive auto-degrades the fan-out raw->FLAC under wifi
+	# contention. Default off until HW-validated; only the group source acts on it.
+	[ -n "$codec" ] && procd_append_param command --codec "$codec"
 	# nice floor as a fallback; the sink promotes its playout thread to SCHED_FIFO at runtime.
 	procd_set_param nice -12
 	procd_set_param respawn

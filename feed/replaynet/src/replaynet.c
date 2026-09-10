@@ -72,18 +72,44 @@
 #include <alsa/asoundlib.h>       /* real WM8524 sink — step (c); the OpenWrt package
                                      builds with -DRN_ALSA and links -lasound */
 #endif
+#ifdef RN_FLAC
+/* adaptive transport compression — the package builds with -DRN_FLAC and links -lFLAC (libflac
+ * is in the 24.10 feeds). Gated so the host --selftest build (no libFLAC) still links; the pure
+ * codec controller below is NOT gated. */
+#include <FLAC/stream_encoder.h>
+#include <FLAC/stream_decoder.h>
+#endif
 
 /* ------------------------------------------------------------------ wire */
 
 #define RN_MAGIC        0x52504C59u   /* "RPLY" */
-#define RN_WIRE_VERSION 2
+#define RN_WIRE_VERSION 3             /* v3: AUDIO body carries a codec tag + decoded n_frames */
 
 #define RN_MSG_AUDIO 1
 #define RN_MSG_PING  2
 #define RN_MSG_PONG  3
 
 #define RN_HDR_SIZE       16
-#define RN_AUDIO_FIXED    28          /* audio body bytes before the PCM */
+/* AUDIO body (before the payload), all big-endian:
+ *   off 0  u64 track_samples       head-sample index @ 44100
+ *   off 8  u64 discarded_samples   source-side cumulative drop/pad (step d)
+ *   off 16 u64 source_time_ns      source monotonic clock when track_samples is emitted
+ *   off 24 u32 n_frames            DECODED PCM frames this message represents (codec-independent)
+ *   off 28 u32 payload_len         bytes of payload following (raw S16_LE PCM, or FLAC)
+ *   off 32 u8  codec (+3 rsv)      RN_CODEC_RAW | RN_CODEC_FLAC
+ * n_frames (not payload_len) drives sample math, so compression doesn't perturb the schedule. */
+#define RN_AUDIO_FIXED    36
+#define RN_AB_TRACK    0
+#define RN_AB_DISCARD  8
+#define RN_AB_STIME   16
+#define RN_AB_NFRAMES 24
+#define RN_AB_PLEN    28
+#define RN_AB_CODEC   32
+#define RN_CODEC_RAW   0
+#define RN_CODEC_FLAC  1
+/* A FLAC frame can, worst case (verbatim subframes), slightly exceed the raw chunk; give the
+ * receive path headroom over RN_CHUNK_BYTES. Decoded output is always <= RN_CHUNK_BYTES. */
+#define RN_MAX_PAYLOAD (RN_CHUNK_BYTES + 4096)
 #define RN_PING_SIZE      8
 #define RN_PONG_SIZE      24
 
@@ -154,7 +180,7 @@ static uint64_t be64_get(const uint8_t *p)
  * arithmetic on sample VALUES, so it must read/write them as little-endian explicitly —
  * on the big-endian AR9331 a native int16 view would be byte-swapped garbage. These
  * assemble/disassemble LE bytes by hand, so they are correct on any CPU. */
-#ifdef RN_ALSA
+#if defined(RN_ALSA) || defined(RN_FLAC)
 static int16_t le16_get(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
 static void    le16_put(uint8_t *p, int16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)((uint16_t)v >> 8); }
 #endif
@@ -208,6 +234,15 @@ static void on_signal(int s) { (void)s; g_stop = 1; }
  * (rn_rsmp) instead of drop/insert. Opt-in (--resample) so the proven drop/insert path
  * stays the default; a forked node player (spawn_player) inherits this via the global. */
 static int g_resample = 0;
+
+/* Adaptive transport codec (--codec). The fan-out streams raw S16_LE by default; when a
+ * member's wifi link starves (POLLOUT backpressure), it degrades the whole group to FLAC to
+ * fit the contended channel, and recovers to raw when the air clears. Set once in main() and
+ * read by run_fanout (a forked child inherits it via this global, like g_resample). */
+#define RN_CODEC_MODE_OFF      0     /* raw only, never compress */
+#define RN_CODEC_MODE_ADAPTIVE 1     /* raw, auto-degrade to FLAC under contention */
+#define RN_CODEC_MODE_FLAC     2     /* always FLAC */
+static int g_codec_mode = RN_CODEC_MODE_OFF;
 
 static void plog(const char *level, const char *fmt, ...)
 {
@@ -616,6 +651,123 @@ static int source_answer_ping(int sock)
 	return write_full(sock, out, sizeof(out));
 }
 
+/* ---- adaptive transport-codec controller (pure; unit-tested in --selftest) --------------
+ * A skipped frame = a sink whose wifi link couldn't accept a chunk in time (the existing
+ * POLLOUT backpressure). Track a decaying skip rate; when it stays high, degrade the whole
+ * group raw->FLAC to shrink the ~1.4 Mbps stream ~2-3x so it fits a contended channel; when
+ * the air has been clean for a sustained window, recover to raw. Asymmetric hysteresis —
+ * degrade FAST, recover SLOW — avoids flapping (the repo's tuning history shows quick/
+ * symmetric toggles get disproved by ear). At ~38 chunks/s the EMA (alpha 1/8) tracks over
+ * ~0.2 s; recovery waits ~16 s of zero skips. */
+struct rn_codec_ctl {
+	int ema_x1000;      /* skip-rate EMA, per-mille of recent chunks that skipped a sink */
+	int clean_chunks;   /* consecutive fully-clean chunks (drives recovery) */
+};
+static void rn_codec_ctl_init(struct rn_codec_ctl *c) { c->ema_x1000 = 0; c->clean_chunks = 0; }
+
+#define RN_CODEC_DEGRADE_X1000  200   /* skip EMA >=20% -> degrade raw->FLAC */
+#define RN_CODEC_RECOVER_CHUNKS 600   /* ~16 s (38 chunks/s) fully clean -> recover FLAC->raw */
+
+/* Fold this chunk's result in and return the codec to use for the NEXT chunk. `cur` is the
+ * codec used this chunk; `skipped_sinks` is how many sinks were skipped on it. */
+static int rn_codec_decide(struct rn_codec_ctl *c, int mode, int cur, int skipped_sinks)
+{
+	int sample = skipped_sinks > 0 ? 1000 : 0;
+	c->ema_x1000 += (sample - c->ema_x1000) / 8;          /* integer EMA, alpha = 1/8 */
+	if (skipped_sinks > 0) c->clean_chunks = 0;
+	else if (c->clean_chunks <= RN_CODEC_RECOVER_CHUNKS) c->clean_chunks++;
+
+	if (mode == RN_CODEC_MODE_OFF)  return RN_CODEC_RAW;
+	if (mode == RN_CODEC_MODE_FLAC) return RN_CODEC_FLAC;
+	/* ADAPTIVE */
+	if (cur == RN_CODEC_RAW)
+		return (c->ema_x1000 >= RN_CODEC_DEGRADE_X1000) ? RN_CODEC_FLAC : RN_CODEC_RAW;
+	return (c->clean_chunks >= RN_CODEC_RECOVER_CHUNKS) ? RN_CODEC_RAW : RN_CODEC_FLAC;
+}
+
+#ifdef RN_FLAC
+/* Self-contained FLAC per message: encode one LE-S16 chunk to a standalone FLAC payload, and
+ * decode one back. Standalone framing => raw<->FLAC switches are gapless and a sink can join
+ * mid-stream (no shared stream header). Both return byte count written, or -1 on error. */
+struct rn_flac_encbuf { uint8_t *p; int cap; int len; int err; };
+static FLAC__StreamEncoderWriteStatus
+rn_flac_enc_cb(const FLAC__StreamEncoder *e, const FLAC__byte b[], size_t n,
+               uint32_t samples, uint32_t frame, void *client)
+{
+	(void)e; (void)samples; (void)frame;
+	struct rn_flac_encbuf *o = client;
+	if (o->len + (int)n > o->cap) { o->err = 1; return FLAC__STREAM_ENCODER_WRITE_STATUS_FATAL_ERROR; }
+	memcpy(o->p + o->len, b, n); o->len += (int)n;
+	return FLAC__STREAM_ENCODER_WRITE_STATUS_OK;
+}
+static int rn_flac_encode(const uint8_t *pcm_le, int nframes, uint8_t *out, int out_cap)
+{
+	if (nframes <= 0 || nframes > RN_CHUNK_FRAMES) return -1;
+	FLAC__StreamEncoder *enc = FLAC__stream_encoder_new();
+	if (!enc) return -1;
+	static FLAC__int32 samples[RN_CHUNK_FRAMES * RN_CHANNELS];   /* forked single-threaded child */
+	for (int i = 0; i < nframes * RN_CHANNELS; i++)
+		samples[i] = (FLAC__int32)le16_get(pcm_le + i * 2);
+	struct rn_flac_encbuf o = { out, out_cap, 0, 0 };
+	FLAC__stream_encoder_set_channels(enc, RN_CHANNELS);
+	FLAC__stream_encoder_set_bits_per_sample(enc, 16);
+	FLAC__stream_encoder_set_sample_rate(enc, RN_RATE);
+	FLAC__stream_encoder_set_blocksize(enc, (uint32_t)nframes);
+	FLAC__stream_encoder_set_compression_level(enc, 0);         /* fast; still ~2x on music */
+	FLAC__stream_encoder_set_streamable_subset(enc, true);
+	int ok = (FLAC__stream_encoder_init_stream(enc, rn_flac_enc_cb, NULL, NULL, NULL, &o)
+	          == FLAC__STREAM_ENCODER_INIT_STATUS_OK);
+	if (ok && !FLAC__stream_encoder_process_interleaved(enc, samples, (uint32_t)nframes)) o.err = 1;
+	if (ok) FLAC__stream_encoder_finish(enc);
+	FLAC__stream_encoder_delete(enc);
+	return (ok && !o.err) ? o.len : -1;
+}
+
+struct rn_flac_decbuf {
+	const uint8_t *in; int inlen, inpos;
+	uint8_t *out; int outcap, outlen, err;
+};
+static FLAC__StreamDecoderReadStatus
+rn_flac_dec_read(const FLAC__StreamDecoder *d, FLAC__byte buf[], size_t *bytes, void *client)
+{
+	(void)d; struct rn_flac_decbuf *b = client;
+	int avail = b->inlen - b->inpos;
+	if (avail <= 0) { *bytes = 0; return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM; }
+	int n = (int)*bytes; if (n > avail) n = avail;
+	memcpy(buf, b->in + b->inpos, (size_t)n); b->inpos += n; *bytes = (size_t)n;
+	return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
+}
+static FLAC__StreamDecoderWriteStatus
+rn_flac_dec_write(const FLAC__StreamDecoder *d, const FLAC__Frame *fr,
+                  const FLAC__int32 *const buf[], void *client)
+{
+	(void)d; struct rn_flac_decbuf *b = client;
+	int n = (int)fr->header.blocksize;
+	if (b->outlen + n * RN_FRAME_BYTES > b->outcap) { b->err = 1; return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT; }
+	for (int i = 0; i < n; i++) {
+		le16_put(b->out + b->outlen, (int16_t)buf[0][i]); b->outlen += 2;
+		le16_put(b->out + b->outlen, (int16_t)buf[1][i]); b->outlen += 2;
+	}
+	return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+}
+static void rn_flac_dec_err(const FLAC__StreamDecoder *d, FLAC__StreamDecoderErrorStatus s, void *client)
+{ (void)d; (void)s; ((struct rn_flac_decbuf *)client)->err = 1; }
+
+static int rn_flac_decode(const uint8_t *payload, int plen, uint8_t *pcm_le, int out_cap)
+{
+	FLAC__StreamDecoder *dec = FLAC__stream_decoder_new();
+	if (!dec) return -1;
+	struct rn_flac_decbuf b = { payload, plen, 0, pcm_le, out_cap, 0, 0 };
+	int ok = (FLAC__stream_decoder_init_stream(dec, rn_flac_dec_read, NULL, NULL, NULL, NULL,
+	              rn_flac_dec_write, NULL, rn_flac_dec_err, &b)
+	          == FLAC__STREAM_DECODER_INIT_STATUS_OK);
+	if (ok) FLAC__stream_decoder_process_until_end_of_stream(dec);
+	FLAC__stream_decoder_finish(dec);
+	FLAC__stream_decoder_delete(dec);
+	return (ok && !b.err) ? b.outlen : -1;
+}
+#endif /* RN_FLAC */
+
 /* Pace toward target_real_ns (1x playback) while answering clock PINGs the instant
  * they arrive — the source spends most of a chunk period idle here, so servicing pings
  * during the wait keeps the request/response delay symmetric and the sink's offset
@@ -678,10 +830,15 @@ static int run_source(const char *pcm_path, const char *host, uint16_t port)
 		pcm_host_to_le(pcm, send_bytes);   /* shairport writes host-order S16; wire is S16_LE */
 		int64_t src_t = now_ns();
 		hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)(RN_AUDIO_FIXED + send_bytes));
-		be64_put(frame + RN_HDR_SIZE + 0, track_samples);
-		be64_put(frame + RN_HDR_SIZE + 8, 0);                 /* discarded_samples: step d */
-		be64_put(frame + RN_HDR_SIZE + 16, (uint64_t)src_t);
-		be32_put(frame + RN_HDR_SIZE + 24, (uint32_t)send_bytes);
+		be64_put(frame + RN_HDR_SIZE + RN_AB_TRACK,   track_samples);
+		be64_put(frame + RN_HDR_SIZE + RN_AB_DISCARD, 0);       /* discarded_samples: step d */
+		be64_put(frame + RN_HDR_SIZE + RN_AB_STIME,   (uint64_t)src_t);
+		be32_put(frame + RN_HDR_SIZE + RN_AB_NFRAMES, (uint32_t)(send_bytes / RN_FRAME_BYTES));
+		be32_put(frame + RN_HDR_SIZE + RN_AB_PLEN,    (uint32_t)send_bytes);
+		frame[RN_HDR_SIZE + RN_AB_CODEC] = RN_CODEC_RAW;
+		frame[RN_HDR_SIZE + RN_AB_CODEC + 1] = 0;
+		frame[RN_HDR_SIZE + RN_AB_CODEC + 2] = 0;
+		frame[RN_HDR_SIZE + RN_AB_CODEC + 3] = 0;
 		if (write_full(sock, frame, RN_HDR_SIZE + RN_AUDIO_FIXED + send_bytes) < 0) {
 			plog("ERROR", "send frame %u: %s", seq, strerror(errno));
 			rc = 1; break;
@@ -729,12 +886,15 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 	if (nsock == 0) { plog("ERROR", "no sinks reachable"); if (in != STDIN_FILENO) close(in); return 1; }
 	plog("INFO", "fan-out to %d sink(s)", nsock);
 
-	uint8_t frame[RN_HDR_SIZE + RN_AUDIO_FIXED + RN_CHUNK_BYTES];
-	uint8_t *pcm = frame + RN_HDR_SIZE + RN_AUDIO_FIXED;
+	uint8_t frame[RN_HDR_SIZE + RN_AUDIO_FIXED + RN_MAX_PAYLOAD];
+	uint8_t *payload = frame + RN_HDR_SIZE + RN_AUDIO_FIXED;   /* raw PCM or FLAC bytes */
+	uint8_t pcm[RN_CHUNK_BYTES];                               /* one source chunk (host->LE) */
 	uint64_t track_samples = 0;
 	uint32_t seq = 0;
 	int64_t pace_start = 0;
 	int rc = 0;
+	int group_codec = RN_CODEC_RAW;          /* codec in force for the group right now */
+	struct rn_codec_ctl cc; rn_codec_ctl_init(&cc);   /* adaptive skip-rate / hysteresis state */
 
 	while (!g_stop) {
 		if (pace_start == 0) pace_start = real_now_ns();
@@ -774,20 +934,39 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 		size_t send_bytes = (size_t)r - (size_t)r % RN_FRAME_BYTES;
 		if (send_bytes) {
 			pcm_host_to_le(pcm, send_bytes);   /* shairport writes host-order S16; wire is S16_LE */
-			hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)(RN_AUDIO_FIXED + send_bytes));
-			be64_put(frame + RN_HDR_SIZE + 0, track_samples);
-			be64_put(frame + RN_HDR_SIZE + 8, 0);
-			be64_put(frame + RN_HDR_SIZE + 16, (uint64_t)now_ns());
-			be32_put(frame + RN_HDR_SIZE + 24, (uint32_t)send_bytes);
-			size_t total = RN_HDR_SIZE + RN_AUDIO_FIXED + send_bytes;
-			int alive = 0;
+			uint32_t nframes = (uint32_t)(send_bytes / RN_FRAME_BYTES);
+			int codec = RN_CODEC_RAW;
+			uint32_t plen = (uint32_t)send_bytes;
+			int use_flac = 0;
+#ifdef RN_FLAC
+			if (group_codec == RN_CODEC_FLAC) {
+				int enc = rn_flac_encode(pcm, (int)nframes, payload, RN_MAX_PAYLOAD);
+				if (enc > 0 && enc < (int)send_bytes) {   /* only if it actually shrank */
+					codec = RN_CODEC_FLAC; plen = (uint32_t)enc; use_flac = 1;
+				}
+			}
+#endif
+			if (!use_flac) memcpy(payload, pcm, send_bytes);   /* raw, or FLAC that didn't help */
+			hdr_pack(frame, RN_MSG_AUDIO, seq, (uint32_t)RN_AUDIO_FIXED + plen);
+			be64_put(frame + RN_HDR_SIZE + RN_AB_TRACK,   track_samples);
+			be64_put(frame + RN_HDR_SIZE + RN_AB_DISCARD, 0);
+			be64_put(frame + RN_HDR_SIZE + RN_AB_STIME,   (uint64_t)now_ns());
+			be32_put(frame + RN_HDR_SIZE + RN_AB_NFRAMES, nframes);
+			be32_put(frame + RN_HDR_SIZE + RN_AB_PLEN,    plen);
+			frame[RN_HDR_SIZE + RN_AB_CODEC]     = (uint8_t)codec;
+			frame[RN_HDR_SIZE + RN_AB_CODEC + 1] = 0;
+			frame[RN_HDR_SIZE + RN_AB_CODEC + 2] = 0;
+			frame[RN_HDR_SIZE + RN_AB_CODEC + 3] = 0;
+			size_t total = RN_HDR_SIZE + RN_AUDIO_FIXED + plen;
+			int alive = 0, skipped_now = 0;
 			for (int i = 0; i < nsock; i++) {
 				if (sock[i] < 0) continue;
 				/* Only send when the sink can accept a whole frame NOW. A sink that is slow
 				 * (still clock-locking, or wifi-congested) must NOT block the fan-out — that
 				 * deadlocks: blocked here we can't answer its pings, so it never locks, so it
 				 * never drains. Skip its frame instead (its schedule servo rides the gap);
-				 * drop it only if it stays stuck for seconds. */
+				 * drop it only if it stays stuck for seconds. A skip also feeds the adaptive
+				 * codec controller (sustained skips -> degrade the group to FLAC). */
 				struct pollfd wp = { .fd = sock[i], .events = POLLOUT };
 				if (poll(&wp, 1, 0) > 0 && (wp.revents & POLLOUT)) {
 					if (write_full(sock[i], frame, total) < 0) {
@@ -797,15 +976,23 @@ static int run_fanout(const char *pcm_path, char peers[][64], int npeers, uint16
 					skips[i] = 0; alive++;
 				} else if (++skips[i] > 500) {           /* ~13 s stuck -> give up on it */
 					plog("WARN", "sink %d stuck (no drain) — dropping", i);
-					close(sock[i]); sock[i] = -1;
+					close(sock[i]); sock[i] = -1; skipped_now++;
 				} else {
 					if (skips[i] == 1) plog("WARN", "sink %d not draining — skipping frames", i);
-					alive++;                              /* temporarily lagging, keep it */
+					alive++; skipped_now++;               /* temporarily lagging, keep it */
 				}
 			}
 			if (alive == 0) { plog("INFO", "all sinks gone"); break; }
-			track_samples += send_bytes / RN_FRAME_BYTES;
+			track_samples += nframes;
 			seq++;
+			/* fold this chunk's skips in and choose the codec for the NEXT chunk */
+			int next_codec = rn_codec_decide(&cc, g_codec_mode, group_codec, skipped_now);
+			if (next_codec != group_codec) {
+				plog("INFO", "codec: %s -> %s (skip-ema %d/1000, %d sink(s) skipped)",
+				     group_codec == RN_CODEC_FLAC ? "flac" : "raw",
+				     next_codec  == RN_CODEC_FLAC ? "flac" : "raw", cc.ema_x1000, skipped_now);
+				group_codec = next_codec;
+			}
 		}
 		if ((size_t)r < RN_CHUNK_BYTES) {
 			/* FIFO writer (shairport) closed the pipe: end-of-session or a brief gap
@@ -985,27 +1172,44 @@ static int run_sink(const char *out_path, uint16_t port)
 		if (h.type != RN_MSG_AUDIO) {
 			plog("ERROR", "unexpected msg type %u", h.type); rc = 1; break;
 		}
-		if (h.body_len < RN_AUDIO_FIXED || h.body_len - RN_AUDIO_FIXED > sizeof(pcm)) {
+		if (h.body_len < RN_AUDIO_FIXED || h.body_len - RN_AUDIO_FIXED > RN_MAX_PAYLOAD) {
 			plog("ERROR", "audio body_len %u out of range", h.body_len); rc = 1; break;
 		}
 		uint8_t afix[RN_AUDIO_FIXED];
 		if (read_full(sock, afix, sizeof(afix)) != (ssize_t)sizeof(afix)) { rc = 1; break; }
-		uint64_t track_samples = be64_get(afix + 0);
-		int64_t  source_time_ns = (int64_t)be64_get(afix + 16);
-		uint32_t pcm_len = be32_get(afix + 24);
-		if (pcm_len != h.body_len - RN_AUDIO_FIXED || pcm_len > sizeof(pcm)) {
-			plog("ERROR", "audio pcm_len mismatch"); rc = 1; break;
+		uint64_t track_samples = be64_get(afix + RN_AB_TRACK);
+		int64_t  source_time_ns = (int64_t)be64_get(afix + RN_AB_STIME);
+		uint32_t n_frames    = be32_get(afix + RN_AB_NFRAMES);
+		uint32_t payload_len = be32_get(afix + RN_AB_PLEN);
+		int codec = afix[RN_AB_CODEC];
+		if (payload_len != h.body_len - RN_AUDIO_FIXED || payload_len > RN_MAX_PAYLOAD ||
+		    n_frames > RN_CHUNK_FRAMES) {
+			plog("ERROR", "audio len/frames out of range"); rc = 1; break;
 		}
 		if (h.seq != expect_seq)
 			plog("WARN", "audio seq gap: expected %u got %u", expect_seq, h.seq);
-		if (pcm_len) {
-			if (read_full(sock, pcm, pcm_len) != (ssize_t)pcm_len) {
-				plog("ERROR", "short pcm for frame %u", h.seq); rc = 1; break;
+		if (payload_len) {
+			uint8_t wire[RN_MAX_PAYLOAD];
+			if (read_full(sock, wire, payload_len) != (ssize_t)payload_len) {
+				plog("ERROR", "short payload for frame %u", h.seq); rc = 1; break;
 			}
+			uint32_t pcm_len = 0;
+			if (codec == RN_CODEC_RAW) {
+				if (payload_len > sizeof(pcm)) { plog("ERROR", "raw payload too big"); rc = 1; break; }
+				memcpy(pcm, wire, payload_len); pcm_len = payload_len;
+			} else if (codec == RN_CODEC_FLAC) {
+#ifdef RN_FLAC
+				int d = rn_flac_decode(wire, (int)payload_len, pcm, (int)sizeof(pcm));
+				if (d < 0) { plog("ERROR", "flac decode failed"); rc = 1; break; }
+				pcm_len = (uint32_t)d;
+#else
+				plog("ERROR", "flac payload but no decoder in this build"); rc = 1; break;
+#endif
+			} else { plog("ERROR", "unknown codec %d", codec); rc = 1; break; }
 			if (write_full(out, pcm, pcm_len) < 0) {
 				plog("ERROR", "pcm write: %s", strerror(errno)); rc = 1; break;
 			}
-			total_frames += pcm_len / RN_FRAME_BYTES;
+			total_frames += n_frames;
 		}
 
 		/* --- timestamp sync + drift (needs a clock-offset estimate first) ---
@@ -1177,14 +1381,35 @@ static int alsa_read_msg(int sock, struct clock_est *ce, struct pcmring *ring,
 	uint8_t afix[RN_AUDIO_FIXED];
 	if (h.body_len < RN_AUDIO_FIXED ||
 	    read_full(sock, afix, RN_AUDIO_FIXED) != RN_AUDIO_FIXED) return -1;
-	*track_samples = be64_get(afix + 0);
-	*source_time_ns = (int64_t)be64_get(afix + 16);
-	uint32_t pcm_len = be32_get(afix + 24);
-	if (pcm_len != h.body_len - RN_AUDIO_FIXED || pcm_len > RN_CHUNK_BYTES) {
-		plog("ERROR", "pcm_len bad"); return -1;
+	*track_samples = be64_get(afix + RN_AB_TRACK);
+	*source_time_ns = (int64_t)be64_get(afix + RN_AB_STIME);
+	uint32_t n_frames    = be32_get(afix + RN_AB_NFRAMES);
+	uint32_t payload_len = be32_get(afix + RN_AB_PLEN);
+	int codec = afix[RN_AB_CODEC];
+	if (payload_len != h.body_len - RN_AUDIO_FIXED || payload_len > RN_MAX_PAYLOAD ||
+	    n_frames > RN_CHUNK_FRAMES) {
+		plog("ERROR", "audio len/frames bad"); return -1;
 	}
+	/* Decode (if compressed) into `tmp` as raw S16_LE PCM; the ring/servo/resampler are all
+	 * PCM downstream and never see the codec. pcm_len = decoded bytes = n_frames * frame. */
 	uint8_t tmp[RN_CHUNK_BYTES];
-	if (pcm_len && read_full(sock, tmp, pcm_len) != (ssize_t)pcm_len) return -1;
+	uint32_t pcm_len = 0;
+	if (payload_len) {
+		uint8_t wire[RN_MAX_PAYLOAD];
+		if (read_full(sock, wire, payload_len) != (ssize_t)payload_len) return -1;
+		if (codec == RN_CODEC_RAW) {
+			if (payload_len > RN_CHUNK_BYTES) { plog("ERROR", "raw payload too big"); return -1; }
+			memcpy(tmp, wire, payload_len); pcm_len = payload_len;
+		} else if (codec == RN_CODEC_FLAC) {
+#ifdef RN_FLAC
+			int d = rn_flac_decode(wire, (int)payload_len, tmp, (int)sizeof(tmp));
+			if (d < 0) { plog("ERROR", "flac decode failed"); return -1; }
+			pcm_len = (uint32_t)d;
+#else
+			plog("ERROR", "flac payload but no decoder in this build"); return -1;
+#endif
+		} else { plog("ERROR", "unknown codec %d", codec); return -1; }
+	}
 	if (pcm_len && rb_push(ring, tmp, pcm_len) != pcm_len)
 		plog("WARN", "ring overrun — dropped audio (sink not draining fast enough)");
 	/* contiguous stream: next source sample after this chunk's head + its frames */
@@ -1938,6 +2163,49 @@ static int selftest(void)
 		CHECK(memcmp(d0, c, sizeof(d0))==0);
 	}
 
+	/* --- adaptive codec controller: modes + asymmetric hysteresis --- */
+	{
+		struct rn_codec_ctl c;
+		/* OFF always raw, FLAC always flac, regardless of skips */
+		rn_codec_ctl_init(&c);
+		CHECK(rn_codec_decide(&c, RN_CODEC_MODE_OFF,  RN_CODEC_RAW, 5)  == RN_CODEC_RAW);
+		rn_codec_ctl_init(&c);
+		CHECK(rn_codec_decide(&c, RN_CODEC_MODE_FLAC, RN_CODEC_RAW, 0)  == RN_CODEC_FLAC);
+
+		/* ADAPTIVE: a lone skip must NOT flip (no flap); sustained skips degrade fast */
+		rn_codec_ctl_init(&c);
+		CHECK(rn_codec_decide(&c, RN_CODEC_MODE_ADAPTIVE, RN_CODEC_RAW, 1) == RN_CODEC_RAW);
+		int cur = RN_CODEC_RAW, i;
+		for (i = 0; i < 50 && cur == RN_CODEC_RAW; i++)
+			cur = rn_codec_decide(&c, RN_CODEC_MODE_ADAPTIVE, cur, 1);   /* every chunk skips */
+		CHECK(cur == RN_CODEC_FLAC && i < 20);                              /* degraded, and fast */
+
+		/* recovery is SLOW: still FLAC after a short clean window, raw after a long one */
+		cur = rn_codec_decide(&c, RN_CODEC_MODE_ADAPTIVE, cur, 0);
+		CHECK(cur == RN_CODEC_FLAC);
+		for (i = 0; i < RN_CODEC_RECOVER_CHUNKS + 5 && cur == RN_CODEC_FLAC; i++)
+			cur = rn_codec_decide(&c, RN_CODEC_MODE_ADAPTIVE, cur, 0);   /* clean chunks */
+		CHECK(cur == RN_CODEC_RAW && i >= RN_CODEC_RECOVER_CHUNKS - 1);
+	}
+
+#ifdef RN_FLAC
+	/* --- FLAC transport codec: encode -> decode is lossless (bit-exact) --- */
+	{
+		int nf = RN_CHUNK_FRAMES;
+		static uint8_t src[RN_CHUNK_BYTES], out[RN_CHUNK_BYTES];
+		static uint8_t enc[RN_MAX_PAYLOAD];
+		for (int i = 0; i < nf * RN_CHANNELS; i++) {          /* deterministic wave, S16_LE */
+			int16_t v = (int16_t)((i * 977 + (i >> 3) * 13) & 0xffff);
+			le16_put(src + i * 2, v);
+		}
+		int el = rn_flac_encode(src, nf, enc, sizeof(enc));
+		CHECK(el > 0);                                        /* encoded */
+		int dl = rn_flac_decode(enc, el, out, sizeof(out));
+		CHECK(dl == nf * RN_FRAME_BYTES);                     /* decoded full chunk */
+		CHECK(el > 0 && dl == nf * RN_FRAME_BYTES && memcmp(src, out, dl) == 0);  /* lossless */
+	}
+#endif
+
 	if (fails == 0) fprintf(stderr, "SELFTEST OK\n");
 	return fails ? 1 : 0;
 	#undef CHECK
@@ -2136,6 +2404,7 @@ static void usage(const char *argv0)
 		"  %s --sink   --listen <port>  [--out <file|-> | --alsa <device>] [--resample]\n"
 		"  %s --node   --id <name> [--group <id>] [--listen <audio-port>]\n"
 		"            [--alsa <dev>] [--pcm <src>] [--signal N] [--no-audio] [--resample]\n"
+		"            [--codec off|adaptive|flac]   (adaptive: auto FLAC under wifi contention)\n"
 		"  %s --fanout --peers <ip1,ip2,...> [--listen <port>] [--pcm <src>]\n"
 		"  %s --ctl <cmd>          (become-source | join <id> | leave | status)\n"
 		"  %s --selftest\n"
@@ -2174,7 +2443,7 @@ int main(int argc, char **argv)
 	char host[64] = "127.0.0.1";
 	uint16_t port = 0;
 
-	enum { O_ID = 1001, O_GROUP, O_GPORT, O_SIGNAL, O_NOAUDIO, O_CTLPATH, O_PEERS, O_FANOUT, O_RESAMPLE, O_SIMULATE };
+	enum { O_ID = 1001, O_GROUP, O_GPORT, O_SIGNAL, O_NOAUDIO, O_CTLPATH, O_PEERS, O_FANOUT, O_RESAMPLE, O_SIMULATE, O_CODEC };
 	static const struct option opts[] = {
 		{ "source", no_argument,       0, 'S' },
 		{ "sink",   no_argument,       0, 'K' },
@@ -2195,6 +2464,7 @@ int main(int argc, char **argv)
 		{ "signal",   required_argument, 0, O_SIGNAL },
 		{ "no-audio", no_argument,       0, O_NOAUDIO },
 		{ "resample", no_argument,       0, O_RESAMPLE },
+		{ "codec",    required_argument, 0, O_CODEC },
 		{ "ctl-path", required_argument, 0, O_CTLPATH },
 		{ "fake-clock-offset-ns", required_argument, 0, 'F' },
 		{ "fake-clock-rate-ppm",  required_argument, 0, 'R' },
@@ -2231,6 +2501,16 @@ int main(int argc, char **argv)
 		case O_SIGNAL: signal_lvl = atoi(optarg); break;
 		case O_NOAUDIO: no_audio = 1; break;
 		case O_RESAMPLE: g_resample = 1; break;
+		case O_CODEC:
+			if (!strcmp(optarg, "off"))           g_codec_mode = RN_CODEC_MODE_OFF;
+			else if (!strcmp(optarg, "adaptive")) g_codec_mode = RN_CODEC_MODE_ADAPTIVE;
+			else if (!strcmp(optarg, "flac"))     g_codec_mode = RN_CODEC_MODE_FLAC;
+			else { fprintf(stderr, "--codec must be off|adaptive|flac\n"); return 2; }
+#ifndef RN_FLAC
+			if (g_codec_mode != RN_CODEC_MODE_OFF)
+				fprintf(stderr, "warning: --codec %s ignored (built without FLAC)\n", optarg);
+#endif
+			break;
 		case O_CTLPATH: ctl_path = optarg; break;
 		case 'F': g_fake_clock_offset_ns = strtoll(optarg, NULL, 10); break;
 		case 'R': g_fake_clock_rate_ppm = strtoll(optarg, NULL, 10); break;
