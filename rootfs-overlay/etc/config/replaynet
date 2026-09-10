@@ -12,6 +12,12 @@ config node 'node'
 	# Election metric: higher wins a leaderless group; 0 = tie-break by id. A hook could
 	# set this from wifi RSSI so the best-connected Beep tends to source.
 	option signal '0'
+	# Transport codec (needs a FLAC-enabled build): 'off' = always raw S16 (~1.4 Mbps);
+	# 'adaptive' = raw normally, auto-degrade the group to FLAC (~2-3x smaller) when a
+	# member's wifi link starves, recover to raw when it clears; 'flac' = always FLAC.
+	# Default 'off' until adaptive is validated on hardware. Only the source (group
+	# primary) acts on this; sinks decode whatever the wire says.
+	option codec 'off'
 	# Opt-in. OFF by default so the current snapcast pipeline is unaffected until the
 	# multi-room engine is switched to replaynet (build flag / UCI). To turn on:
 	#   uci set replaynet.node.enabled=1; uci commit replaynet

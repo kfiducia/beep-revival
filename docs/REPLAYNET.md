@@ -323,3 +323,28 @@ Known deltas to expect: drop/insert correction can click on a sharp drift step (
 resampler is the fix); a weak-wifi sink (< ~−70 dBm) can't carry ~1.4 Mbps raw PCM and will
 glitch (FLAC/opus is the fix); `beep-source snapcast on/off` still uses the "snapcast" verb
 though it drives replaynet under the engine switch.
+
+## Adaptive transport compression (FLAC)
+
+Under wifi contention the ~1.4 Mbps raw S16 fan-out can't fit a busy channel and members
+starve (measured: `sink N not draining — skipping frames`, ring starvation, re-lock storms).
+The source can compress the fan-out with **FLAC** (lossless, integer/no-FPU, ~2–3× → ~500–700
+kbps) so it fits.
+
+- **Wire (v3):** the AUDIO body carries a `codec` tag (raw | flac) and a decoded `n_frames`
+  count, so sample math is codec-independent and downstream (clock lock, schedule servo,
+  resampler) never sees the codec. Each message is a **self-contained** FLAC frame, so raw↔FLAC
+  switches are gapless and a sink can join mid-stream. The source encodes **once** and fans the
+  same compressed bytes to every member.
+- **Adaptive (`--codec adaptive`):** a pure controller (`rn_codec_decide`, unit-tested) watches
+  the existing per-sink POLLOUT skip signal via a decaying EMA. It degrades raw→FLAC **fast** on
+  sustained skips and recovers FLAC→raw **slowly** after a long clean window (asymmetric
+  hysteresis; no flap). So there is **zero encode cost in clear air** — FLAC only engages while a
+  link is actually starving. Modes: `off` (raw), `adaptive`, `flac` (always).
+- **Config:** `uci set replaynet.node.codec=adaptive` (default `off`); the init passes
+  `--codec`. Build: `feed/replaynet/Makefile` links `-lFLAC` (`+libflac`, already in the feeds)
+  and defines `-DRN_FLAC`.
+- **Validation:** `--selftest` covers the controller decision table and a FLAC encode→decode
+  **bit-exact** round-trip. Primary CPU risk is FLAC encode on the already-loaded source
+  (~38 chunks/s); measure on hardware before promoting `codec` off `off`. Opus (~10×, lossy,
+  heavier) is a later escalation for links too weak even for FLAC.

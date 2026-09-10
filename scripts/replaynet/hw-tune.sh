@@ -64,13 +64,13 @@ metrics(){
     END{ printf "snap_events=%d err_max_ms=%.1f ring_min_ms=%d", ev, emax*1000/44100, rmin }'
 }
 
-echo "== cross-compile current $SRC for mips_24kc (-DRN_ALSA) =="
+echo "== cross-compile current $SRC for mips_24kc (-DRN_ALSA -DRN_FLAC) =="
 scp $O -o BatchMode=yes "$SRC" "$IMAC:/tmp/replaynet.c" >/dev/null 2>&1 || { echo "!! scp to imac failed"; exit 1; }
 ssh $O -o BatchMode=yes "$IMAC" "$DOCKER cp /tmp/replaynet.c $CONTAINER:/tmp/replaynet.c >/dev/null && $DOCKER exec $CONTAINER sh -lc '
   export STAGING_DIR=/build/openwrt/staging_dir
   TC=\$STAGING_DIR/toolchain-mips_24kc_gcc-13.3.0_musl; SR=\$STAGING_DIR/target-mips_24kc_musl
   rm -f /tmp/replaynet-alsa
-  \$TC/bin/mips-openwrt-linux-musl-gcc -Wall -Wextra -O2 -DRN_ALSA --sysroot=\$SR -I\$SR/usr/include -o /tmp/replaynet-alsa /tmp/replaynet.c -L\$SR/usr/lib -lasound 2>&1 | head
+  \$TC/bin/mips-openwrt-linux-musl-gcc -Wall -Wextra -O2 -DRN_ALSA -DRN_FLAC --sysroot=\$SR -I\$SR/usr/include -o /tmp/replaynet-alsa /tmp/replaynet.c -L\$SR/usr/lib -lasound -lFLAC 2>&1 | head
   \$TC/bin/mips-openwrt-linux-musl-strip /tmp/replaynet-alsa && echo BUILT
 ' && $DOCKER cp $CONTAINER:/tmp/replaynet-alsa /tmp/replaynet-alsa >/dev/null && echo PULLED" 2>&1 | filt | tail -3
 scp $O -o BatchMode=yes "$IMAC:/tmp/replaynet-alsa" /tmp/replaynet-alsa >/dev/null 2>&1 || { echo "!! pull binary failed"; exit 1; }
