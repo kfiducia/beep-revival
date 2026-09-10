@@ -11,10 +11,12 @@ name: CI (lint + unit tests)
 # smoke checklist in tests/README.md.
 #
 # ┌───────────────────────────────────────────────────────────────────────────────────┐
-# │ REPORT-ONLY: every job has `continue-on-error: true`, so a failure is VISIBLE (red  │
-# │ on the job) but the overall run stays green and never blocks a merge. To make a     │
-# │ check gate merges instead: remove its `continue-on-error` line AND add the job as a │
-# │ required status check in the branch-protection settings for `main`.                 │
+# │ BLOCKING: these jobs gate merges into `main`. A failure fails the run, and all three │
+# │ are required status checks in the branch-protection settings for `main`, so a red    │
+# │ check prevents the PR from merging until it is fixed. (They earned this by being      │
+# │ clean + reproducible — shellcheck is version-pinned; see below.) To temporarily make  │
+# │ a check advisory again, add `continue-on-error: true` back to its job AND drop it     │
+# │ from the required checks in branch protection.                                        │
 # └───────────────────────────────────────────────────────────────────────────────────┘
 
 on:
@@ -30,7 +32,6 @@ jobs:
   shell-lint:
     name: shellcheck
     runs-on: ubuntu-latest
-    continue-on-error: true          # REPORT-ONLY (see header) — remove to make blocking
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck (pinned)
@@ -64,7 +65,6 @@ jobs:
   shell-tests:
     name: shell unit tests
     runs-on: ubuntu-latest
-    continue-on-error: true          # REPORT-ONLY (see header) — remove to make blocking
     steps:
       - uses: actions/checkout@v4
       - name: Run the shell test suite
@@ -73,7 +73,6 @@ jobs:
   c-build:
     name: compile beepd (-Wall -Wextra)
     runs-on: ubuntu-latest
-    continue-on-error: true          # REPORT-ONLY (see header) — remove to make blocking
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain + headers
@@ -81,5 +80,6 @@ jobs:
       - name: Compile the userspace daemon with warnings on
         # -c only (no link): proves beepd.c compiles cleanly against ALSA/i2c headers.
         # The i2s kernel module (feed/beep-i2s) needs a target kernel tree and is not built
-        # here. Warnings are surfaced but do not fail the job (report-only; no -Werror).
+        # here. No -Werror, so warnings stay non-fatal, but a genuine compile ERROR fails
+        # this (now-blocking) job.
         run: gcc -std=gnu11 -Wall -Wextra -c feed/beepd/src/beepd.c -o /tmp/beepd.o
