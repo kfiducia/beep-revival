@@ -14,7 +14,7 @@ The knob is a rotary encoder with a push-button, read by the STM8 companion MCU.
 |---|---|
 | **Turn** | Volume. Clockwise = up. One LED of the ring per detent; the arc fills from the bottom (6 o'clock) clockwise. Volume is shared — AirPlay, the web slider, and the knob all move the same level. |
 | **Single tap** | **Mute / unmute** (soft-mute: saves the level, drops to 0, restores on the next tap). The ring shows a calm dim breath while muted. |
-| **Double tap** | **Join the active multi-room group** (Snapcast). *Experimental — see multi-room note.* |
+| **Double tap** | **Join the active multi-room group** (toggle: join if solo, leave if grouped). The ring plays a "joining" animation through the connect window. *Experimental — see multi-room note.* |
 | **Hold ~10 s** | **Enter Wi-Fi setup.** The ring fills to full as you hold; release when full → the device raises its `BeepRevival-Setup-XXXXXX` AP. This is the *only* way to open setup on a configured device (deliberate physical action — it can't be forced by a deauth attack). |
 | **Hold ~30 s** | **Factory reset** (wipes config + reboots). After the ring first fills (10 s), it empties and fills a **second** time on a brighter background — that second sweep is the reset countdown. Release before it completes if you didn't mean it. |
 
@@ -34,6 +34,7 @@ device's real 24 Hz.
 | **Boot** | <img src="ui/boot.gif" width="150" alt="Boot"> | A power-on smiley, then "wings" rise from the bottom (6 o'clock) up both sides as it boots, then a full ring as it hands off to live status. |
 | **Wi-Fi connecting** | <img src="ui/wifi-connecting.gif" width="150" alt="Wi-Fi connecting"> | A single bright dot orbiting a dim full track while joining Wi-Fi. |
 | **Wi-Fi setup mode** | <img src="ui/wifi-setup.gif" width="150" alt="Wi-Fi setup"> | A comet chasing around a dark ring — "reconfigure me" (setup AP is up). |
+| **Joining multi-room** | <img src="ui/joining.gif" width="150" alt="Joining multi-room group"> | After a double-tap: two dots sweep down from the top, meet at the bottom, and the ring flashes once — "linking up." Loops through the (silent) ~5 s connect until audio starts, then hands off to the Playing twinkle. Distinct from the single-dot Wi-Fi spinner. |
 | **Idle** (connected, nothing playing) | <img src="ui/idle.gif" width="150" alt="Idle"> | Just the **bottom two LEDs** gently breathing — on, at rest. |
 | **Sleep** (deep idle) | <img src="ui/sleep.gif" width="150" alt="Sleep"> | The same bottom two dots, slower and dimmer, after a longer idle. |
 | **Volume** (while turning) | <img src="ui/volume.gif" width="150" alt="Volume"> | A bright arc from the bottom, clockwise, over a dim full-scale track. 50% = the whole left side. |
