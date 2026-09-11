@@ -5,8 +5,9 @@ name: Release
 # AP1 (AirPlay-1 + Snapcast, the default), AP2 (AirPlay-2, no Snapcast), and
 # replaynet (AirPlay-1 + the fresh replaynet multi-room engine, no Snapcast) — signs
 # each sysupgrade with the usign OTA key (repo secret BEEP_OTA_SEC), and publishes a
-# GitHub Release with the signed .bins + raw images + a first-flash initramfs +
-# checksums + pubkey.
+# GitHub Release with the signed + raw sysupgrade images + checksums + pubkey.
+# (The first-flash RAM-boot uses the lean initramfs tracked in the repo, not a release
+# asset — see the "Assemble release assets" step.)
 #
 # One-time setup: add the private OTA key as a repo secret named BEEP_OTA_SEC
 #   gh secret set BEEP_OTA_SEC < ~/beep-ota-signing/beep-ota.sec
@@ -291,9 +292,10 @@ jobs:
           echo "::endgroup::"
           cp "$(ls "$OUT"/*8dev_carambola2-squashfs-sysupgrade.bin)" \
              "/tmp/collected/beep-revival-${V}-sysupgrade.bin"
-          # initramfs for the first-time UART RAM-boot
-          cp "$(ls "$OUT"/*8dev_carambola2-initramfs-kernel.bin)" \
-             "/tmp/collected/beep-revival-${V}-initramfs-kernel.bin"
+          # NOTE: we deliberately do NOT publish the full *-initramfs-kernel.bin.
+          # The first-flash RAM-boot uses the LEAN initramfs tracked in the repo
+          # (images/lean-initramfs-kernel.bin) — the full initramfs OOM-panics on the
+          # 64MB board, so releasing it every time was dead weight and a footgun.
           ls -la /tmp/collected/
 
       - name: Upload image artifacts
@@ -363,7 +365,6 @@ jobs:
           mkdir -p release
           cp /tmp/collected/beep-revival-${V}-sysupgrade.bin        release/
           cp /tmp/collected/beep-revival-${V}-sysupgrade.signed.bin release/
-          cp /tmp/collected/beep-revival-${V}-initramfs-kernel.bin  release/
           cp rootfs-overlay/etc/beep-ota.pub release/beep-ota.pub
           ( cd release && sha256sum * > SHA256SUMS )
           ls -la release/
@@ -409,7 +410,10 @@ jobs:
 
             ### First-time flash (still on stock/cloud firmware)
             You need a 3.3 V USB-UART adapter. Follow **[docs/FLASHING-WALKTHROUGH.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/FLASHING-WALKTHROUGH.md)**.
-            RAM-boot the `*-initramfs-kernel.bin`, then sysupgrade the `*-sysupgrade.bin`.
+            The walkthrough RAM-boots the **lean** image shipped in the repo
+            (`images/lean-initramfs-kernel.bin`), then sysupgrades the `*-sysupgrade.bin`
+            from this release. *(Do not RAM-boot a full `-initramfs-kernel.bin` — it
+            OOM-panics on the 64 MB board; that's why it isn't published here.)*
 
             ### Verify a download
             `usign -V -m <image> -p beep-ota.pub -x <(head -2 *.signed.bin)` — or check `SHA256SUMS`.
