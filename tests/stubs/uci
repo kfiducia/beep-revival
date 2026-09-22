@@ -1,0 +1,29 @@
+#!/bin/sh
+# Minimal file-backed uci stub for the off-device test harness.
+#
+# Only the verbs the wifi-revert helper uses are modeled: `export <pkg>` prints the
+# package's saved state, `import <pkg>` replaces it from stdin, `commit` is a no-op
+# (import already persisted). Each package is one file under $UCI_STATE_DIR. `get`/`set`
+# are stubbed as best-effort no-ops so unrelated callers don't crash; extend as needed.
+: "${UCI_STATE_DIR:=${TMPDIR:-/tmp}/uci-stub}"
+mkdir -p "$UCI_STATE_DIR" 2>/dev/null
+
+# Drop leading option flags (-q, -c <dir>, etc.) that don't change these verbs' behavior.
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-q|-m|-f|-n) shift ;;
+		-c|-d|-t|-P) shift 2 ;;
+		*) break ;;
+	esac
+done
+
+cmd="${1:-}"; shift 2>/dev/null || true
+case "$cmd" in
+	export) [ -n "${1:-}" ] && cat "$UCI_STATE_DIR/$1" 2>/dev/null || true ;;
+	import) [ -n "${1:-}" ] && cat > "$UCI_STATE_DIR/$1" ;;
+	commit) : ;;
+	get)    : ;;   # best-effort no-op (prints nothing, exits 0)
+	set|add_list|delete|del_list|rename|reorder) : ;;
+	*)      : ;;
+esac
+exit 0
