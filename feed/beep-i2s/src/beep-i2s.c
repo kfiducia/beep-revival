@@ -4,23 +4,19 @@
  *
  * Modern (kernel 6.x, devicetree) rewrite of franzflasch/ar9331-i2s-alsa's
  * ath79-i2s.c + the Carambola2 board init in ath-carambola2.c. Register layout
- * and clock table are carried over verbatim (see driver-i2s/ath79-stereo-regs.h)
- * and cross-checked against the stock, unstripped ath_i2s.ko (MBOX TX control
- * @ mbox+0x24: START=bit1 / RESUME=bit2 / STOP=bit0).
+ * and clock table are carried over verbatim (see ath79-stereo-regs-dt.h) and
+ * cross-checked against the now-public stock Beep firmware source
+ * (shawnlewis/beepmusic-orig, device/ath_i2s/ath_i2s.c + 933x.h). MBOX DMA
+ * control bits are STOP(PAUSE)=bit0 / START=bit1 / RESUME=bit2, identical on the
+ * RX and TX control registers; playback runs on the RX MBOX channel (control
+ * @ mbox+0x1c) — see BEEP_PLAYBACK_TX.
  *
  * SCOPE / STATUS:
- *   This file is the "control plane" — clock/format/enable + the GPIO function
- *   mux — which is fully specifiable from the register map and is expected to be
- *   correct.  The "data plane" (the MBOX descriptor-ring DMA + ALSA PCM) is the
- *   part the research flagged as genuine bring-up work; the reference for it is
- *   vendored at driver-i2s/ath79-mbox.c and ath79-pcm.c, and the port task is
- *   spelled out in driver-i2s/PORTING.md.  Until that PCM component lands, this
- *   driver registers the CPU DAI so `aplay -D hw` fails cleanly with "no PCM"
- *   rather than silently — which is the correct Phase-1 checkpoint.
- *
- * Bench verification order (see driver-i2s/PORTING.md): RAM-boot -> confirm the
- * soundcard node appears -> Saleae on CK/WS/MCK to prove the clocks match
- * hw_params BEFORE trusting analog -> then speaker-test.
+ *   Two halves. The "control plane" — clock/format/enable + the GPIO function mux
+ *   — is fully specifiable from the register map. The "data plane" (the MBOX
+ *   descriptor-ring DMA + ALSA PCM component, below) was the bring-up work; it is
+ *   now implemented and hardware-tested (see the pinmux, mbox-reset, and
+ *   integer-periods notes below, all from live-device debugging).
  */
 
 #include <linux/module.h>
@@ -51,13 +47,25 @@
 #define AR934X_DMA_MBOX_DMA_POLICY_TX_FIFO_THRESH_SHIFT	4
 
 /*
- * PLAYBACK DMA CHANNEL — the one real ambiguity in this port.
- *   0 = MBOX0 *RX* regs (0x18 base / 0x1c ctrl / int bit10) — the franzflasch
- *       working reference's choice ("RX regs for playback").
- *   1 = MBOX0 *TX* regs (0x20 base / 0x24 ctrl / int bit6)  — what the Beep's
- *       own stock ath_i2s.ko used per the disassembly (PORTING.md).
- * Both are internally consistent; a wrong pick = silence (no crash). Flip this
- * one line and rebuild if RX is silent.
+ * PLAYBACK DMA CHANNEL — RESOLVED (was flagged as the one real ambiguity).
+ *   0 = MBOX0 *RX* regs (0x18 base / 0x1c ctrl / int bit10) — CORRECT for playback.
+ *   1 = MBOX0 *TX* regs (0x20 base / 0x24 ctrl / int bit6)  — the CAPTURE channel.
+ *
+ * The AR9331 MBOX naming is counterintuitive: the stock driver drives PLAYBACK on
+ * the RX channel and CAPTURE on the TX channel. The now-public stock source is
+ * unambiguous — device/ath_i2s/ath_i2s.c:
+ *   - ath_i2s_wr()/ath_i2s_write() (playback) sets `mode = 0` and calls
+ *     ath_i2s_dma_start(0) -> ATH_MBOX_DMA_RX_CONTROL0 (0x1c), enabling
+ *     ATH_MBOX_RX_DMA_COMPLETE (bit10).
+ *   - ath_i2s_read() (capture) sets `mode = 1` -> ATH_MBOX_DMA_TX_CONTROL0 (0x24),
+ *     ATH_MBOX_TX_DMA_COMPLETE (bit6).
+ * So RX-for-playback is confirmed three ways: stock source, the franzflasch
+ * reference, and working audio on the device. The earlier "stock used TX" note
+ * (from a binary disassembly) mis-read the *capture* path's TX writes.
+ *
+ * Keep the macro only as a bring-up escape hatch: a wrong pick = silence (no
+ * crash). Setting it to 1 selects the stock *capture* channel and is wrong for
+ * playback — do not change 0 without a hardware A/B.
  */
 #define BEEP_PLAYBACK_TX 0
 
