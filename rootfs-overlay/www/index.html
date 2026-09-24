@@ -226,6 +226,39 @@ summary::-webkit-details-marker{display:none}
     </div>
     </div><!-- /lms-section -->
 
+    <!-- Button gestures: what a tap / double-tap on the knob does. The safety/recovery
+         gestures (triple-tap = firmware unlock, 10s hold = setup, 30s hold = reset) and
+         turn = volume are fixed and intentionally not shown. "Auto" = source-aware default. -->
+    <div class="card">
+      <h2>🔘 Button gestures</h2>
+      <p class="mut">What a <b>tap</b> or <b>double-tap</b> on the knob does. <b>Auto</b> picks a
+        sensible action for whatever&rsquo;s playing — play/pause on a Music Server, mute on AirPlay.
+        Volume (turn), Wi-Fi setup (10s hold) and factory reset (30s hold) are fixed.</p>
+      <div style="margin-top:12px">
+        <label for="g-tap">Single tap</label>
+        <select id="g-tap" onchange="saveGesture('tap',this.value)">
+          <option value="auto">Auto (recommended)</option>
+          <option value="mute">Mute / unmute</option>
+          <option value="lms_playpause">Music Server: play / pause</option>
+          <option value="lms_next">Music Server: next track</option>
+          <option value="group_toggle">Multi-room: join / leave</option>
+          <option value="none">Nothing</option>
+        </select>
+      </div>
+      <div style="margin-top:12px">
+        <label for="g-dtap">Double tap</label>
+        <select id="g-dtap" onchange="saveGesture('double_tap',this.value)">
+          <option value="auto">Auto (recommended)</option>
+          <option value="mute">Mute / unmute</option>
+          <option value="lms_playpause">Music Server: play / pause</option>
+          <option value="lms_next">Music Server: next track</option>
+          <option value="group_toggle">Multi-room: join / leave</option>
+          <option value="none">Nothing</option>
+        </select>
+      </div>
+      <p class="mut" id="g-status" style="margin-top:10px"></p>
+    </div>
+
     <div class="card">
       <h2>System</h2>
       <details class="mb">
@@ -330,6 +363,7 @@ function refresh(){return call("status").then(function(s){
   setAirplayUI(s);
   setGroupUI(s);
   setLmsUI(s);
+  setGesturesUI(s);
   setSshUI(s);
   el("foot").textContent="Beep Revival — open firmware · "+(s.name||"");
 }).catch(function(e){ // status failed -> session invalid/expired, needs login
@@ -490,6 +524,22 @@ function saveLms(){ // re-apply LMS as the source with the entered server addres
 function setLms(en){ // underlying source switch (0=AirPlay, 1=LMS) used by setSource()
   call("set_lms",{enabled:en,server:el("lms-srv").value.trim()}).then(function(){setTimeout(refresh,1500);})
     .catch(function(e){toast(e&&e.message||e,true);});
+}
+// Button gestures: reflect status.gesture_* into the selects; write via set_gestures.
+function setGesturesUI(s){
+  var t=(s&&s.gesture_tap)||"auto", d=(s&&s.gesture_double_tap)||"auto";
+  var gt=el("g-tap"), gd=el("g-dtap");
+  if(gt&&!gt.matches(":focus"))gt.value=t;
+  if(gd&&!gd.matches(":focus"))gd.value=d;
+}
+function saveGesture(which,val){
+  var p={}; p[which]=val;
+  call("set_gestures",p).then(function(r){
+    if(r&&r.error){toast(r.error,true);return;}
+    el("g-status").textContent="Saved.";
+    setTimeout(function(){el("g-status").textContent="";},1500);
+    refresh();
+  }).catch(function(e){toast(e&&e.message||e,true);});
 }
 function savePw(){var p=el("np").value;if(p.length<6){toast("Min 6 characters",true);return;}
   call("set_password",{password:p}).then(function(){el("np").value="";toast("Password set");})

@@ -98,8 +98,20 @@ status() {
 	local lmsen lmssrv
 	lmsen="$(uget squeezelite.options.enabled)"; case "$lmsen" in 0|1) ;; *) lmsen=0;; esac
 	lmssrv="$(jesc "$(uget squeezelite.options.server_addr)")"
-	printf '"lms_enabled":%s,"lms_server":"%s","lms_running":%s,"airplay_mode":"%s"}\n' "$lmsen" "$lmssrv" \
+	printf '"lms_enabled":%s,"lms_server":"%s","lms_running":%s,"airplay_mode":"%s",' "$lmsen" "$lmssrv" \
 		"$(pidof squeezelite >/dev/null 2>&1 && echo true || echo false)" "$apmode"
+	# Configurable button gestures (see set_gestures + usr/libexec/beep/beep-action). Default
+	# "auto" (source-aware). jesc'd defensively even though set_gestures whitelists the values.
+	local gtap gdt
+	gtap="$(uget beep.gestures.tap)"; [ -n "$gtap" ] || gtap=auto
+	gdt="$(uget beep.gestures.double_tap)"; [ -n "$gdt" ] || gdt=auto
+	printf '"gesture_tap":"%s","gesture_double_tap":"%s"}\n' "$(jesc "$gtap")" "$(jesc "$gdt")"
+}
+
+# Whitelist of actions a configurable gesture may map to (mirrors beep-action's
+# run_gesture_action). "auto" = the source-aware default resolved at gesture time.
+valid_gesture_action() {
+	case "$1" in auto|mute|lms_playpause|lms_next|group_toggle|none) return 0;; *) return 1;; esac
 }
 
 scan() {
@@ -273,11 +285,28 @@ set_ssh() {
 	esac
 }
 
+set_gestures() {
+	# Set the configurable gesture->action map. Params: tap, double_tap (either/both,
+	# optional). Only these two are settable; the safety/recovery gestures (triple-tap,
+	# holds) and turn=volume are deliberately fixed and NOT exposed here. Each value must
+	# pass valid_gesture_action(); "auto" restores the source-aware default.
+	local t d changed=0
+	t="$(jf '@.tap')"; d="$(jf '@.double_tap')"
+	if [ -n "$t" ]; then valid_gesture_action "$t" || { echo '{"error":"invalid tap action"}'; return; }; fi
+	if [ -n "$d" ]; then valid_gesture_action "$d" || { echo '{"error":"invalid double_tap action"}'; return; }; fi
+	[ -n "$t$d" ] && uci -q set beep.gestures=gestures   # idempotent: ensure the section exists
+	[ -n "$t" ] && { uci -q set beep.gestures.tap="$t"; changed=1; }
+	[ -n "$d" ] && { uci -q set beep.gestures.double_tap="$d"; changed=1; }
+	[ "$changed" = 1 ] && uci -q commit beep
+	printf '{"ok":true,"tap":"%s","double_tap":"%s"}\n' \
+		"$(jesc "$(uget beep.gestures.tap || echo auto)")" "$(jesc "$(uget beep.gestures.double_tap || echo auto)")"
+}
+
 reboot_dev() { (sleep 1; reboot) >/dev/null 2>&1 & echo '{"ok":true}'; }
 
 case "$1" in
   list)
-    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_group":{"role":"str","server":"str"}, "set_airplay_mode":{"mode":"str"}, "set_lms":{"enabled":0,"server":"str"}, "set_password":{"password":"str"}, "set_ssh":{"mode":"str","hours":0}, "reboot":{} }'
+    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_group":{"role":"str","server":"str"}, "set_airplay_mode":{"mode":"str"}, "set_lms":{"enabled":0,"server":"str"}, "set_gestures":{"tap":"str","double_tap":"str"}, "set_password":{"password":"str"}, "set_ssh":{"mode":"str","hours":0}, "reboot":{} }'
     ;;
   call)
     method="$2"; INPUT="$(cat)"
@@ -290,6 +319,7 @@ case "$1" in
       set_group)    set_group ;;
       set_airplay_mode) set_airplay_mode ;;
       set_lms)      set_lms ;;
+      set_gestures) set_gestures ;;
       set_password) set_password ;;
       set_ssh)      set_ssh ;;
       reboot)       reboot_dev ;;

@@ -1,3 +1,13 @@
 #!/bin/sh
-# fake jsonfilter: extract the boolean after "access": from stdin (what beep-ota asks for).
-sed -n 's/.*"access":[[:space:]]*\([a-z]*\).*/\1/p'
+# fake jsonfilter: supports `-e '@.KEY'`, extracting the top-level JSON value for KEY
+# from stdin — a quoted string, or a bareword number/bool/null. Enough for the shell
+# under test (beep-ota's `@.access`, set_gestures' `@.tap`/`@.double_tap`, etc.).
+key=""
+while [ $# -gt 0 ]; do case "$1" in -e) key="$2"; shift 2 ;; *) shift ;; esac; done
+k="${key#@.}"
+[ -n "$k" ] || exit 0
+in="$(cat)"
+# string value first ("k":"v"), else a bareword (true/false/null/number)
+v="$(printf '%s' "$in" | sed -n "s/.*\"$k\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1)"
+[ -n "$v" ] || v="$(printf '%s' "$in" | sed -n "s/.*\"$k\"[[:space:]]*:[[:space:]]*\([A-Za-z0-9._-][A-Za-z0-9._-]*\).*/\1/p" | head -1)"
+printf '%s\n' "$v"
