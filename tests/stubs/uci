@@ -1,0 +1,29 @@
+#!/bin/sh
+# Minimal uci stub for the off-device test harness.
+#   get <a.b.c>            -> echoes env UCIGET_<a_b_c> (dots -> underscores), or nothing
+#   export/import <pkg>    -> file-backed under $UCI_STATE_DIR (import replaces from stdin)
+#   commit / set / delete… -> no-op (exit 0)
+# Only what the shell logic under test needs is modeled; extend as required.
+: "${UCI_STATE_DIR:=${TMPDIR:-/tmp}/uci-stub}"
+mkdir -p "$UCI_STATE_DIR" 2>/dev/null
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-q|-m|-f|-n) shift ;;
+		-c|-d|-t|-P) shift 2 ;;
+		*) break ;;
+	esac
+done
+
+cmd="${1:-}"; shift 2>/dev/null || true
+case "$cmd" in
+	get)
+		[ -n "${1:-}" ] || exit 0
+		var="UCIGET_$(printf '%s' "$1" | tr '.[]@-' '_____')"
+		eval "printf '%s' \"\${$var:-}\""
+		;;
+	export) [ -n "${1:-}" ] && cat "$UCI_STATE_DIR/$1" 2>/dev/null || true ;;
+	import) [ -n "${1:-}" ] && cat > "$UCI_STATE_DIR/$1" ;;
+	*)      : ;;
+esac
+exit 0

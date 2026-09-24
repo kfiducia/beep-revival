@@ -1,0 +1,90 @@
+#!/bin/sh
+# beep-lms-ctl <playpause|next|status> — control THIS Beep's squeezelite player via
+# the Lyrion Music Server CLI (TCP :9090). Used by beep-action for LMS-context
+# gestures (see beep-action's gesture_action()).
+#
+# Exits 0 on success; NON-ZERO on any failure (no server, player not found, nc error)
+# so the caller can fall back to a source-agnostic action. Prints only for `status`.
+#
+# Mechanism validated 2026-09-24 against LMS 9.1.1 with a live Beep player:
+#   - the CLI request uses the RAW MAC ("<mac> pause"); responses are URL-encoded (%3A).
+#   - `<pid> pause` toggles play<->pause; `<pid> playlist index +1` = next.
+#   - player lookup: `players 0 100` returns ONE space-joined, URL-encoded line whose
+#     values (the MAC!) themselves contain %3A, so we split on the FIRST %3A only and
+#     walk per-player blocks (delimited by `playerindex`) to pick the id whose `name`
+#     equals our hostname.
+#
+# Testable seams: $BEEP_LMS_NC / $BEEP_LMS_UCI / $BEEP_LMS_NETSTAT override the tools
+# so the parsing can be exercised off-device; $BEEP_LMS_HOST forces the hostname.
+set -u
+
+: "${BEEP_LMS_PORT:=9090}"
+: "${BEEP_LMS_NC_WAIT:=4}"
+NC="${BEEP_LMS_NC:-nc}"
+UCI="${BEEP_LMS_UCI:-uci}"
+NETSTAT="${BEEP_LMS_NETSTAT:-netstat}"
+
+log() { logger -t beep-lms-ctl "$*" 2>/dev/null; }
+
+# LMS server host: the pinned server_addr if set, else discover it from squeezelite's
+# own outbound connection (slimproto :3483 / HTTP :9000) in the ESTABLISHED table.
+lms_server() {
+	local s
+	s="$("$UCI" -q get squeezelite.options.server_addr 2>/dev/null)"
+	if [ -n "$s" ]; then printf '%s' "$s"; return 0; fi
+	"$NETSTAT" -tn 2>/dev/null | awk '
+		/ESTABLISHED/ && ($5 ~ /:3483$/ || $5 ~ /:9000$/) {
+			ip=$5; sub(/:[0-9]+$/,"",ip); print ip; exit }'
+}
+
+# One-line CLI request over nc. $1 = the command line (already space-delimited).
+cli() { printf '%s\nexit\n' "$1" | "$NC" -w "$BEEP_LMS_NC_WAIT" "$SRV" "$BEEP_LMS_PORT" 2>/dev/null | head -1; }
+
+# Our hostname (== the -n name squeezelite registers with LMS; see init.d/squeezelite).
+our_host() {
+	local h
+	h="${BEEP_LMS_HOST:-}"
+	[ -n "$h" ] || h="$("$UCI" -q get system.@system[0].hostname 2>/dev/null)"
+	[ -n "$h" ] || h="$(cat /proc/sys/kernel/hostname 2>/dev/null)"
+	printf '%s' "$h"
+}
+
+# Extract our player id from a `players 0 100` response line (arg $1), by matching the
+# per-player `name` block to our hostname. Emits the decoded id (colons) or nothing.
+parse_pid() {
+	printf '%s' "$1" | tr ' ' '\n' | sed 's/%3A/|/' | awk -F'|' -v H="$2" '
+		$1=="playerindex"{p=""}
+		$1=="playerid"{p=$2}
+		$1=="name" && $2==H {print p; exit}' | sed 's/%3A/:/g'
+}
+
+# (testability) sourcing with BEEP_LMS_LIB=1 exposes the functions without running.
+if [ "${BEEP_LMS_LIB:-0}" = 1 ]; then return 0; fi
+
+SRV="$(lms_server)"
+[ -n "$SRV" ] || { log "no LMS server (server_addr unset and discovery found none)"; exit 2; }
+
+HOST="$(our_host)"
+[ -n "$HOST" ] || { log "could not determine hostname"; exit 3; }
+
+PID="$(parse_pid "$(cli 'players 0 100')" "$HOST")"
+[ -n "$PID" ] || { log "player '$HOST' not found on LMS $SRV"; exit 4; }
+
+case "${1:-}" in
+	playpause)
+		cli "$PID pause" >/dev/null
+		log "playpause: $HOST now $(cli "$PID mode ?" | sed 's/.* mode //')"
+		;;
+	next)
+		cli "$PID playlist index +1" >/dev/null
+		log "next: $HOST"
+		;;
+	status)
+		cli "$PID mode ?" | sed 's/.* mode //'
+		;;
+	*)
+		echo "usage: beep-lms-ctl playpause|next|status" >&2
+		exit 64
+		;;
+esac
+exit 0
