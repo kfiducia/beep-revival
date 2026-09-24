@@ -347,7 +347,11 @@ function refresh(){return call("status").then(function(s){
   setGroupUI(s);
   setLmsUI(s);
   setSshUI(s);
-  armIdle(s.session_timeout_min);
+  // Only arm on the FIRST status success after sign-in (idleT null). refresh() is also
+  // polled every 10s in the background (see setInterval below) — if we re-armed on every
+  // poll, the idle timer would never fire since 10s << any configurable idleMin (min 1m),
+  // silently defeating the auto sign-out feature. Later polls just keep idleMin in sync.
+  if(idleT)idleMin=(s.session_timeout_min>0)?s.session_timeout_min:30;else armIdle(s.session_timeout_min);
   el("foot").textContent="Beep Revival — open firmware · "+(s.name||"");
 }).catch(function(e){ // status failed -> session invalid/expired, needs login
   sess=NULLSESS; try{STORE.removeItem("beep_sess");}catch(_){}
@@ -380,9 +384,11 @@ function doLogin(){var pw=el("pw").value;login(pw).then(function(ok){
   if(ok){el("loginerr").textContent="";refresh();}
   else el("loginerr").textContent="Wrong password.";});}
 
-// Client-side idle auto-sign-out. Re-armed by refresh() (from status.session_timeout_min)
-// and by any user activity while signed in. This is separate from login()'s fixed 24h
-// ubus session lifetime (unchanged) — a short client timer here doesn't shrink that ceiling.
+// Client-side idle auto-sign-out. Armed once by refresh() right after sign-in, then
+// reset by any user activity (mouse/keyboard/touch) and by saveTimeout(); the periodic
+// background status poll in refresh() deliberately does NOT reset it (see there). This
+// is separate from login()'s fixed 24h ubus session lifetime (unchanged) — a short
+// client timer here doesn't shrink that ceiling.
 function armIdle(min){idleMin=(min>0)?min:30;clearTimeout(idleT);
   idleT=setTimeout(function(){if(!el("app").classList.contains("hide"))doLogout(true);},idleMin*60000);}
 ["mousedown","keydown","touchstart"].forEach(function(ev){
@@ -390,7 +396,7 @@ function armIdle(min){idleMin=(min>0)?min:30;clearTimeout(idleT);
 
 function doLogout(auto){
   var s=sess; sess=NULLSESS; try{STORE.removeItem("beep_sess");}catch(_){}
-  clearTimeout(idleT);
+  clearTimeout(idleT); idleT=null;
   el("app").classList.add("hide"); el("login").classList.remove("hide"); el("pw").value="";
   el("loginerr").textContent=auto?("Signed out after "+idleMin+" min idle."):"";
   if(s!==NULLSESS) rpc({jsonrpc:"2.0",id:1,method:"call",
