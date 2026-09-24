@@ -492,7 +492,7 @@ function saveLms(){ // re-apply LMS as the source with the entered server addres
 }
 function setLms(en){ // underlying source switch (0=AirPlay, 1=LMS) used by setSource()
   var srv=el("lms-srv").value.trim();
-  if(!validSrv(srv)){toast("Invalid server address — fix it under Music Server before switching",true);return;}
+  if(en && !validSrv(srv)){toast("Invalid server address — fix it under Music Server before switching",true);return;}
   call("set_lms",{enabled:en,server:srv}).then(function(){setTimeout(refresh,1500);})
     .catch(function(e){toast(e&&e.message||e,true);});
 }
