@@ -66,12 +66,13 @@ volume() {
 }
 
 status() {
-	local name role apm up ip ssid sig ver vol utime smode sexp grole gengine
+	local name role apm up ip ssid sig ver vol utime smode sexp grole gengine stmin
 	smode="$(uget beep.main.ssh_mode)"; [ -n "$smode" ] || smode=off
 	grole="$(uget beep.main.group_role)"; [ -n "$grole" ] || grole=solo
 	gengine="$(uget beep.main.group_engine)"; [ -n "$gengine" ] || gengine=snapcast
 	local apmode; apmode="$(uget beep.main.airplay_mode)"; [ -n "$apmode" ] || apmode=ap1
 	sexp="$(uget beep.main.ssh_expires)"; case "$sexp" in ''|*[!0-9]*) sexp=null;; esac
+	stmin="$(uget beep.main.session_timeout_min)"; case "$stmin" in [0-9]*) ;; *) stmin=30;; esac
 	name="$(jesc "$(uget system.@system[0].hostname)")"
 	role="$(jesc "$(uget beep.main.role)")"
 	apm="$(ap_mode)"
@@ -85,6 +86,7 @@ status() {
 	printf '{"name":"%s","airplay_name":"%s","role":"%s","ap_mode":%s,' "$name" "$name" "$role" "$apm"
 	printf '"connected":%s,"ssid":"%s","ip":"%s","signal":%s,' "$up" "$ssid" "$ip" "$sig"
 	printf '"volume":%s,"version":"%s","uptime":%s,"ssh":%s,"ssh_mode":"%s","ssh_expires":%s,' "$vol" "$ver" "$utime" "$(ssh_on)" "$smode" "$sexp"
+	printf '"session_timeout_min":%s,' "$stmin"
 	# group_engine tells the UI which multi-room control set to render (snapcast: the
 	# Solo/Primary/Member roles; replaynet: a Grouped/Solo toggle — sourcing is automatic
 	# on play, so there's no manual "primary"). "replaynet" is the node daemon liveness
@@ -273,11 +275,23 @@ set_ssh() {
 	esac
 }
 
+set_session_timeout() {
+	# Client-side idle auto-sign-out, in minutes. Does NOT change the ubus session's
+	# own absolute lifetime (still the fixed 24h passed at login in index.html) — it
+	# only tunes how long the SPA waits, with no user activity, before signing itself
+	# out and destroying the session. Cap at 1440 (24h) so it can't exceed that ceiling.
+	local m; m="$(jf '@.minutes')"
+	case "$m" in ''|*[!0-9]*) echo '{"error":"minutes must be 1-1440"}'; return;; esac
+	[ "$m" -ge 1 ] && [ "$m" -le 1440 ] || { echo '{"error":"minutes must be 1-1440"}'; return; }
+	uci -q set beep.main.session_timeout_min="$m"; uci -q commit beep
+	echo "{\"ok\":true,\"session_timeout_min\":$m}"
+}
+
 reboot_dev() { (sleep 1; reboot) >/dev/null 2>&1 & echo '{"ok":true}'; }
 
 case "$1" in
   list)
-    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_group":{"role":"str","server":"str"}, "set_airplay_mode":{"mode":"str"}, "set_lms":{"enabled":0,"server":"str"}, "set_password":{"password":"str"}, "set_ssh":{"mode":"str","hours":0}, "reboot":{} }'
+    echo '{ "status":{}, "scan":{}, "set_wifi":{"ssid":"str","key":"str"}, "set_name":{"name":"str"}, "set_volume":{"percent":0}, "set_group":{"role":"str","server":"str"}, "set_airplay_mode":{"mode":"str"}, "set_lms":{"enabled":0,"server":"str"}, "set_password":{"password":"str"}, "set_ssh":{"mode":"str","hours":0}, "set_session_timeout":{"minutes":0}, "reboot":{} }'
     ;;
   call)
     method="$2"; INPUT="$(cat)"
@@ -292,6 +306,7 @@ case "$1" in
       set_lms)      set_lms ;;
       set_password) set_password ;;
       set_ssh)      set_ssh ;;
+      set_session_timeout) set_session_timeout ;;
       reboot)       reboot_dev ;;
       *)            echo '{"error":"unknown method"}' ;;
     esac
