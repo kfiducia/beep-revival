@@ -214,6 +214,15 @@ set_lms() {
 	# wired and the Beep is on Wi-Fi. Applies immediately (enable + restart).
 	local en srv; en="$(jf '@.enabled')"; srv="$(jf '@.server')"
 	case "$en" in 0|1) ;; *) echo '{"error":"enabled 0|1"}'; return;; esac
+	# Blank = auto-discover. Otherwise must look like a hostname/IP (letters, digits,
+	# dot, hyphen) — this string flows unquoted into squeezelite's argv (see
+	# make_cmdline's word-split in /etc/init.d/squeezelite), so reject anything else
+	# up front instead of letting it garble the command line.
+	case "$srv" in
+		'') ;;
+		*[!A-Za-z0-9.-]*) echo '{"error":"server must be a hostname or IP: letters, digits, dot, hyphen only"}'; return;;
+	esac
+	[ "${#srv}" -gt 253 ] && { echo '{"error":"server address too long"}'; return; }
 	[ -x /etc/init.d/squeezelite ] || { echo '{"error":"LMS player not in this image"}'; return; }
 	uci -q set squeezelite.options.enabled="$en"
 	uci -q set squeezelite.options.server_addr="$srv"
