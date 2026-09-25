@@ -104,10 +104,15 @@ The **16-byte sync-state payload** is the sample-accuracy core. Both the seriali
 ```c
 /* on-wire sync state — 16 bytes, big-endian (network order) */
 struct playnet_sync_state {
-    uint64_t current_track_jiffies;   /* bytes  [0..8)  — playback position, in SAMPLES @ 44100 Hz */
+    uint64_t current_track_jiffies;   /* bytes  [0..8)  — see ⚠ below: wall-clock ms, NOT samples */
     uint64_t sync_discarded_samples;  /* bytes  [8..16) — cumulative samples dropped/added for alignment */
 };
 ```
+
+> ⚠ **Corrected by the stock source (see §7):** `current_track_jiffies` is a **wall-clock
+> millisecond timestamp** (`beep_millis()` = `CLOCK_REALTIME` ms), **not** a sample count. It is
+> `sync_discarded_samples` that is a sample count. The "SAMPLES @ 44100 Hz" reading below was a
+> disassembly mis-attribution of the `*1000/44100` conversion.
 
 - Serializer: `memcpy(buf+0, &g_current_track_jiffies, 8); memcpy(buf+8, &g_sync_discarded_samples, 8);`
   (globals `0x41b938` and `0x41b940`). Deserializer does the exact reverse. Both **assert
@@ -127,9 +132,10 @@ struct playnet_sync_state {
 
 ### 4.2 Timing / drift algorithm (the alignment core, audio.c ~404-413)
 
-Plain English: every device counts the **samples it has played** on a shared 44100 Hz clock
-(`current_track_jiffies` = a sample counter, not wall-clock jiffies) plus how many samples it
-has had to drop or pad to stay aligned (`sync_discarded_samples`). The source keeps shipping
+Plain English: **[⚠ unit corrected in §7 — `current_track_jiffies` is a wall-clock ms timestamp,
+not a sample counter; the source is authoritative on this.]** The intent is unchanged: the source
+ships a `(position, discarded)` pair alongside the PCM and each sink hard-snaps its playback to it.
+`sync_discarded_samples` is how many samples were dropped/padded to stay aligned. The source keeps shipping
 its `(jiffies, discarded)` pair alongside the PCM. When a sink receives it, the sink **forces
 its own playback clock to the source's value and re-arms playback at that exact position** —
 so all devices are playing the same sample index at the same moment. There is no PLL/gradual
@@ -257,3 +263,83 @@ A fresh, small daemon on musl/OpenWrt that reproduces the *design*, not the bina
 ~~disassemble `audio_sync_state_send/recv` for the wire format~~ (done, §4); map playnet's
 full ubus method surface (`beep.playnet` methods); run the 2-instance sync **wire capture** to
 live-confirm §4 (needs the fuller harness described in §4.6 — build it as part of impl step (a)).
+
+## 7. Source reconciliation (2026-09 — stock source is now public)
+
+The original Beep firmware **source** was published in 2026 at
+[`github.com/shawnlewis/beepmusic-orig`](https://github.com/shawnlewis/beepmusic-orig) (release
+`v0.9.12r2`, 2015). This section reconciles the §4 binary-RE against it. Every claim here was
+read directly from the source (not a summary); citations are `device/src/...` in that tree. See
+also the cross-cutting analysis in `docs/ORIG-FIRMWARE-NOTES.md` §4. Companion issue: #92.
+
+Method note: **validated against source, not trusted.** Where the source and the binary-RE
+disagree, the source is authoritative on *semantics* (the binary-RE is authoritative on the
+*shipped ISA* — see MIPS16e below).
+
+### 7.1 Confirmed (source agrees with the RE)
+- **16-byte payload = two `uint64_t`, big-endian.** `audio_sync_state_read`/`_write` do a raw
+  `memcpy` of `current_track_jiffies` then `sync_discarded_samples`, each asserting `len == 16`
+  (`lib/audio/audio.c:856-891`, globals `:116-117`). BE holds because the CPU is big-endian and
+  there is no explicit byteswap — exactly as §4.1 concluded (a little-endian reimpl must
+  `htobe64`/`be64toh`).
+- **Hard-snap, no PLL.** On resume the receiver overrides its clock and re-arms
+  (`restore_state_on_resume` → `start_at_jiffies`, `audio.c:409-431`) — matching §4.2's
+  "override then resume NOW."
+- **Grouping = deterministic LAN consensus, no arbiter; discovery = mDNS.** Matches §3
+  (`beepmanager_grouping.lua`, `beepdiscovery.c` advertising `_beepcontrol._tcp`/`_beephttp._tcp`,
+  filtered by a `cluster_id` TXT record).
+- **TCP transport.** Matches §4.3.
+
+### 7.2 Corrected (the RE was wrong; the source wins)
+- **`current_track_jiffies` is a wall-clock millisecond timestamp, NOT a sample counter.**
+  `beep_millis()` reads `CLOCK_REALTIME` in ms (`lib/beep/beeplib.h:95-101`), and the resume math is
+  `start_jiffies = current_track_jiffies + (sync_discarded_samples * 1000 / 44100)`
+  (`audio.c:409-431`) — i.e. the `*1000/44100` converts the *sample* count `discarded_samples` to
+  ms and adds it to a value already in ms. `start_at_jiffies` is then compared against
+  `beep_millis()` in the backend. The RE's "position in SAMPLES @ 44100 Hz" (§4.1/§4.2) mis-read
+  that conversion. Only `sync_discarded_samples` is a sample count (it also feeds
+  `start_at_elapsed_samples`, `audio.c:418`).
+- **Stock assumes NTP-synced wall clocks.** `CLOCK_MONOTONIC` is present-but-commented-out in
+  `beep_millis()` — the switch to `CLOCK_REALTIME` is deliberate so timestamps compare across
+  devices (`beeplib.h:95-97`). So the whole scheme leans on every speaker's real clock being
+  NTP-aligned. (This is a notable fragility, and the reason replaynet does its own PTP-lite theta
+  estimation instead — see REPLAYNET.md.)
+
+### 7.3 New (facts the binary-RE didn't have — from the readable Lua source layer)
+- **The steady-state inter-room servo (in the Lua distributor, not the C sync core).** The source
+  (master) aligns every player to the **most-behind** one and only ever skips *forward*:
+  `min_time = min(player.apparent_start_time)`; `delta = 1000*(apparent_start_time - min_time)` µs;
+  if `delta >= 3000` (**3 ms**) → `player:skip_ahead(delta)`; `delta < 0` is logged as an error
+  ("can't skip backwards") (`lua/distributor.lua:1235-1261`). A good reference for tightening
+  replaynet's alignment (#73).
+- **No resampler anywhere in stock.** Correction is whole-sample drop / silence-insert only. So
+  replaynet's `--resample` (click-free continuous trim) is *our* addition on top of the
+  stock-faithful drop/insert default — keep drop/insert as the baseline.
+- **Structural: `playnet` is the SINK; the SOURCE is the Lua `distributor`.** §2 framed `playnet`
+  as "the audio engine (decode + sync orchestration)"; in the source, `playnet.c` is the sink
+  daemon (TCP :32299, ubus `beep.playnet`) and `lua/distributor.lua` (+ `distributor_players.lua`)
+  is the master that pushes frames to each member. Roles are assigned by the grouping consensus (§3).
+
+### 7.4 Unresolved / do NOT over-claim
+- **Whether the source plays its own audio as a symmetric self-directed sink is NOT confirmed.**
+  When a device becomes source it adds a distributor player for every device whose
+  `sink_id == new_source_id` (`beepmanager.lua:165-199`), but `set_source_id` does *not* set the
+  source's own `sink_id` (`beepmanager_grouping.lua:79-91`), and no self/`127.0.0.1` player is
+  visible in `distributor_players.lua`. So I could not verify the "the master is just another
+  networked sink" model. **Consequence:** the replaynet **source-room latency skew** must be
+  characterized as *our* servo/loopback artifact — the stock source does not settle it, so don't
+  file it as a stock-parity gap. (Tracking: the `fix/replaynet-source-room-sync` work.)
+- **MIPS16e (§4.0) stands for the shipped image.** The *source tree* builds `-mips32r2`
+  (`site_scons/.../toolchain_openwrt-mips-r2.py`, `PKG_USE_MIPS16:=0` on beep packages), but the
+  RE read the actual flashed `playnet` ELF flags (`0x74001005` = MIPS16e). These aren't
+  contradictory — the retail image was evidently built differently from this snapshot (the repo's
+  own provenance warns of exactly this). Keep the binary-RE authoritative for disassembling the
+  shipped binary.
+
+### 7.5 Net for the reimplementation
+The §4.5 spec is sound and mostly unaffected: 16-byte BE `{u64, u64}`, hard-snap, TCP, mDNS. The
+one substantive change is conceptual, not wire-level — **stock's position field is a wall-clock ms
+timestamp riding on assumed-NTP clocks**, whereas replaynet deliberately uses a sample-index plus
+its own estimated clock offset (theta), which is *more* robust on Beeps whose clocks aren't
+NTP-aligned. That divergence is intentional and an improvement; it does not change the on-wire
+`{u64, u64}` framing.

@@ -263,6 +263,15 @@ summary::-webkit-details-marker{display:none}
             "Currently" shows whether dropbear is actually running right now.</p>
         </div>
       </details>
+      <details class="mb">
+        <summary>Auto sign-out</summary>
+        <div style="margin-top:12px">
+          <label for="stmin">Sign out after inactivity (minutes)</label>
+          <input id="stmin" type="text" inputmode="numeric" class="mb" placeholder="30">
+          <button class="btn sec" onclick="saveTimeout()">Save</button>
+        </div>
+      </details>
+      <button class="btn sec mb" onclick="doLogout()">Sign out</button>
       <button class="btn danger" onclick="reboot()">Restart device</button>
     </div>
     <p class="mut" style="text-align:center" id="foot"></p>
@@ -274,15 +283,21 @@ summary::-webkit-details-marker{display:none}
 <script>
 "use strict";
 // Restore a saved rpcd session so a page refresh doesn't re-prompt for the password
-// (persisted in login() with a 24h ubus timeout; cleared on auth failure). SECURITY:
-// only persist/restore over HTTPS — never leave a bearer token in localStorage on a
-// plaintext HTTP origin (the setup/captive-portal listener), where it could be sniffed
-// or read back. Over HTTP we behave as before (a fresh login each page load). The token
+// (persisted in login() with a 24h ubus timeout; cleared on auth failure). The token
 // travels in the request BODY (not a cookie), so this stays CSRF-safe.
 var UBUS="/ubus", NULLSESS="00000000000000000000000000000000";
 var SECURE=(location.protocol==="https:");
-var sess=(SECURE&&localStorage.getItem("beep_sess"))||NULLSESS;
+// STORAGE CHOICE (BEP23): HTTPS (STA/home-network listener) -> localStorage, so the
+// admin stays signed in indefinitely like a router UI (unchanged from #82). HTTP (the
+// WPA2 setup-AP captive portal, which stays plain HTTP on purpose — see
+// 99-beep-uhttpd) -> sessionStorage instead: still survives refresh/back-forward, but
+// is cleared when the tab closes, so a token from one physical Beep's setup AP can't
+// be read back by a DIFFERENT Beep's setup AP later (every unit answers at the same
+// fixed http://192.168.60.1).
+var STORE=SECURE?localStorage:sessionStorage;
+var sess=NULLSESS; try{sess=STORE.getItem("beep_sess")||NULLSESS;}catch(e){}
 var selEnc=false;
+var idleT=null, idleMin=30;   // client-side auto sign-out timer; set from status()
 
 function el(id){return document.getElementById(id);}
 function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast show"+(bad?" bad":"");
@@ -294,7 +309,7 @@ function rpc(body){return fetch(UBUS,{method:"POST",headers:{"Content-Type":"app
 function login(pw){return rpc({jsonrpc:"2.0",id:1,method:"call",
   params:[NULLSESS,"session","login",{username:"root",password:pw||"",timeout:86400}]})
   .then(function(j){if(j.result&&j.result[0]===0){sess=j.result[1].ubus_rpc_session;
-    if(SECURE){try{localStorage.setItem("beep_sess",sess);}catch(e){}} return true;}return false;});}
+    try{STORE.setItem("beep_sess",sess);}catch(e){} return true;}return false;});}
 
 function call(method,params){return rpc({jsonrpc:"2.0",id:1,method:"call",
   params:[sess,"beep",method,params||{}]}).then(function(j){
@@ -326,14 +341,20 @@ function refresh(){return call("status").then(function(s){
   el("s-up").textContent=fmtUp(s.uptime);
   if(!el("nm").matches(":focus"))el("nm").value=s.name||"";
   if(s.volume!=null && !el("vol")._live){el("vol").value=s.volume;el("volpct").textContent=s.volume+"%";}
+  if(!el("stmin").matches(":focus"))el("stmin").value=s.session_timeout_min||30;
   setSourceUI(s);
   setAirplayUI(s);
   setGroupUI(s);
   setLmsUI(s);
   setSshUI(s);
+  // Only arm on the FIRST status success after sign-in (idleT null). refresh() is also
+  // polled every 10s in the background (see setInterval below) — if we re-armed on every
+  // poll, the idle timer would never fire since 10s << any configurable idleMin (min 1m),
+  // silently defeating the auto sign-out feature. Later polls just keep idleMin in sync.
+  if(idleT)idleMin=(s.session_timeout_min>0)?s.session_timeout_min:30;else armIdle(s.session_timeout_min);
   el("foot").textContent="Beep Revival — open firmware · "+(s.name||"");
 }).catch(function(e){ // status failed -> session invalid/expired, needs login
-  sess=NULLSESS; try{localStorage.removeItem("beep_sess");}catch(_){}
+  sess=NULLSESS; try{STORE.removeItem("beep_sess");}catch(_){}
   el("app").classList.add("hide"); el("login").classList.remove("hide");
 });}
 
@@ -362,6 +383,29 @@ function setAirplay(mode){
 function doLogin(){var pw=el("pw").value;login(pw).then(function(ok){
   if(ok){el("loginerr").textContent="";refresh();}
   else el("loginerr").textContent="Wrong password.";});}
+
+// Client-side idle auto-sign-out. Armed once by refresh() right after sign-in, then
+// reset by any user activity (mouse/keyboard/touch) and by saveTimeout(); the periodic
+// background status poll in refresh() deliberately does NOT reset it (see there). This
+// is separate from login()'s fixed 24h ubus session lifetime (unchanged) — a short
+// client timer here doesn't shrink that ceiling.
+function armIdle(min){idleMin=(min>0)?min:30;clearTimeout(idleT);
+  idleT=setTimeout(function(){if(!el("app").classList.contains("hide"))doLogout(true);},idleMin*60000);}
+["mousedown","keydown","touchstart"].forEach(function(ev){
+  document.addEventListener(ev,function(){if(!el("app").classList.contains("hide"))armIdle(idleMin);},{passive:true});});
+
+function doLogout(auto){
+  var s=sess; sess=NULLSESS; try{STORE.removeItem("beep_sess");}catch(_){}
+  clearTimeout(idleT); idleT=null;
+  el("app").classList.add("hide"); el("login").classList.remove("hide"); el("pw").value="";
+  el("loginerr").textContent=auto?("Signed out after "+idleMin+" min idle."):"";
+  if(s!==NULLSESS) rpc({jsonrpc:"2.0",id:1,method:"call",
+    params:[NULLSESS,"session","destroy",{ubus_rpc_session:s}]}).catch(function(){});
+}
+function saveTimeout(){var v=+el("stmin").value;
+  if(!(v>=1&&v<=1440)){toast("1-1440 minutes",true);return;}
+  call("set_session_timeout",{minutes:v}).then(function(){toast("Saved");armIdle(v);})
+    .catch(function(e){toast(e.message,true);});}
 
 function scan(){var b=el("scanbtn");b.disabled=true;b.innerHTML='<span class="spin"></span> Scanning…';
   call("scan").then(function(r){
@@ -482,13 +526,18 @@ function setLmsUI(s){ // Off/On is the master Audio-source toggle now; keep serv
     ? ((s&&s.lms_running)?"Playing — look for this Beep as a player in your LMS.":"Starting the LMS player…")
     : "";
 }
+function validSrv(v){return v==="" || /^[A-Za-z0-9.-]+$/.test(v);}
 function saveLms(){ // re-apply LMS as the source with the entered server address
+  var srv=el("lms-srv").value.trim();
+  if(!validSrv(srv)){el("lms-status").textContent="Invalid address — use a hostname or IP (letters, digits, dot, hyphen only).";return;}
   el("lms-status").textContent="Saving…";
-  call("set_lms",{enabled:1,server:el("lms-srv").value.trim()}).then(function(){setTimeout(refresh,1200);})
+  call("set_lms",{enabled:1,server:srv}).then(function(){toast("Server saved");setTimeout(refresh,1200);})
     .catch(function(e){el("lms-status").textContent="Failed: "+(e&&e.message||e);});
 }
 function setLms(en){ // underlying source switch (0=AirPlay, 1=LMS) used by setSource()
-  call("set_lms",{enabled:en,server:el("lms-srv").value.trim()}).then(function(){setTimeout(refresh,1500);})
+  var srv=el("lms-srv").value.trim();
+  if(en && !validSrv(srv)){toast("Invalid server address — fix it under Music Server before switching",true);return;}
+  call("set_lms",{enabled:en,server:srv}).then(function(){setTimeout(refresh,1500);})
     .catch(function(e){toast(e&&e.message||e,true);});
 }
 function savePw(){var p=el("np").value;if(p.length<6){toast("Min 6 characters",true);return;}
