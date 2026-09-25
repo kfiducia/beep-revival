@@ -33,7 +33,7 @@ common header — 16 bytes
   u32 body_len   bytes of body following
 
 AUDIO body — 28 B fixed + pcm_len bytes of interleaved S16 PCM (44100 Hz, 2 ch)
-  u64 track_samples      head-sample index @ 44100     (stock: current_track_jiffies)
+  u64 track_samples      head-sample index @ 44100     (stock: current_track_jiffies — see note*)
   u64 discarded_samples  source-side cumulative drop/pad (stock: sync_discarded_samples; step d)
   u64 source_time_ns     source monotonic-clock ns when track_samples is emitted
   u32 pcm_len
@@ -73,6 +73,24 @@ epoch on the same frame, so all rooms re-align together.
 
 _(Periodic theta re-lock is still future work; the discontinuity re-anchor above covers the
 gap-drift case that mattered for multi-room.)_
+
+> **\* Reconciliation with the now-public stock source (2026 — see `docs/PLAYNET-RE.md` §7).**
+> The stock source revealed our field mapping is *role*-correct but *unit*-different, and the
+> difference is a deliberate improvement, not a bug:
+> - Stock's `current_track_jiffies` is a **wall-clock millisecond timestamp** (`beep_millis()` =
+>   `CLOCK_REALTIME`), and stock **assumes every speaker's clock is NTP-synced** (its
+>   `CLOCK_MONOTONIC` path is commented out on purpose so timestamps compare across devices).
+>   Our `track_samples` is a **sample index** carried alongside `source_time_ns` (**monotonic**)
+>   with the offset estimated per-connection via the PING/PONG `theta` above. So replaynet does
+>   **not** depend on NTP-aligned wall clocks — strictly more robust on Beeps that may never NTP-sync.
+> - Stock has **no resampler** — it corrects by whole-sample drop/insert only. Our default drop/insert
+>   servo is therefore stock-faithful; `--resample` (below) is a replaynet-only enhancement.
+> - Stock's steady-state inter-room alignment is a **most-behind, 3 ms, skip-forward-only** servo in
+>   its Lua distributor (`distributor.lua:1235-1261`) — a useful reference for tightening our own
+>   alignment (#73).
+> - **Source-room skew is ours to own, not a stock-parity gap:** the stock source does *not* clearly
+>   model the master as a symmetric self-directed sink (unconfirmed — see §7.4), so the source-room
+>   latency skew is a property of our servo/loopback path, tracked separately.
 
 ## Drift correction (step b)
 
