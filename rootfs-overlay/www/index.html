@@ -482,13 +482,18 @@ function setLmsUI(s){ // Off/On is the master Audio-source toggle now; keep serv
     ? ((s&&s.lms_running)?"Playing — look for this Beep as a player in your LMS.":"Starting the LMS player…")
     : "";
 }
+function validSrv(v){return v==="" || /^[A-Za-z0-9.-]+$/.test(v);}
 function saveLms(){ // re-apply LMS as the source with the entered server address
+  var srv=el("lms-srv").value.trim();
+  if(!validSrv(srv)){el("lms-status").textContent="Invalid address — use a hostname or IP (letters, digits, dot, hyphen only).";return;}
   el("lms-status").textContent="Saving…";
-  call("set_lms",{enabled:1,server:el("lms-srv").value.trim()}).then(function(){setTimeout(refresh,1200);})
+  call("set_lms",{enabled:1,server:srv}).then(function(){toast("Server saved");setTimeout(refresh,1200);})
     .catch(function(e){el("lms-status").textContent="Failed: "+(e&&e.message||e);});
 }
 function setLms(en){ // underlying source switch (0=AirPlay, 1=LMS) used by setSource()
-  call("set_lms",{enabled:en,server:el("lms-srv").value.trim()}).then(function(){setTimeout(refresh,1500);})
+  var srv=el("lms-srv").value.trim();
+  if(en && !validSrv(srv)){toast("Invalid server address — fix it under Music Server before switching",true);return;}
+  call("set_lms",{enabled:en,server:srv}).then(function(){setTimeout(refresh,1500);})
     .catch(function(e){toast(e&&e.message||e,true);});
 }
 function savePw(){var p=el("np").value;if(p.length<6){toast("Min 6 characters",true);return;}
