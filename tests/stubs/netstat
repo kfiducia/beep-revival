@@ -1,0 +1,14 @@
+#!/bin/sh
+# Minimal netstat stub. Emits rows from $NETSTAT_ROWS (newline-separated) if set,
+# else a default table with one ESTABLISHED slimproto (:3483) connection — enough to
+# exercise beep-lms-ctl's server-discovery fallback.
+if [ -n "${NETSTAT_ROWS:-}" ]; then
+	printf '%s\n' "$NETSTAT_ROWS"
+else
+	cat <<'EOF'
+Active Internet connections (w/o servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 10.9.100.174:53252      10.9.100.175:3483       ESTABLISHED
+EOF
+fi
+exit 0

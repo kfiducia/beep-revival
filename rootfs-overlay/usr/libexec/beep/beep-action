@@ -1,19 +1,29 @@
 #!/bin/sh
 # beep-action <gesture> [arg]   — called by beepd on each decoded gesture.
-# Policy layer: maps physical gestures to Snapcast control (JSON-RPC :1705).
-# Edit freely; beepd does not need recompiling.
+# Policy layer mapping physical gestures to actions. Edit freely; beepd does not
+# need recompiling.
 #
-#   turn <delta>    knob rotated <delta> detents -> volume +/-
-#   tap             single tap                   -> play/pause the active stream
-#   double_tap      double tap                   -> join the active group (sync)
-#   phys_confirm    triple tap                   -> 60s unsigned-upload unlock
-#   hold            release after >=10s hold     -> enter Wi-Fi setup mode
-#   factory_reset   release after >=30s hold     -> wipe config + reboot
+#   turn <delta>    knob rotated <delta> detents -> volume +/-      (FIXED)
+#   tap             single tap                   -> configurable    (see below)
+#   double_tap      double tap                   -> configurable    (see below)
+#   phys_confirm    triple tap                   -> 60s unsigned-upload unlock (FIXED, security)
+#   hold            release after >=10s hold     -> enter Wi-Fi setup mode      (FIXED, recovery)
+#   factory_reset   release after >=30s hold     -> wipe config + reboot        (FIXED, recovery)
 # (beepd fires hold/factory_reset ON RELEASE by duration, with a growing LED
 #  "arming" ring, so neither triggers accidentally.)
 #
-# Multi-room join/leave is delegated to /usr/libexec/beep/beep-group, which owns the
-# snapclient/snapserver services and the shairport backend switch.
+# CONFIGURABLE gestures (tap, double_tap): the action is read from UCI
+# `beep.gestures.<gesture>` (default `auto`). Values:
+#   auto           source-aware default: LMS active -> tap=lms_playpause; else tap=mute.
+#                  double_tap auto = group_toggle (LMS-next is not an auto default yet).
+#   mute           soft mute/unmute the local Master softvol
+#   lms_playpause  play/pause our LMS player (falls back to mute if LMS unreachable)
+#   lms_next       next track on our LMS player (falls back to group_toggle)
+#   group_toggle   join/leave the multi-room group (beep-group)
+#   none           no-op
+# The safety/recovery gestures above are deliberately NOT remappable. Multi-room
+# join/leave is delegated to /usr/libexec/beep/beep-group; LMS control to
+# /usr/libexec/beep/beep-lms-ctl.
 
 GESTURE="$1"; ARG="$2"
 NLEDS=24              # LED ring resolution == number of volume levels (1 LED per detent)
@@ -23,6 +33,86 @@ LOGT="beep-action"
 BEEP_RUN="${BEEP_RUN_DIR:-/var/run/beep}"
 
 log() { logger -t "$LOGT" "$*"; }
+
+# (testability) override the config tool so gesture resolution can be exercised off-device.
+UCI="${BEEP_UCI:-uci}"
+
+# Which source currently owns the speaker? LMS takes over when enabled (set_lms stops
+# shairport/replaynet), so the persistent UCI flag is the authoritative signal.
+active_source() {
+	[ "$("$UCI" -q get squeezelite.options.enabled 2>/dev/null)" = 1 ] && echo lms || echo airplay
+}
+
+# Resolve a configurable gesture (tap|double_tap) to a concrete action. Reads
+# beep.gestures.<gesture> (default `auto`), expanding `auto` to the source-aware default.
+gesture_action() {
+	local g a; g="$1"
+	a="$("$UCI" -q get "beep.gestures.$g" 2>/dev/null)"
+	[ -n "$a" ] || a=auto
+	if [ "$a" = auto ]; then
+		case "$g" in
+			tap)        [ "$(active_source)" = lms ] && a=lms_playpause || a=mute ;;
+			double_tap) a=group_toggle ;;   # LMS-next is intentionally NOT an auto default yet
+			*)          a=none ;;
+		esac
+	fi
+	echo "$a"
+}
+
+# ---- concrete gesture actions ------------------------------------------------
+# Soft mute/unmute. The softvol "Master" has volume but NO mute switch, so
+# `set Master toggle` is a silent no-op; the honest local equivalent is save-and-zero.
+act_mute() {
+	local cur prev
+	cur="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)"
+	case "$cur" in ''|*[!0-9]*) cur=0;; esac
+	mkdir -p "$BEEP_RUN"
+	if [ "$cur" -gt 0 ]; then
+		echo "$cur" > "$BEEP_RUN/premute-vol"
+		amixer -M -q set Master 0% 2>/dev/null
+		echo 0 > "$BEEP_RUN/volume"
+		: > "$BEEP_RUN/muted"            # flag: beepd shows the muted indicator
+		log "mute: muted (was ${cur}%)"
+	else
+		prev="$(cat "$BEEP_RUN/premute-vol" 2>/dev/null)"
+		case "$prev" in ''|*[!0-9]*|0) prev=30;; esac
+		amixer -M -q set Master "${prev}%" 2>/dev/null
+		echo "$prev" > "$BEEP_RUN/volume"
+		rm -f "$BEEP_RUN/muted"
+		log "mute: unmuted -> ${prev}%"
+	fi
+}
+
+# Toggle multi-room membership (beep-group owns the engine). Joining is slow+silent
+# for ~5s, so raise the "joining" ring up front; cancel it if the toggle was a LEAVE.
+act_group_toggle() {
+	local new
+	mkdir -p "$BEEP_RUN"
+	echo "$(( $(cut -d. -f1 /proc/uptime) + 10 ))" > "$BEEP_RUN/connecting" 2>/dev/null
+	new="$(/usr/libexec/beep/beep-group toggle 2>/dev/null | tail -1)"
+	case "$new" in solo|"") rm -f "$BEEP_RUN/connecting" 2>/dev/null ;; esac
+	log "group_toggle: multi-room now ${new:-toggled}"
+}
+
+# LMS transport — fallback-safe: on ANY failure, degrade to a source-agnostic action
+# so a gesture never silently does nothing.
+act_lms_playpause() { /usr/libexec/beep/beep-lms-ctl playpause || { log "lms_playpause failed -> mute"; act_mute; }; }
+act_lms_next()      { /usr/libexec/beep/beep-lms-ctl next      || { log "lms_next failed -> group_toggle"; act_group_toggle; }; }
+
+# Dispatch a resolved action. $1 = action, $2 = originating gesture (for logs).
+run_gesture_action() {
+	case "$1" in
+		mute)          act_mute ;;
+		group_toggle)  act_group_toggle ;;
+		lms_playpause) act_lms_playpause ;;
+		lms_next)      act_lms_next ;;
+		none)          log "$2: none (no-op)" ;;
+		*)             log "$2: unknown action '$1' -> mute"; act_mute ;;
+	esac
+}
+
+# (testability) sourcing with BEEP_ACTION_LIB=1 exposes the functions without dispatching.
+if [ "${BEEP_ACTION_LIB:-0}" = 1 ]; then return 0; fi
 
 case "$GESTURE" in
 	turn)
@@ -52,47 +142,14 @@ case "$GESTURE" in
 		echo "$pct" > "$BEEP_RUN/volume"           # beepd arc reads this (no per-detent logger)
 		;;
 	tap)
-		# Soft mute/unmute. The softvol "Master" has a volume capability but NO mute
-		# switch, so `set Master toggle` is a silent no-op — that's why tap did nothing.
-		# We also can't pause the phone that owns the AirPlay transport (would need a
-		# DACP remote), so the honest local equivalent is: save the level and drop to
-		# 0; the next tap restores it.
-		cur="$(amixer -M get Master 2>/dev/null | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)"
-		case "$cur" in ''|*[!0-9]*) cur=0;; esac
-		mkdir -p "$BEEP_RUN"
-		if [ "$cur" -gt 0 ]; then
-			echo "$cur" > "$BEEP_RUN/premute-vol"
-			amixer -M -q set Master 0% 2>/dev/null
-			echo 0 > "$BEEP_RUN/volume"
-			: > "$BEEP_RUN/muted"            # flag: beepd shows the muted indicator
-			log "tap: muted (was ${cur}%)"
-		else
-			prev="$(cat "$BEEP_RUN/premute-vol" 2>/dev/null)"
-			case "$prev" in ''|*[!0-9]*|0) prev=30;; esac
-			amixer -M -q set Master "${prev}%" 2>/dev/null
-			echo "$prev" > "$BEEP_RUN/volume"
-			rm -f "$BEEP_RUN/muted"
-			log "tap: unmuted -> ${prev}%"
-		fi
+		# Configurable via beep.gestures.tap (default `auto`; see header). auto = LMS
+		# play/pause when LMS is the active source, else mute. AirPlay transport can't be
+		# driven from here (no back-channel to the sender — issue #7), hence mute there.
+		run_gesture_action "$(gesture_action tap)" tap
 		;;
 	double_tap)
-		# Toggle multi-room membership. beep-group owns the engine (snapcast or
-		# replaynet) and does the work:
-		#   solo   -> member (stop solo AirPlay receive, bring the group engine up,
-		#             discover the active source and play its sample-synced stream)
-		#   member -> solo   (leave the group, resume solo AirPlay)
-		# Joining is SLOW and silent for ~5s (engine bring-up + clock-lock + prebuffer),
-		# so kick off the ring "joining" animation up front — beepd renders it until
-		# playback actually starts (PCM RUNNING) or this deadline lapses (a backstop if
-		# the join fails). Deadline = an absolute /proc/uptime second, matching beepd's
-		# refresh_connecting(). If the toggle turns out to be a LEAVE, cancel it at once.
-		mkdir -p "$BEEP_RUN"
-		echo "$(( $(cut -d. -f1 /proc/uptime) + 10 ))" > "$BEEP_RUN/connecting" 2>/dev/null
-		new="$(/usr/libexec/beep/beep-group toggle 2>/dev/null | tail -1)"
-		case "$new" in
-			solo|"") rm -f "$BEEP_RUN/connecting" 2>/dev/null ;;
-		esac
-		log "double_tap: multi-room now ${new:-toggled}"
+		# Configurable via beep.gestures.double_tap (default `auto` = group_toggle).
+		run_gesture_action "$(gesture_action double_tap)" double_tap
 		;;
 	hold)
 		# released after a >=10s hold (see beepd tiers) -> Wi-Fi reconfig AP
