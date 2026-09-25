@@ -56,6 +56,15 @@ with a self-signed cert). From there: rename it (renames AirPlay too), set volum
 change the admin password, toggle SSH (off by default), pick a multi-room role,
 and apply **signed firmware updates**.
 
+Signing in persists across a page refresh on both listeners: on the home-network
+HTTPS listener the session survives until you sign out or the auto sign-out timer
+fires (see below), while on the `BeepRevival-Setup-XXXXXX` HTTP captive portal it's
+tab-scoped — a refresh keeps you signed in, but closing the tab clears it (that
+listener stays plain HTTP on purpose, so the token never persists past the tab).
+Under **System**, **Sign out** ends the session immediately (client and server
+side); **Auto sign-out** sets how many idle minutes (1–1440, default 30) before
+you're signed out automatically — any click, key press, or touch resets the timer.
+
 ### First-time setup
 
 A never-configured Beep raises a **`BeepRevival-Setup-XXXXXX`** Wi-Fi network (WPA2).
