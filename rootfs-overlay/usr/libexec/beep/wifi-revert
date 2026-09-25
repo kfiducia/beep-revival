@@ -1,0 +1,76 @@
+#!/bin/sh
+# One-way-door Wi-Fi join revert.
+#
+# The single radio can't be AP and STA at once, so the moment set_wifi attempts a
+# join the setup AP (and the web UI hosting it) disappears — there is no way to
+# report "confirmed/failed" back to that same browser. Instead we make the switch
+# provisional and let the netcheck watchdog decide:
+#
+#   arm      (set_wifi)  snapshot the pre-change config before overwriting it.
+#   confirm  (netcheck)  the new network associated at least ONCE -> commit the
+#                        switch and disarm forever. This is the one-way door: after
+#                        a single success we never revert, even if the network later
+#                        drops (that path is the deliberate anti-deauth retry in
+#                        netcheck, NOT a revert).
+#   revert   (netcheck)  the new creds NEVER associated within the join window
+#                        (wrong password / dead AP) -> restore the snapshot: a
+#                        reconfigured working unit falls back to its OLD network; a
+#                        fresh unit falls back to the setup-AP state. No AP is
+#                        auto-raised for a configured STA, so anti-deauth is intact.
+#
+# Ephemeral by design: the snapshot lives in tmpfs ($BEEP_RUN), so a reboot mid-join
+# drops the revert and the STA just keeps retrying (existing behavior). The
+# "works once => committed" door only has to hold within one boot's join window.
+#
+# Testable seams: $BEEP_RUN (snapshot dir), $BEEP_APPLY=0 (skip live service reloads),
+# $BEEP_INITD (init.d path). uci/wifi/logger are resolved via PATH so tests can stub them.
+set -u
+
+: "${BEEP_RUN:=/var/run/beep}"
+PREV="$BEEP_RUN/wifi-prev"
+# Packages set_wifi mutates when handing the radio AP->STA (creds, radio enable,
+# setup-AP disable, lan-zone membership, captive-portal DHCP teardown, HTTPS redirect).
+PKGS="wireless network dhcp firewall uhttpd"
+
+apply() {   # re-assert the restored config on the live system (skipped under tests)
+	[ "${BEEP_APPLY:-1}" = 1 ] || return 0
+	initd="${BEEP_INITD:-/etc/init.d}"
+	"$initd/firewall" reload  >/dev/null 2>&1
+	# full restart (not reload) so a restored captive-portal config regenerates and the
+	# DNS cache is flushed, matching set_wifi's own dnsmasq handling.
+	"$initd/dnsmasq" stop     >/dev/null 2>&1; "$initd/dnsmasq" start >/dev/null 2>&1
+	"$initd/uhttpd" reload    >/dev/null 2>&1
+	wifi reload               >/dev/null 2>&1
+}
+
+case "${1:-}" in
+	arm)
+		# Only snapshot if a join isn't already pending: rapid re-submits must keep the
+		# ORIGINAL good baseline as the revert target, not an intermediate failed attempt.
+		[ -d "$PREV" ] && exit 0
+		mkdir -p "$PREV" || exit 1
+		for p in $PKGS; do uci -q export "$p" > "$PREV/$p" 2>/dev/null; done
+		;;
+	armed)
+		# Exit status only: is a revert currently pending?
+		[ -d "$PREV" ]
+		;;
+	confirm)
+		# First successful association -> the switch is now permanent.
+		rm -rf "$PREV" 2>/dev/null
+		exit 0
+		;;
+	revert)
+		[ -d "$PREV" ] || exit 0
+		for p in $PKGS; do
+			[ -f "$PREV/$p" ] && uci -q import "$p" < "$PREV/$p" && uci -q commit "$p"
+		done
+		rm -rf "$PREV" 2>/dev/null
+		apply
+		logger -t beep-netcheck "wifi join failed within window -> reverted to previous config" 2>/dev/null
+		;;
+	*)
+		echo "usage: wifi-revert arm|armed|confirm|revert" >&2
+		exit 2
+		;;
+esac

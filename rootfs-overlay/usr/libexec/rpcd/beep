@@ -122,6 +122,11 @@ set_wifi() {
 	# watchdog just bounces back to setup with no hint why. Reject up front.
 	if [ -n "$k" ] && [ "${#k}" -lt 8 ]; then
 		echo '{"error":"wifi password must be at least 8 characters"}'; return; fi
+	# Arm the one-way-door revert BEFORE mutating anything: snapshot the pre-change
+	# config so a join that NEVER associates (wrong password / dead AP) falls back to
+	# the previous good network (or the setup AP for a fresh unit). netcheck disarms
+	# this the first time the new network associates — see usr/libexec/beep/wifi-revert.
+	/usr/libexec/beep/wifi-revert arm 2>/dev/null || true
 	uget network.wwan >/dev/null || {
 		uci set network.wwan=interface; uci set network.wwan.proto=dhcp; uci commit network; }
 	uci set wireless.@wifi-iface[0].device=radio0
@@ -161,7 +166,7 @@ set_wifi() {
 	# persisted session token never rides plaintext HTTP once we're off the WPA2 setup AP.
 	uci -q set uhttpd.main.redirect_https=1; uci -q commit uhttpd; /etc/init.d/uhttpd reload >/dev/null 2>&1
 	wifi reload
-	echo '{"ok":true,"note":"Attempting to join. This setup network will disappear; if the join succeeds the speaker appears on your normal Wi-Fi within ~30s. If it fails (e.g. wrong password) this setup network comes back on its own."}'
+	echo '{"ok":true,"note":"Attempting to join. This setup network will disappear; if the join succeeds the speaker appears on your normal Wi-Fi within ~30s. If it never connects (e.g. wrong password) the speaker automatically returns to its previous network, or to this setup network if it had none."}'
 }
 
 set_name() {

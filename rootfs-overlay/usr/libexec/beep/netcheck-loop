@@ -100,6 +100,10 @@ while :; do
 	if sta_ok; then
 		fails=0
 		rm -f /var/run/beep/joining 2>/dev/null         # landed -> normal watchdog resumes
+		# One-way door: the new network associated at least once, so commit the switch
+		# and disarm any pending revert. From here a later drop is handled by the
+		# anti-deauth retry below, NEVER by reverting (see usr/libexec/beep/wifi-revert).
+		/usr/libexec/beep/wifi-revert confirm 2>/dev/null
 		set_net connected
 		ap_up && /usr/libexec/beep/wifi-setup-disable   # recovered -> drop the AP
 		sleep 20
@@ -110,6 +114,18 @@ while :; do
 		set_net connecting
 		sleep "$PERIOD"
 	else
+		# The join window has lapsed with no association. If a set_wifi revert is still
+		# armed, the new creds NEVER worked (wrong password / dead AP) -> revert to the
+		# snapshot ONCE (previous good network, or the setup-AP state for a fresh unit)
+		# and let the next loop settle on the restored config. This does not raise the AP
+		# for a configured STA, so the anti-deauth guarantee below is preserved.
+		if /usr/libexec/beep/wifi-revert armed 2>/dev/null; then
+			/usr/libexec/beep/wifi-revert revert 2>/dev/null
+			fails=0
+			set_net connecting
+			sleep "$PERIOD"
+			continue
+		fi
 		# ANTI-DEAUTH — do NOT auto-raise the setup AP for a *configured* STA that
 		# can't associate. The old fallback (wifi-setup-enable after GRACE failures)
 		# let an attacker deauth a configured device into setup mode, then read the
