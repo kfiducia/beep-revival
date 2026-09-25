@@ -39,6 +39,6 @@ NOT built in CI.
   (`rootfs-overlay/usr/libexec/beep/wifi-setup-enable`).
 
 ## Design docs & roadmap
-`docs/RECOVERY-DESIGN.md`, `docs/BE-AP2-AUDIT.md`, `docs/ORIG-FIRMWARE-NOTES.md` (what the leaked
+`docs/RECOVERY-DESIGN.md`, `docs/BE-AP2-AUDIT.md`, `docs/ORIG-FIRMWARE-NOTES.md` (what the
 2015 stock source confirms/corrects vs our RE + the improvement issue map), and the open GitHub
 issues (#6 iOS AirPlay-1, #7 volume push-back) are the shareable roadmap. Default branch: `main`.
