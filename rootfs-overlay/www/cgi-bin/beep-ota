@@ -154,10 +154,24 @@ logger -t beep "OTA: starting sysupgrade ($([ "$want_unsigned" = 1 ] && echo uns
 # process group can't signal sysupgrade MID-WRITE — a half-written primary is exactly
 # the brick we're guarding against. Fall back to a plain background if setsid is absent.
 # $FLASH_ARGS is intentionally unquoted (word-split into flags; paths carry no spaces).
+#
+# CRITICAL: run sysupgrade on /dev/console, NOT /dev/null. On this AR9331/procd device the
+# actual flash runs in procd's stage-2 (`ubus call system sysupgrade` -> /lib/upgrade/do_stage2
+# in a ramfs, AFTER all userspace incl. syslog is killed). With no console (stdio=/dev/null,
+# no controlling tty), stage-2 silently fails to complete the write and the box reboots onto
+# the OLD firmware — the exact "update reboots but stays on old version" bug. A `sysupgrade`
+# run from the serial login shell works precisely because it inherits /dev/console. So we give
+# the detached flash the same: `<>/dev/console` opens the console read-write on fd0, and since
+# setsid makes us a session leader, that open also acquires it as the CONTROLLING terminal —
+# mirroring the serial-shell flash. /dev/console is always a valid device even with no UART
+# cable attached. (Diagnosed live on beep-copper: every /dev/null flash failed at the stage-2
+# handoff; the identical flash on /dev/console was the only one that actually wrote the image.)
 if command -v setsid >/dev/null 2>&1; then
-	setsid sh -c "sleep 1; sysupgrade $FLASH_ARGS /tmp/ota.bin" </dev/null >/dev/null 2>&1 &
+	setsid sh -c "sleep 1; sysupgrade $FLASH_ARGS /tmp/ota.bin" <>/dev/console >&0 2>&0 &
 else
+	# No setsid: no new session (so no controlling tty), but still hand stage-2 a real console
+	# via stdio rather than /dev/null. setsid is present on the image, so this is a rare path.
 	# shellcheck disable=SC2086  # $FLASH_ARGS deliberately word-splits into sysupgrade flags
-	( sleep 1; sysupgrade $FLASH_ARGS /tmp/ota.bin ) </dev/null >/dev/null 2>&1 &
+	( sleep 1; sysupgrade $FLASH_ARGS /tmp/ota.bin ) <>/dev/console >&0 2>&0 &
 fi
 exit 0
