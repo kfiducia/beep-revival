@@ -385,6 +385,21 @@ A separate build target (`initramfs`, minimal package set):
 The web UI gets a firmware-upload path, but **only signature-verified images ever
 reach `sysupgrade`** — otherwise the admin UI becomes a full-compromise vector.
 
+> ### ⚠️ 2026-09-27 — the web-OTA `sysupgrade` MUST run on `/dev/console`, not `/dev/null`
+> A silent bug made the web-OTA "reboot but stay on the old firmware" **every time**, while a
+> `sysupgrade` from the serial login shell worked. Diagnosed live on beep-copper across ~7
+> flashes: on this AR9331/procd device the real write happens in **procd stage-2**
+> (`ubus call system sysupgrade` → `/lib/upgrade/do_stage2` in a ramfs, *after* all userspace
+> incl. syslog is killed). If the `sysupgrade` process has **no console** (stdio `/dev/null`,
+> no controlling tty — as a detached CGI does), stage-2 **silently fails to complete the write**
+> and the box reboots onto the intact old primary. The serial-shell flash works only because it
+> inherits `/dev/console`. **Ruled out: RAM (freeing 26 MB changed nothing) and `-f` vs
+> keep-config (both fail identically on `/dev/null`).** Fix (in `www/cgi-bin/beep-ota`): launch
+> the flash with `setsid sh -c "… sysupgrade -f \$KEEP /tmp/ota.bin" <>/dev/console >&0 2>&0` —
+> `/dev/console` is valid even with no UART cable, and the session-leader open also makes it the
+> controlling tty. Keep the `-f` curated preserve (it avoids the slow/hanging first-boot config
+> migration that plain keep-config causes). **Do not revert `beep-ota` to `>/dev/null`.**
+
 1. Generate a `usign` keypair once: private key stored **off-device** (1Password),
    public key baked into the image at `/etc/beep-ota.pub`.
 2. Release images are signed with the private key (`usign -S`).
