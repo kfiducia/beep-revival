@@ -30,8 +30,9 @@ if [ ! -f /etc/beep-code ]; then
 	uci -q commit system
 fi
 
-# per-device self-signed TLS cert for uhttpd (never a shared/baked cert)
-[ -x /usr/sbin/px5g ] && [ ! -f /etc/beep-uhttpd.crt ] && \
-	px5g selfsigned -der -days 3650 -newkey rsa:2048 -keyout /etc/beep-uhttpd.key -out /etc/beep-uhttpd.crt \
-		-subj "/CN=beep-${MAC6}" 2>/dev/null
+# per-device self-signed TLS cert for uhttpd (never a shared/baked cert). The helper
+# generates a cert WITH a valid SAN and self-heals older empty-SAN certs via a keep-listed
+# version marker — modern browsers reject an empty-SAN cert as a hard, non-proceedable
+# ERR_CERT_INVALID, making the admin UI unreachable over HTTPS. See the helper + issue #105.
+[ -x /usr/libexec/beep/gen-uhttpd-cert ] && /usr/libexec/beep/gen-uhttpd-cert "$MAC6"
 exit 0

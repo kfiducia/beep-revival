@@ -1,0 +1,23 @@
+#!/bin/sh
+# Minimal px5g stub for the off-device test harness. Records its full argv to
+# $PX5G_ARGS_LOG (one arg per line) so a case can assert what SAN args were passed, and
+# touches the -out/-keyout files so the caller's "cert exists" checks pass. It does NOT
+# produce a real certificate. Set PX5G_FAIL=1 to simulate a generation failure.
+if [ -n "${PX5G_ARGS_LOG:-}" ]; then
+	: > "$PX5G_ARGS_LOG"
+	for _a in "$@"; do printf '%s\n' "$_a" >> "$PX5G_ARGS_LOG"; done
+fi
+
+[ "${PX5G_FAIL:-0}" = 1 ] && exit 1
+
+_out=""; _key=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-out)    _out="${2:-}"; shift 2 ;;
+		-keyout) _key="${2:-}"; shift 2 ;;
+		*)       shift ;;
+	esac
+done
+[ -n "$_out" ] && : > "$_out"
+[ -n "$_key" ] && : > "$_key"
+exit 0

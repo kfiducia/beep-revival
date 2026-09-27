@@ -131,7 +131,7 @@ else
 	# anything variant-specific that could trip the restore.
 	KEEP=/tmp/beep-keep.tar.gz; rm -f "$KEEP"
 	KEEP_FILES=""
-	for f in etc/beep-code etc/beep-uhttpd.crt etc/beep-uhttpd.key etc/shadow \
+	for f in etc/beep-code etc/beep-uhttpd.crt etc/beep-uhttpd.key etc/beep-cert-ver etc/shadow \
 	         etc/config/wireless etc/config/network etc/config/system; do
 		[ -e "/$f" ] && KEEP_FILES="$KEEP_FILES $f"
 	done
