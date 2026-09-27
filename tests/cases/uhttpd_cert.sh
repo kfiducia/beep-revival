@@ -32,7 +32,9 @@ args="$(cat "$PX5G_ARGS_LOG" 2>/dev/null)"
 assert_contains "$args" "-addext"                                "px5g invoked with an -addext SAN (not CN-only — the #105 bug)"
 assert_contains "$args" "subjectAltName=DNS:beep-${MAC6}"        "SAN includes the stable device DNS name"
 assert_contains "$args" "subjectAltName=DNS:beep-${MAC6}.local"  "SAN includes the mDNS .local name"
-assert_eq "2" "$(cat "$BEEP_ETC/beep-cert-ver" 2>/dev/null)"     "version marker written after generation"
+newkey_val="$(awk '/^-newkey$/{getline; print; exit}' "$PX5G_ARGS_LOG")"
+assert_eq "ec" "$newkey_val"                                     "cert uses an EC key (RSA-2048 TLS is too slow on the AR9331)"
+assert_eq "3" "$(cat "$BEEP_ETC/beep-cert-ver" 2>/dev/null)"     "version marker written after generation"
 if [ -f "$BEEP_ETC/beep-uhttpd.crt" ]; then _crt=yes; else _crt=no; fi
 assert_eq "yes" "$_crt"                                          "cert file created"
 
@@ -45,7 +47,7 @@ assert_eq "no" "$(ran)"                                          "current cert (
 rm -f "$BEEP_ETC/beep-cert-ver"        # simulate a unit updated from pre-#105 firmware
 sh "$GEN" "$MAC6"
 assert_eq "yes" "$(ran)"                                         "missing version marker forces a one-time regen"
-assert_eq "2" "$(cat "$BEEP_ETC/beep-cert-ver" 2>/dev/null)"     "regen refreshes the version marker"
+assert_eq "3" "$(cat "$BEEP_ETC/beep-cert-ver" 2>/dev/null)"     "regen refreshes the version marker"
 
 # --- renamed device: SAN also covers the current hostname's .local ---
 rm -f "$BEEP_ETC/beep-cert-ver"
