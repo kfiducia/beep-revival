@@ -7,3 +7,7 @@
 /etc/beep-code
 /etc/beep-uhttpd.crt
 /etc/beep-uhttpd.key
+# Cert-scheme version marker. Kept so a healed (SAN) cert isn't needlessly regenerated
+# every update; a unit updating from a pre-#105 image has no marker, which correctly
+# triggers gen-uhttpd-cert to replace the old empty-SAN cert exactly once.
+/etc/beep-cert-ver

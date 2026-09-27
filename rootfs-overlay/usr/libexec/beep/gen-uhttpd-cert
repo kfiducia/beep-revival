@@ -1,0 +1,64 @@
+#!/bin/sh
+# Generate the per-device self-signed TLS cert for uhttpd, WITH a valid Subject
+# Alternative Name (SAN). Called from uci-defaults/99-beep with the device MAC6.
+#
+# WHY A SAN IS MANDATORY (GitHub issue #105): modern browsers ignore a cert's CN and
+# match the hostname against the SAN. Worse, px5g (mbedtls) ALWAYS emits the SAN
+# extension — and with no SAN entries that extension is *empty*, which Chrome/Safari/
+# Firefox reject as ERR_CERT_INVALID: a hard, NON-proceedable error (no "Proceed
+# anyway" button). That made the admin UI unreachable over HTTPS. So we always pass at
+# least one DNS SAN; any non-empty SAN restores the normal (proceedable) self-signed
+# warning, and matching the mDNS names removes the warning outright for those names.
+#
+# SELF-HEAL ACROSS UPDATES: the cert, key, and this version marker are on the sysupgrade
+# keep-list (lib/upgrade/keep.d/beep + www/cgi-bin/beep-ota), so an already-provisioned
+# unit KEEPS its old (empty-SAN) cert across an OTA. The CERT_VER check below forces a
+# one-time regeneration when the marker is missing or older, healing the existing fleet.
+# Bump CERT_VER whenever this generation scheme changes.
+#
+# Env seams for the off-device test harness: BEEP_ETC (cert dir), PX5G (px5g binary).
+set -u
+
+BEEP_ETC="${BEEP_ETC:-/etc}"
+PX5G="${PX5G:-/usr/sbin/px5g}"
+CERT_VER=2
+
+CRT="$BEEP_ETC/beep-uhttpd.crt"
+KEY="$BEEP_ETC/beep-uhttpd.key"
+VER="$BEEP_ETC/beep-cert-ver"
+
+[ -x "$PX5G" ] || { logger -t beep "gen-uhttpd-cert: no px5g ($PX5G) — skipping"; exit 0; }
+
+# MAC6 = last 6 hex of the primary MAC, lowercased — the stable device identity behind
+# the hostname and mDNS name. Prefer the arg (99-beep already computed it); else derive.
+MAC6="${1:-}"
+if [ -z "$MAC6" ]; then
+	_mac="$(cat /sys/class/net/eth0/address 2>/dev/null || cat /sys/class/ieee80211/phy0/macaddress 2>/dev/null)"
+	MAC6="$(printf '%s' "$_mac" | tr -d ': \n' | tail -c 6 | tr A-Z a-z)"
+fi
+
+# Regenerate only when the cert is missing or the scheme changed — never churn a valid,
+# current-version cert (that would needlessly force the owner to re-trust it every boot).
+if [ -f "$CRT" ] && [ "$(cat "$VER" 2>/dev/null)" = "$CERT_VER" ]; then
+	exit 0
+fi
+
+# Names the user actually browses to. DNS entries ONLY: px5g mis-encodes an IPv4 `IP:`
+# SAN (it hardcodes a 16-byte length), and DHCP addresses aren't stable anyway. The
+# `-addext subjectAltName=` args MUST come LAST and stay consecutive: px5g self-links its
+# SAN list onto any trailing non-SAN arg, corrupting the extension.
+HOST="$(uci -q get system.@system[0].hostname 2>/dev/null)"; HOST="${HOST:-beep-${MAC6:-dial}}"
+set -- -addext "subjectAltName=DNS:beep-${MAC6}" -addext "subjectAltName=DNS:beep-${MAC6}.local"
+if [ -n "$HOST" ] && [ "$HOST" != "beep-${MAC6}" ]; then
+	# renamed unit: also cover the current hostname's mDNS name
+	set -- "$@" -addext "subjectAltName=DNS:${HOST}" -addext "subjectAltName=DNS:${HOST}.local"
+fi
+
+if "$PX5G" selfsigned -der -days 3650 -newkey rsa:2048 \
+		-keyout "$KEY" -out "$CRT" -subj "/CN=beep-${MAC6}" "$@" 2>/dev/null; then
+	printf '%s' "$CERT_VER" > "$VER"
+	logger -t beep "gen-uhttpd-cert: wrote SAN cert v$CERT_VER for beep-${MAC6}"
+	exit 0
+fi
+logger -t beep "gen-uhttpd-cert: px5g failed"
+exit 1
