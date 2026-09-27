@@ -106,6 +106,51 @@ docker exec -it beep-build bash /src/scripts/build.sh
 4. From here unit #1 is network-flashable (`scp -O` + `sysupgrade`) — no serial.
    Unit #2 needs one UART clip to reach step 2, then it's networked too.
 
+## Updating an already-running unit
+
+**On v1.5.1 or newer:** just use the web UI — sign in, upload the signed
+`*-sysupgrade.signed.bin` from the [latest release](https://github.com/kfiducia/beep-revival/releases/latest),
+and it flashes and reboots itself. No serial, no SSH.
+
+> ### ⚠️ Upgrading a unit on firmware **older than v1.5.1** — do the first hop over SSH
+> Web-OTA is **broken on pre-v1.5.1 firmware**: that version's updater ran `sysupgrade`
+> detached with no controlling console, so on this AR9331/procd board the flash silently
+> fails and the unit reboots straight back onto the **old** firmware (fixed in v1.5.1,
+> [#104](https://github.com/kfiducia/beep-revival/pull/104)). Because the flash is run by
+> the *currently installed* firmware, the fix can't help the hop *onto* it — so a unit on
+> ≤ v1.5.0 must be upgraded **once** by hand. (Related: pre-v1.5.2 units ship a TLS cert
+> with an empty SAN that modern browsers reject as a non-proceedable `ERR_CERT_INVALID`
+> ([#105](https://github.com/kfiducia/beep-revival/pull/105)), so you may not even be able
+> to reach their HTTPS admin UI — another reason to do the first hop over SSH.)
+>
+> Enable SSH (button-hold, or the web UI's SSH toggle), then — replicating exactly what
+> the fixed web updater now does (curated config-preserve + a console-attached flash):
+>
+> ```sh
+> # from your machine — copy the RAW (unsigned) sysupgrade image over:
+> scp -O beep-revival-vX.Y.Z-sysupgrade.bin root@<beep-ip>:/tmp/ota.bin
+>
+> # on the Beep (ssh in):
+> # 1. RAM is tight (~55 MB total); free it so the ~11 MB image can stage in /tmp (tmpfs):
+> for s in shairport-sync squeezelite replaynet nqptp avahi-daemon uhttpd dnsmasq; do
+>     /etc/init.d/$s stop; done; sync; echo 3 > /proc/sys/vm/drop_caches
+>
+> # 2. sanity-check the image BEFORE flashing:
+> sysupgrade -T /tmp/ota.bin || echo "BAD IMAGE — do not flash"
+>
+> # 3. preserve identity + Wi-Fi (so it rejoins) WITHOUT stock keep-config, which can
+> #    hang the first-boot restore on a variant mismatch — the curated set only:
+> cd / && tar czf /tmp/keep.tar.gz etc/beep-code etc/beep-uhttpd.crt etc/beep-uhttpd.key \
+>     etc/shadow etc/config/wireless etc/config/network etc/config/system 2>/dev/null
+>
+> # 4. flash with the console attached (the key detail — this is what #104 automated),
+> #    detached so it survives your SSH session dropping at reboot:
+> setsid sh -c "sysupgrade -f /tmp/keep.tar.gz /tmp/ota.bin" <>/dev/console >&0 2>&0 &
+> ```
+>
+> The unit writes the image, reboots, and rejoins your Wi-Fi on the new firmware. From
+> then on, web-OTA works normally (and it self-heals the empty-SAN cert on first boot).
+
 ## Security (fixes the stock Beep's sins)
 No anonymous control API (admin behind `rpcd` session auth), no writable CGI
 docroot, no remote-support backdoor, minimal daemon surface, per-device hostname
