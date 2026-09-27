@@ -21,7 +21,13 @@ set -u
 
 BEEP_ETC="${BEEP_ETC:-/etc}"
 PX5G="${PX5G:-/usr/sbin/px5g}"
-CERT_VER=2
+# v3: EC (P-256) key instead of RSA-2048. On the 400 MHz soft-float AR9331 an RSA-2048 TLS
+# handshake is so CPU-heavy that the admin SPA's periodic HTTPS status poll saturates uhttpd
+# (~70% CPU, 0% idle), pushing every login/status to ~20 s — the UI then times out and
+# bounces the user to the password screen. Measured live: RSA login ~20 s vs EC ~1 s. EC
+# P-256 is equivalent security at a fraction of the per-handshake cost. Bumping CERT_VER
+# makes a unit updating from a v1.5.2 (RSA) image self-heal to an EC cert on first boot.
+CERT_VER=3
 
 CRT="$BEEP_ETC/beep-uhttpd.crt"
 KEY="$BEEP_ETC/beep-uhttpd.key"
@@ -54,7 +60,7 @@ if [ -n "$HOST" ] && [ "$HOST" != "beep-${MAC6}" ]; then
 	set -- "$@" -addext "subjectAltName=DNS:${HOST}" -addext "subjectAltName=DNS:${HOST}.local"
 fi
 
-if "$PX5G" selfsigned -der -days 3650 -newkey rsa:2048 \
+if "$PX5G" selfsigned -der -days 3650 -newkey ec \
 		-keyout "$KEY" -out "$CRT" -subj "/CN=beep-${MAC6}" "$@" 2>/dev/null; then
 	printf '%s' "$CERT_VER" > "$VER"
 	logger -t beep "gen-uhttpd-cert: wrote SAN cert v$CERT_VER for beep-${MAC6}"
