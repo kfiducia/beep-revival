@@ -527,7 +527,9 @@ function setGroupUI(s){
   el("grp-status").textContent=msg;
 }
 function setGroup(r){
-  var body={role:r}; if(r==="member"){var v=el("grp-srv").value.trim(); if(v)body.server=v;}
+  var body={role:r};
+  if(r==="member"){var v=el("grp-srv").value.trim();
+    if(v){ if(!validSrv(v)){el("grp-status").textContent="Invalid address — use a hostname or IP (letters, digits, dot, hyphen only).";return;} body.server=v; }}
   el("grp-status").textContent="Applying…";
   call("set_group",body).then(function(){setTimeout(refresh,1200);})
     .catch(function(e){el("grp-status").textContent="Failed: "+(e&&e.message||e);});
