@@ -1,0 +1,6 @@
+#!/bin/sh
+# fake chpasswd: consume the "user:password" line from stdin; record it to $CHPASSWD_LOG if
+# set. Exit $CHPASSWD_RC (default 0) so rpcd/beep's set_root_pw() success + failure branches
+# are both drivable off-device (a normal test user can't run the real chpasswd).
+if [ -n "${CHPASSWD_LOG:-}" ]; then cat >> "$CHPASSWD_LOG"; else cat >/dev/null; fi
+exit "${CHPASSWD_RC:-0}"
