@@ -349,7 +349,12 @@ function call(method,params){return rpc({jsonrpc:"2.0",id:1,method:"call",
     if(j.error)throw new Error(j.error.message||"rpc error");
     if(!j.result)throw new Error("no result");
     if(j.result[0]!==0)throw new Error("access denied ("+j.result[0]+")");
-    return j.result[1]||{};});}
+    var r=j.result[1]||{};
+    // Application-level error: several write methods return ubus status 0 with an
+    // {"error":"..."} payload (bad input / backend refusal). Treat it like the ubus
+    // failure above so every caller's .catch shows the real reason, not a false toast.
+    if(r.error)throw new Error(String(r.error));
+    return r;});}
 
 function bars(sig){ // dBm -> 0..4
   var n=0; if(sig!=null){ if(sig>=-60)n=4; else if(sig>=-70)n=3; else if(sig>=-80)n=2; else if(sig!=null)n=1;}
@@ -583,8 +588,7 @@ function setGesturesUI(s){
 }
 function saveGesture(which,val){
   var p={}; p[which]=val;
-  call("set_gestures",p).then(function(r){
-    if(r&&r.error){toast(r.error,true);return;}
+  call("set_gestures",p).then(function(){
     el("g-status").textContent="Saved.";
     setTimeout(function(){el("g-status").textContent="";},1500);
     refresh();
