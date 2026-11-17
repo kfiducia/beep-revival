@@ -209,6 +209,17 @@ set_group() {
 	# an explicit server host). beep-group applies the services + shairport backend.
 	local role srv; role="$(jf '@.role')"; srv="$(jf '@.server')"
 	case "$role" in solo|primary|member) ;; *) echo '{"error":"role solo|primary|member"}'; return;; esac
+	# BEP30: the primary address flows unquoted into the snapclient/replaynet command line
+	# a member dials to reach the group primary (see beep-group), so validate it exactly
+	# like the LMS server field (BEP22): hostname/IP chars only, length <= 253. Blank =
+	# auto-discover via mDNS. Only checked when a server is actually given — the solo /
+	# leave path carries no address, so a stale/invalid value never blocks leaving a group.
+	if [ -n "$srv" ]; then
+		case "$srv" in
+			*[!A-Za-z0-9.-]*) echo '{"error":"server must be a hostname or IP: letters, digits, dot, hyphen only"}'; return;;
+		esac
+		[ "${#srv}" -gt 253 ] && { echo '{"error":"server address too long"}'; return; }
+	fi
 	if [ -n "$srv" ]; then uci -q set beep.main.group_server="$srv"; else uci -q delete beep.main.group_server 2>/dev/null; fi
 	uci -q set beep.main.group_role="$role"; uci -q commit beep
 	/usr/libexec/beep/beep-group "$role" >/dev/null 2>&1
