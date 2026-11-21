@@ -80,7 +80,7 @@ while [ "$i" -lt "$NLED" ]; do
 	[ "$lit" -eq 1 ] && phys="$phys $v" || phys="$phys 0"
 	i=$((i + 1))
 done
-# shellcheck disable=SC2086
+# shellcheck disable=SC2086  # $phys deliberately word-splits into positional params (one per LED)
 set -- $phys
 
 wire=""; i=0
@@ -93,6 +93,6 @@ while [ "$i" -lt "$NLED" ]; do
 done
 
 # reg + 24 LEDs + 1 ack = 26 bytes in one write.
-# shellcheck disable=SC2086
+# shellcheck disable=SC2086  # $wire deliberately word-splits into separate i2ctransfer byte args
 i2ctransfer -y "$BUS" "w$((NLED + 2))@${ADDR}" "$REG" $wire 0x00 >/dev/null 2>&1 || true
 exit 0
