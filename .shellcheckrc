@@ -1,8 +1,9 @@
 # shellcheck configuration for the Beep firmware (BusyBox ash / OpenWrt) tree.
 #
 # These disables silence the KNOWN false positives for this codebase so the CI report
-# shows real signal instead of ~90 recurring non-issues. This does NOT change enforcement
-# (the CI shellcheck job is report-only); it just makes the output worth reading. Real
+# shows real signal instead of ~90 recurring non-issues. This does not make the check lenient:
+# the CI shellcheck job is BLOCKING (pinned 0.11.0, a required check on main), so every
+# global disable here must be a repo-wide false positive. Real
 # findings (unquoted expansions that matter, genuine parse errors, etc.) still surface.
 # Prefer a targeted inline `# shellcheck disable=SCxxxx` in a single file over adding a
 # code here, so a repo-wide disable stays reserved for genuinely repo-wide patterns.
