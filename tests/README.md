@@ -20,6 +20,7 @@ No install step — just a POSIX `sh` and coreutils. The same suite runs in CI
 | `cases/bootcount_decode.sh` | `scripts/beep-bootcount-probe.sh` | Misreading the strike counter hides how close a unit is to dropping to recovery. |
 | `cases/volume_math.sh` | `rootfs-overlay/usr/libexec/beep/beep-action` | Knob → DAC → LED must agree on exact 1/24 steps; off-by-one drifts the slider. |
 | `cases/ota_gate.sh` | `rootfs-overlay/www/cgi-bin/beep-ota` | The signed/unsigned flash authorization gate — a regression is a remote-flash hole. |
+| `cases/rpcd_scan.sh` | `rootfs-overlay/usr/libexec/rpcd/beep` (scan) | A neighbor's SSID is untrusted radio input — bad escaping breaks JSON.parse in the setup UI. |
 
 ## How it works
 

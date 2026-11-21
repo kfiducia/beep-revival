@@ -1,0 +1,7 @@
+#!/bin/sh
+# fake iwinfo: '<dev> scan' cats $IWINFO_SCAN_FILE (captured 'iwinfo radio0 scan' text) if
+# set, else prints nothing (= empty scan). Other subcommands print nothing.
+case "${2:-}" in
+	scan) [ -n "${IWINFO_SCAN_FILE:-}" ] && [ -f "$IWINFO_SCAN_FILE" ] && cat "$IWINFO_SCAN_FILE" ;;
+esac
+exit 0
