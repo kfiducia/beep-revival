@@ -36,13 +36,13 @@ unset UCIGET_beep_gestures_double_tap
 
 # --- run_gesture_action dispatches to the right act_* -------------------------
 # Redefine the act_* as markers; run_gesture_action calls them by name (indirect use).
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329  # invoked indirectly by run_gesture_action
 act_mute()          { echo MUTE; }
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329  # invoked indirectly by run_gesture_action
 act_group_toggle()  { echo GROUP; }
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329  # invoked indirectly by run_gesture_action
 act_lms_playpause() { echo PP; }
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329  # invoked indirectly by run_gesture_action
 act_lms_next()      { echo NEXT; }
 assert_eq MUTE  "$(run_gesture_action mute tap)"                 "dispatch mute"
 assert_eq GROUP "$(run_gesture_action group_toggle double_tap)" "dispatch group_toggle"
