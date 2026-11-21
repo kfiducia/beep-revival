@@ -52,12 +52,16 @@ ssh_on()  { pidof dropbear >/dev/null 2>&1 && echo 1 || echo 0; }   # actual run
 version() {
 	# /etc is an overlay: if a stale overlay whiteout hides the baked stamp, fall back to
 	# the pristine squashfs copy (/rom), which can't be overlay-deleted. Use -s (non-empty)
-	# so a 0-byte file can't shadow a good copy. Last resort: the OpenWrt release string.
-	local f
-	for f in /etc/beep-version /rom/etc/beep-version; do
+	# so a 0-byte file can't shadow a good copy. Last resort: a Beep-branded "unstamped" label
+	# carrying the OpenWrt build for reference — never a bare OpenWrt banner.
+	# BEEP_VERSION_FILE / BEEP_VERSION_ROM / BEEP_OPENWRT_RELEASE override the paths (test hooks).
+	local f rel="${BEEP_OPENWRT_RELEASE:-/etc/openwrt_release}" ow=""
+	for f in "${BEEP_VERSION_FILE:-/etc/beep-version}" "${BEEP_VERSION_ROM:-/rom/etc/beep-version}"; do
 		[ -s "$f" ] && { cat "$f"; return; }
 	done
-	. /etc/openwrt_release 2>/dev/null; printf '%s' "${DISTRIB_DESCRIPTION:-unknown}"
+	# shellcheck source=/dev/null
+	[ -r "$rel" ] && ow="$( . "$rel" 2>/dev/null; printf '%s' "${DISTRIB_DESCRIPTION:-}")"
+	if [ -n "$ow" ]; then printf '%s' "Beep Revival (unstamped; $ow)"; else printf '%s' "Beep Revival (unstamped)"; fi
 }
 
 volume() {
