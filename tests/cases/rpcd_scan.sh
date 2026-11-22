@@ -14,8 +14,6 @@ t_tmpdir; tmp="$T_TMP"
 
 scanf() { IWINFO_SCAN_FILE="$1" sh "$RPCD" call scan </dev/null; }
 
-# hidden SSIDs ("ESSID: unknown") deliberately not covered — known bug, see BEP40
-
 # --- A: ESSID/Signal/Encryption extraction + enc true/false -------------------
 fA="$tmp/scanA"
 {
@@ -147,5 +145,49 @@ fF="$tmp/scanF"
 printf '%s\n' 'No scan results' > "$fF"
 out="$(scanf "$fF")"
 assert_eq '{"networks":[]}' "$out" "iwinfo 'No scan results' -> empty scan"
+
+# --- G: hidden networks dropped, not merged/garbage ------------------------------
+fG="$tmp/scanG"
+{
+	printf '%s\n' 'Cell 01 - Address: 02:00:00:00:00:51'
+	printf '%s\n' '          ESSID: unknown'
+	printf '%s\n' '          Mode: Master  Frequency: 2.412 GHz  Band: 2.4 GHz  Channel: 1'
+	printf '%s\n' '          Signal: -40 dBm  Quality: 60/70'
+	printf '%s\n' '          Encryption: WPA2 PSK (CCMP)'
+	printf '%s\n' ''
+	printf '%s\n' 'Cell 02 - Address: 02:00:00:00:00:52'
+	printf '%s\n' '          ESSID: "Visible"'
+	printf '%s\n' '          Mode: Master  Frequency: 2.417 GHz  Band: 2.4 GHz  Channel: 2'
+	printf '%s\n' '          Signal: -45 dBm  Quality: 55/70'
+	printf '%s\n' '          Encryption: none'
+	printf '%s\n' ''
+	printf '%s\n' 'Cell 03 - Address: 02:00:00:00:00:53'
+	printf '%s\n' '          ESSID: unknown'
+	printf '%s\n' '          Mode: Master  Frequency: 2.422 GHz  Band: 2.4 GHz  Channel: 3'
+	printf '%s\n' '          Signal: -70 dBm  Quality: 20/70'
+	printf '%s\n' '          Encryption: WPA2 PSK (CCMP)'
+} > "$fG"
+out="$(scanf "$fG")"
+assert_eq '{"networks":[{"ssid":"Visible","signal":-45,"enc":false}]}' \
+	"$out" "hidden ESSID (unquoted) dropped, not merged into a garbage entry"
+
+# --- H: field keywords inside an ESSID don't spoof Signal/Encryption -------------
+fH="$tmp/scanH"
+{
+	printf '%s\n' 'Cell 01 - Address: 02:00:00:00:00:61'
+	printf '%s\n' '          ESSID: "Encryption: none"'
+	printf '%s\n' '          Mode: Master  Frequency: 2.412 GHz  Band: 2.4 GHz  Channel: 1'
+	printf '%s\n' '          Signal: -50 dBm  Quality: 60/70'
+	printf '%s\n' '          Encryption: WPA2 PSK (CCMP)'
+	printf '%s\n' ''
+	printf '%s\n' 'Cell 02 - Address: 02:00:00:00:00:62'
+	printf '%s\n' '          ESSID: "Signal: -1 dBm"'
+	printf '%s\n' '          Mode: Master  Frequency: 2.417 GHz  Band: 2.4 GHz  Channel: 2'
+	printf '%s\n' '          Signal: -55 dBm  Quality: 58/70'
+	printf '%s\n' '          Encryption: none'
+} > "$fH"
+out="$(scanf "$fH")"
+assert_eq '{"networks":[{"ssid":"Encryption: none","signal":-50,"enc":true},{"ssid":"Signal: -1 dBm","signal":-55,"enc":false}]}' \
+	"$out" "field keywords embedded in ESSID text don't spoof Signal/Encryption of their own or another cell"
 
 t_done

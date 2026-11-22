@@ -123,9 +123,9 @@ valid_gesture_action() {
 scan() {
 	printf '{"networks":['
 	iwinfo radio0 scan 2>/dev/null | tr -d '\000-\011\013-\037' | awk '
-		/ESSID:/      { s=$0; sub(/.*ESSID: "/,"",s); sub(/"$/,"",s); ssid=s; sig="null" }
-		/Signal:/     { g=$0; sub(/.*Signal: /,"",g); sub(/ dBm.*/,"",g); if (g ~ /^-?[0-9]+$/) sig=g }
-		/Encryption:/ { e=$0; sub(/.*Encryption: /,"",e); enc=(e ~ /none/)?"false":"true";
+		/ESSID: "/    { s=$0; sub(/.*ESSID: "/,"",s); sub(/"$/,"",s); ssid=s; sig="null" }
+		/^[ \t]*Signal:/     { g=$0; sub(/.*Signal: /,"",g); sub(/ dBm.*/,"",g); if (g ~ /^-?[0-9]+$/) sig=g }
+		/^[ \t]*Encryption:/ { e=$0; sub(/.*Encryption: /,"",e); enc=(e ~ /none/)?"false":"true";
 		                if (ssid!="" && !(ssid in seen)) { seen[ssid]=1;
 		                    gsub(/\\/,"\\\\",ssid); gsub(/"/,"\\\"",ssid);
 		                    printf "%s{\"ssid\":\"%s\",\"signal\":%s,\"enc\":%s}", (n++?",":""), ssid, sig, enc }
